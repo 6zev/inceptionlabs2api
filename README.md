@@ -346,7 +346,7 @@ curl -s http://localhost:3000/healthz | jq
 # {"ok":true,"pool":{"size":2,"min":2,"max":8,"expired":0},
 #  "search":{"available":true},
 #  "clearance":{"has_cookie":true,"age_seconds":312,"refresh_count":3},
-#  "counters":{"requests":12,"streams":9,"errors":0,"upstream_errors":0}}
+#  "counters":{"requests":12,"streams":9,"errors":0,"upstream_errors":0,"tts":0,"stt":0}}
 ```
 
 ## 开发
@@ -354,7 +354,7 @@ curl -s http://localhost:3000/healthz | jq
 ```bash
 cd app
 go build ./... && go vet ./... && go test ./...        # 每个提交都必须是绿的
-go test ./... -race -cover                              # 竞态 + 覆盖率（约 88%）
+go test ./... -race -cover                              # 竞态 + 覆盖率（约 90%）
 ```
 
 测试策略：全部针对 `httptest` / 本地 TLS 监听器上的模拟上游，不访问真实的
