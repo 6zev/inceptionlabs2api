@@ -55,5 +55,66 @@ func Decode(body []byte) (*ChatRequest, *RequestError) {
 	} else {
 		req.ReasoningEffort = "medium"
 	}
+	if re := decodeTools(raw, &req); re != nil {
+		return nil, re
+	}
 	return &req, nil
+}
+
+// decodeTools validates the tool fields. It reads tool_choice from the raw
+// body because the field is a union of a string and an object.
+//
+// Only the structural minimum is rejected (class 2 in SPEC §1.1): `tools` must
+// be an array of objects carrying a non-empty function name. Everything else —
+// an unknown tool type, parameters that are not a schema, an unknown
+// tool_choice string — is coerced, because the upstream answers no field here
+// and a 400 would be the gateway's invention.
+func decodeTools(raw map[string]json.RawMessage, req *ChatRequest) *RequestError {
+	if body, ok := raw["tools"]; ok {
+		var items []json.RawMessage
+		if err := json.Unmarshal(body, &items); err != nil || items == nil {
+			return Invalid("tools must be an array of function objects")
+		}
+		for i, item := range items {
+			var t Tool
+			if err := json.Unmarshal(item, &t); err != nil {
+				return Invalid(fmt.Sprintf("tools[%d] must be an object", i))
+			}
+			if t.Function.Name == "" {
+				return Invalid(fmt.Sprintf("tools[%d].function.name is required", i))
+			}
+			req.Tools = append(req.Tools, t)
+		}
+	}
+
+	req.ToolChoice = ToolChoice{Kind: ToolChoiceAuto}
+	if body, ok := raw["tool_choice"]; ok {
+		req.ToolChoice = parseToolChoice(body)
+	}
+	return nil
+}
+
+// parseToolChoice normalises the union. An unrecognised value is auto: the
+// OpenAI default whenever tools are present.
+func parseToolChoice(body json.RawMessage) ToolChoice {
+	var s string
+	if err := json.Unmarshal(body, &s); err == nil {
+		switch s {
+		case "none":
+			return ToolChoice{Kind: ToolChoiceNone}
+		case "required":
+			return ToolChoice{Kind: ToolChoiceRequired}
+		default:
+			return ToolChoice{Kind: ToolChoiceAuto}
+		}
+	}
+	var named struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(body, &named); err == nil && named.Function.Name != "" {
+		return ToolChoice{Kind: ToolChoiceNamed, Name: named.Function.Name}
+	}
+	return ToolChoice{Kind: ToolChoiceAuto}
 }

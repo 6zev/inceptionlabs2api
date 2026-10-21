@@ -634,7 +634,7 @@ func TestPresumptuousRejectionsAreGone(t *testing.T) {
 		body string
 	}{
 		{"unknown param", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"temperature":0.5}`},
-		{"tools", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"tools":[{"type":"function"}]}`},
+		{"tools", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"tools":[{"type":"function","function":{"name":"f"}}]}`},
 		{"tool_choice", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"tool_choice":"auto"}`},
 		{"image", `{"model":"mercury-3","messages":[{"role":"user","content":[{"type":"text","text":"see"},{"type":"image_url","image_url":{"url":"x"}}]}]}`},
 		{"tool message", `{"model":"mercury-3","messages":[{"role":"tool","content":"x","tool_call_id":"c"}]}`},

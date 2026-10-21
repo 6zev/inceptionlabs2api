@@ -5,26 +5,80 @@ package openai
 import "encoding/json"
 
 // ChatRequest is the subset of an OpenAI chat completion request that maps
-// onto the upstream. Unknown top-level fields (temperature, tools, response
-// format, ...) are intentionally absent: they are dropped during decoding,
-// not rejected (SPEC §1.1).
+// onto the upstream, plus the tool fields (§4.1). Unknown top-level fields
+// (temperature, response format, ...) are intentionally absent: they are
+// dropped during decoding, not rejected (SPEC §1.1).
 type ChatRequest struct {
 	Model           string    `json:"model"`
 	Messages        []Message `json:"messages"`
 	Stream          bool      `json:"stream"`
 	ReasoningEffort string    `json:"reasoning_effort"`
+
+	Tools             []Tool     `json:"tools"`
+	ToolChoice        ToolChoice `json:"-"`
+	ParallelToolCalls *bool      `json:"parallel_tool_calls"`
+}
+
+// Tool is one OpenAI function tool.
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction is the callable half of a Tool. Parameters is kept raw: an
+// absent or unparseable schema renders as {} rather than rejecting the call.
+type ToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// ToolChoiceKind is the normalised tool_choice variant (§5 of
+// DESIGN-TOOLS.md).
+type ToolChoiceKind int
+
+// The four OpenAI tool_choice variants. Auto is the zero value: OpenAI
+// documents "auto" as the default when tools are present.
+const (
+	ToolChoiceAuto ToolChoiceKind = iota
+	ToolChoiceNone
+	ToolChoiceRequired
+	ToolChoiceNamed
+)
+
+// ToolChoice is the normalised tool_choice. Name is set only for
+// ToolChoiceNamed.
+type ToolChoice struct {
+	Kind ToolChoiceKind
+	Name string
+}
+
+// ToolCall is one assistant tool call, on both the response and the replayed
+// request side.
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
+}
+
+// FunctionCall is the function half of a ToolCall. Arguments is a JSON-encoded
+// string exactly as it crosses the wire.
+type FunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // Message is one OpenAI chat message. Content is either a string or an array
 // of content parts; it is kept raw so media parts can be rendered as text
-// placeholders instead of being rejected.
+// placeholders instead of being rejected. ToolCalls and ToolCallID are raw so
+// a malformed history entry cannot fail the whole request.
 type Message struct {
 	Role         string          `json:"role"`
 	Content      any             `json:"content"`
 	Name         string          `json:"name"`
 	ToolCalls    json.RawMessage `json:"tool_calls"`
 	FunctionCall json.RawMessage `json:"function_call"`
-	ToolCallID   string          `json:"tool_call_id"`
+	ToolCallID   json.RawMessage `json:"tool_call_id"`
 }
 
 // Model is one entry of GET /v1/models.
@@ -61,10 +115,27 @@ type ChunkChoice struct {
 // Delta is the incremental payload of a streaming frame. Empty fields are
 // omitted.
 type Delta struct {
-	Role             string     `json:"role,omitempty"`
-	Content          string     `json:"content,omitempty"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	Annotations      []Citation `json:"annotations,omitempty"`
+	Role             string          `json:"role,omitempty"`
+	Content          string          `json:"content,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	Annotations      []Citation      `json:"annotations,omitempty"`
+	ToolCalls        []ToolCallDelta `json:"tool_calls,omitempty"`
+}
+
+// ToolCallDelta is one streaming tool-call fragment. Index is the only field
+// OpenAI's schema requires on every fragment; id, type and name are sent on
+// the first fragment of each call and omitted afterwards.
+type ToolCallDelta struct {
+	Index    int               `json:"index"`
+	ID       string            `json:"id,omitempty"`
+	Type     string            `json:"type,omitempty"`
+	Function FunctionCallDelta `json:"function"`
+}
+
+// FunctionCallDelta is the function half of a ToolCallDelta.
+type FunctionCallDelta struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments"`
 }
 
 // Citation is one OpenAI url_citation annotation. Index is the 1-based
@@ -105,6 +176,7 @@ type CompletionMessage struct {
 	Content          string     `json:"content"`
 	ReasoningContent string     `json:"reasoning_content,omitempty"`
 	Annotations      []Citation `json:"annotations,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // ErrorResponse is OpenAI's error envelope.

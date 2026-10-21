@@ -223,3 +223,53 @@ func itoa(i int) string {
 	}
 	return itoa(i/10) + string(rune('0'+i%10))
 }
+
+// Expanded turns named tools into full schemas while keeping every other
+// tool's index entry and the loader, and stays declared.
+func TestExpanded(t *testing.T) {
+	t.Parallel()
+	tools := manyTools(TierThreshold + 2)
+	m, err := BuildManifest(tools, Choice{Auto: true}, false)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	first := m.tools[0]
+	next := m.Expanded([]Tool{first})
+	if !next.Tiered || !next.Loader {
+		t.Fatalf("expanded tiered=%v loader=%v", next.Tiered, next.Loader)
+	}
+	if !strings.Contains(next.Preamble, `"name":"tool_0","description":"Operation number 0 for testing.","parameters":{"type":"object"`) {
+		t.Fatalf("expanded tool lacks schema:\n%s", next.Preamble)
+	}
+	// An unloaded tool keeps its index entry: expanding one tool must not
+	// re-inflate the whole manifest.
+	if !strings.Contains(next.Preamble, `{"name":"tool_1","description":"Operation number 1 for testing."}`+"\n") {
+		t.Fatalf("unloaded tool lost its index entry:\n%s", next.Preamble)
+	}
+	if strings.Count(next.Preamble, `,"parameters":`) != 1 {
+		t.Fatalf("expanded manifest carries %d schemas, want 1", strings.Count(next.Preamble, `,"parameters":`))
+	}
+	// Every declared name must still be declared, plus the loader.
+	if len(next.Declared) != len(tools)+1 || next.Declared[len(next.Declared)-1] != toolSchemaName {
+		t.Fatalf("declared = %v", next.Declared)
+	}
+	if len(next.tools) != len(tools) {
+		t.Fatalf("tools = %d", len(next.tools))
+	}
+	// Unknown tools cannot be injected into the catalogue: Expand only
+	// answers with declared tools, and a second expansion keeps the first
+	// tool's schema while the index stays complete.
+	next = next.Expanded([]Tool{{Name: "extra", Parameters: json.RawMessage(`{}`)}})
+	if len(next.tools) != len(tools) {
+		t.Fatalf("tools after extra = %d", len(next.tools))
+	}
+	if !strings.Contains(next.Preamble, `"name":"tool_0"`) || !strings.Contains(next.Preamble, `"name":"tool_30"`) {
+		t.Fatalf("index incomplete after second expansion")
+	}
+	if strings.Contains(next.Preamble, `"name":"extra"`) {
+		t.Fatal("undeclared tool was injected into the catalogue")
+	}
+	if strings.Count(next.Preamble, `,"parameters":`) != 1 {
+		t.Fatalf("second expansion dropped the first schema")
+	}
+}

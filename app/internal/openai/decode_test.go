@@ -198,7 +198,7 @@ func TestNormalizeCoercesToolRolesAndDropsToolCalls(t *testing.T) {
 	msgs := []Message{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "call", ToolCalls: json.RawMessage(`[{"id":"call_1"}]`)},
-		{Role: "tool", Content: "tool result", ToolCallID: "call_1"},
+		{Role: "tool", Content: "tool result", ToolCallID: json.RawMessage(`"call_1"`)},
 		{Role: "function", Content: "fn result"},
 		{Role: "assistant", Content: "x", FunctionCall: json.RawMessage(`{"name":"f"}`)},
 		{Role: "weird", Content: "unknown role"},

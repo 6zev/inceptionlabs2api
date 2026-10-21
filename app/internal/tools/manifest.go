@@ -47,7 +47,42 @@ type Manifest struct {
 	// Loader reports that the synthetic tool_schema function was offered.
 	Loader bool
 
-	tools []Tool
+	tools        []Tool
+	instructions string
+	// loaded is the subset of tools whose full schemas the current preamble
+	// carries instead of the tier-1 index entry.
+	loaded []Tool
+}
+
+// tierNote explains why schemas are absent and how to ask for them.
+const tierNote = "\nParameter schemas are omitted to save context. Before calling a function, if you do not know its parameters, call `" + toolSchemaName + "` once with {\"names\": [\"…\"]} or {\"query\": \"…\"} to load them.\n"
+
+// header is the fixed part of every preamble: the output contract followed by
+// the choice-specific instructions.
+func (m *Manifest) header() string {
+	return "# Tool calling\n\n" +
+		"You can call the functions listed below. To call a function, emit exactly:\n\n" +
+		callStart + "\n" +
+		`{"name": "function_name", "arguments": {"arg": "value"}}` + "\n" +
+		callEnd + "\n\n" +
+		"Emit one block per call, with a complete JSON object. Do not wrap the block in a code fence. " +
+		"Only use the function names below; never invent one. If no function is needed, answer normally.\n" +
+		m.instructions
+}
+
+// instructions renders the tool_choice / parallel instructions.
+func instructions(c Choice, parallelOff bool) string {
+	var b strings.Builder
+	switch {
+	case c.Named != "":
+		fmt.Fprintf(&b, "\nYou must call the function %q. Do not call any other function.\n", c.Named)
+	case c.Required:
+		b.WriteString("\nYou MUST call at least one function before answering.\n")
+	}
+	if parallelOff {
+		b.WriteString("\nCall at most one function per turn.\n")
+	}
+	return b.String()
 }
 
 // BuildManifest renders the tool preamble. parallelOff adds the "at most one"
@@ -85,28 +120,14 @@ func BuildManifest(list []Tool, c Choice, parallelOff bool) (*Manifest, error) {
 		m.Declared = append(m.Declared, t.Name)
 	}
 
-	var b strings.Builder
-	b.WriteString("# Tool calling\n\n")
-	b.WriteString("You can call the functions listed below. To call a function, emit exactly:\n\n")
-	b.WriteString(callStart + "\n")
-	b.WriteString(`{"name": "function_name", "arguments": {"arg": "value"}}` + "\n")
-	b.WriteString(callEnd + "\n\n")
-	b.WriteString("Emit one block per call, with a complete JSON object. Do not wrap the block in a code fence. ")
-	b.WriteString("Only use the function names below; never invent one. If no function is needed, answer normally.\n")
+	m.instructions = instructions(c, parallelOff)
 
-	switch {
-	case c.Named != "":
-		fmt.Fprintf(&b, "\nYou must call the function %q. Do not call any other function.\n", c.Named)
-	case c.Required:
-		b.WriteString("\nYou MUST call at least one function before answering.\n")
-	}
-	if parallelOff {
-		b.WriteString("\nCall at most one function per turn.\n")
-	}
+	var b strings.Builder
+	b.WriteString(m.header())
 
 	if m.Tiered {
 		m.Loader = true
-		fmt.Fprintf(&b, "\nParameter schemas are omitted to save context. Before calling a function, if you do not know its parameters, call `%s` once with {\"names\": [\"…\"]} or {\"query\": \"…\"} to load them.\n", toolSchemaName)
+		b.WriteString(tierNote)
 		b.WriteString("\n<tools>\n")
 		for _, t := range selected {
 			fmt.Fprintf(&b, `{"name":%s,"description":%s}`+"\n", quoteJSON(t.Name), quoteJSON(t.Description))
@@ -196,4 +217,56 @@ func compactParams(raw json.RawMessage) string {
 func quoteJSON(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
+}
+
+// Expanded returns the manifest for the next round: the original declared
+// tools, with the given tools carrying full schemas instead of the tier-1
+// index. Already-expanded tools keep their schemas. The loader stays offered
+// so the model may ask again, but the server caps the number of rounds.
+func (m *Manifest) Expanded(extra []Tool) *Manifest {
+	// loaded keeps the tools whose schemas are now in the prompt.
+	loaded := make(map[string]Tool, len(extra))
+	for _, t := range m.loaded {
+		loaded[t.Name] = t
+	}
+	for _, t := range extra {
+		loaded[t.Name] = t
+	}
+
+	var b strings.Builder
+	b.WriteString(m.header())
+	b.WriteString(tierNote)
+	b.WriteString("\n<tools>\n")
+	for _, t := range m.tools {
+		if full, ok := loaded[t.Name]; ok {
+			fmt.Fprintf(&b, `{"name":%s,"description":%s,"parameters":%s}`+"\n",
+				quoteJSON(full.Name), quoteJSON(full.Description), compactParams(full.Parameters))
+			continue
+		}
+		fmt.Fprintf(&b, `{"name":%s,"description":%s}`+"\n", quoteJSON(t.Name), quoteJSON(t.Description))
+	}
+	b.WriteString("</tools>\n")
+
+	declared := make([]string, 0, len(m.tools)+1)
+	for _, t := range m.tools {
+		declared = append(declared, t.Name)
+	}
+	declared = append(declared, toolSchemaName)
+
+	allLoaded := make([]Tool, 0, len(loaded))
+	for _, t := range m.tools {
+		if full, ok := loaded[t.Name]; ok {
+			allLoaded = append(allLoaded, full)
+		}
+	}
+
+	return &Manifest{
+		Preamble:     b.String(),
+		Declared:     declared,
+		Tiered:       true,
+		Loader:       true,
+		tools:        m.tools,
+		instructions: m.instructions,
+		loaded:       allLoaded,
+	}
 }

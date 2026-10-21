@@ -267,6 +267,18 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Tool-bearing requests take §4.1's path. A nil plan means the legacy one,
+	// which must stay byte-identical for every request without tools.
+	plan, re := planTools(req)
+	if re != nil {
+		s.fail(w, re)
+		return
+	}
+	if plan != nil {
+		s.chatWithTools(w, r, req, plan)
+		return
+	}
+
 	ureq := upstream.NewChatRequest(msgs, req.ReasoningEffort)
 	if req.Stream {
 		s.stream(w, r, ureq, req.Model)
