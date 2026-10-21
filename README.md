@@ -19,8 +19,15 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
 
 - **匿名会话池**：min 2 / max 8，TTL 30 分钟到期销毁重建，401/403 丢弃换新并最多重试 2 次。
   客户端断连、超时、上游 5xx 都**不会**污染 token。
-- **utls Chrome 指纹 + ALPN 仅 `http/1.1`**：Vercel 风控会按 HTTP/2 JA4 拦截，
-  所以每个请求都用全新 ClientHello，并支持 HTTP CONNECT 代理（`HTTPS_PROXY` 风格）。
+- **标准库 HTTP/2 + `_vcrcs` 通关**：上游的 Vercel 安全网关要求「清除凭证
+  cookie + 求解时同一个 Chrome UA + HTTP/2」三者同时成立。网关在首次请求时
+  本地求解 v2 工作量证明（3 轮 SHA-256 前缀链，约 0.1 秒 CPU，无外部依赖），
+  拿到 1 小时有效的 `_vcrcs` cookie，并在 45 分钟时主动更换；请求被 429 挑战
+  时立即重解一次并重放。全部走标准库 `crypto/tls` + `ForceAttemptHTTP2`，
+  支持 HTTP CONNECT 代理（`HTTPS_PROXY` 风格），清关与业务请求共用同一出口。
+  （此前的 utls + ALPN `http/1.1` 方案已被证明是反的：强制 h1.1 恰恰会让
+  cookie 永远失效，整段实现已删除。）
+- **零第三方依赖**：`go.mod` 没有 require，`go.sum` 已移除，单一静态二进制。
 - **完整的 OpenAI 协议对齐**：
   - 流式：role 首帧 → `reasoning_content` 增量 → `content` 增量 → `finish_reason:"stop"` → `[DONE]`；
   - 非流式：聚合为 `chat.completion`，`message.reasoning_content` 与 `content` 同时返回；
@@ -29,11 +36,20 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
   - 多段流（`reasoning-0 → text-0 → reasoning-1 → text-1`）全程保留；
   - `text-start` 携带的整段快照文本按一个 content delta 输出，不丢字；
   - 错误统一为 `{"error":{"message","type","code"}}`。
-- **诚实的边界**：上游不提供 usage，因此响应里**没有** `usage` 字段（不编造估算值）；
-  不支持的 OpenAI 参数（`temperature`、`top_p`、`n`、`logprobs`、`response_format`……）
-  一律 **400 并列出全部参数名**，而不是静默忽略；图片/音频/工具调用同样显式 400。
-- **上下文守卫**：输入超过 25 万字符（按 Unicode 码点计）直接 400
-  `context_length_exceeded`，绝不静默截断。
+- **诚实的边界**：上游不提供 usage，因此响应里**没有** `usage` 字段（不编造估算值）。
+- **透传优先，不做自作主张的拦截**：网关只拒绝三类请求——(a) JSON 无法解析、
+  (b) 结构上无法表达（缺 `model`/`messages`、消息里没有任何可渲染文本、JSON 类型错误）、
+  (c) 鉴权失败。其余一律交给上游：
+  - 未知 OpenAI 参数（`temperature`、`top_p`、`n`、`logprobs`、`response_format`、
+    `seed`、`user`……）**静默丢弃**，不返回 400——OpenAI SDK 每次都会带这些字段；
+  - `tools` / `tool_choice` / `functions` / `function_call` 被丢弃，请求按普通聊天继续；
+  - 图片/音频/文件等非文本内容块不再 400，而是转成 `[image]` / `[audio]` /
+    `[file]` 这样的短文本占位符，让模型知道有附件；
+  - `role:"tool"` / 未知 role 统一按 `user` 处理；
+  - **没有** 25 万字符上下文守卫：超长输入直接转给上游，由上游按自己的上限截断；
+  - `reasoning_effort` 只把 `minimal` 映射成 `low`，其余原样透传；
+  - 上游的非 200 错误正文（以及搜索流里的终止 `error`）**原样翻译**进
+    `{"error":{...}}` 信封，只有 HTML 挑战页不会被回显。
 - **滑动空闲看门狗**：上游 60 秒没有任何事件才判超时（每行事件都会重置），
   不是按总耗时砍断长回答；流中断后必定补发 error 帧 + `[DONE]`，绝不裸关闭。
 - **可选 API Key**：`IL2API_API_KEY` 为空即开放访问；`OPTIONS` 预检与 CORS 头已处理。
@@ -97,7 +113,9 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `IL2API_POOL_MAX` | `8` | 会话池最大 token 数 |
 | `IL2API_POOL_TTL` | `30m` | token 寿命，到期销毁重建 |
 | `IL2API_IDLE_TIMEOUT` | `60s` | 滑动空闲看门狗（每个上游事件都会重置） |
-| `IL2API_CONTEXT_CHARS` | `250000` | 输入字符上限；`-1` 关闭守卫 |
+| `IL2API_CONTEXT_CHARS` | `0` | 已废弃的空操作，仅为配置兼容保留；不再有输入长度守卫 |
+| `IL2API_CLEARANCE_REFRESH` | `45m` | `_vcrcs` 主动刷新年龄（cookie 实际有效期 60 分钟） |
+| `IL2API_CLEARANCE_COOLDOWN` | `15s` | 两次清关求解之间的最小间隔，避免挑战风暴 |
 | `IL2API_SESSION_TIMEOUT` | `15s` | 单次 `/api/session` 请求超时 |
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` 的滑动空闲看门狗（每个 NDJSON 行都会重置） |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`，是否在启动时后台探测一次 `/api/search-lab/config`；`off` 时 `search.available` 恒为 `null` |
@@ -113,16 +131,20 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `POST` | `/v1/web_search` | 独立联网搜索，返回查询与来源（见下） |
 | `GET` | `/v1/models` | 返回配置的模型列表 |
 | `OPTIONS` | `/v1/*` | CORS 预检（返回 204） |
-| `GET` | `/healthz` | 存活探针 + 会话池大小 + 请求计数 |
+| `GET` | `/healthz` | 存活探针 + 会话池大小 + 清关状态 + 请求计数 |
 
-### 请求字段
+### 请求字段与校验边界
 
-只接受 `model`、`messages`、`stream`、`reasoning_effort`。其他顶层字段（`temperature`、
-`top_p`、`n`、`stop`、`response_format`、`logprobs`、`stream_options`、`user`……）
-返回 400 `unsupported_parameter`，错误信息会**逐一列出**不支持的字段名和允许的字段集合。
-`tools` / `tool_choice` / `functions` / `function_call` 返回 400 `tool_calling_unsupported`。
-消息数组里的 `image_url`、`input_audio`、`file` 等非文本块返回 400
-`content_part_unsupported`。`role: "developer"` 会映射为 `system`。
+真正被使用的字段是 `model`、`messages`、`stream`、`reasoning_effort`；**其余顶层字段
+（`temperature`、`top_p`、`n`、`stop`、`response_format`、`logprobs`、`stream_options`、
+`user`、`seed`……）一律静默丢弃，不报错**。`tools` / `tool_choice` / `functions` /
+`function_call` 同样丢弃，请求按普通聊天继续。消息里的 `image_url`、`input_audio`、
+`file` 等非文本块会被渲染成简短的文本占位符。`role: "developer"` 映射为 `system`，
+`role: "tool"` 与未知 role 按 `user` 处理。
+
+网关只在以下情况返回 400/401：JSON 无法解析或尾部有多余内容、`model`/`messages`
+缺失或为空、某条消息没有任何可渲染文本、字段 JSON 类型错误、API Key 错误。
+其余判断权归上游；上游的错误正文会翻译进 OpenAI 错误信封。
 
 ### 流式响应示例
 
@@ -182,7 +204,7 @@ curl http://localhost:3000/v1/web_search \
 
 - `config` 可省略：`fanout` 默认 3、`depth` 默认 1、`keep_top_k` 默认 10、`effort`
   默认 `instant`；`fanout`/`depth` 会按上游公布的范围（1–5 / 1–3）收敛，
-  `keep_top_k` 收敛到 1–50，`effort` 只接受 `instant`/`fast`/`deep`。
+  `keep_top_k` 收敛到 1–50，`effort` 原样透传。
 - `queries` 收集自所有 `queries` 事件（含多轮 follow-up），去重后按出现顺序返回。
 - `results` 是最终一轮 `docs` 的名称/链接/名次，`cite_index` 为 1..N；
   **`snippet` 恒为空**——上游 NDJSON 里根本没有逐条摘要，本网关不编造。
@@ -190,8 +212,9 @@ curl http://localhost:3000/v1/web_search \
   提前停止可省下数秒与多次 LLM 调用。
 - 只返回绝对的 `http(s)` 链接；`javascript:`、`data:`、相对路径与含控制字符的
   URL 会被丢弃（消费方通常直接把它们渲染成可点击链接）。
-- 空查询、超长查询（>2000 字符）、未知字段（含 `config` 内未知字段）、
-  重复键、JSON 尾部多余内容一律 400，并在错误信息里指出具体字段。
+- 未知字段（含 `config` 内未知字段）静默丢弃，数值越界按上游公布范围收敛；
+  `effort` 原样透传（上游自己判断）。只有 JSON 损坏、尾部多余内容、查询缺失/
+  非字符串/为空才是 400。
 - 上游没有结果时返回 `200` + `"results":[]`，这是诚实的空列表，不重试。
 - 响应带 `Cache-Control: no-store`；本接口不流式，整次检索完成后一次性返回。
 
@@ -201,22 +224,20 @@ curl http://localhost:3000/v1/web_search \
 `502 upstream_stream_error`；滑动空闲窗口（默认 60 秒，每行重置）超时
 `504 upstream_idle_timeout`，整次运行另有 10 个空闲窗口的绝对上限。
 
-> 上游对 NDJSON 默认做 Brotli 压缩，而 Go 的 `net/http` 不会自动解压。
-> 网关发送 `Accept-Encoding: identity`，并对 `br`/`gzip` 响应做防御性解码。
+> 上游对 NDJSON 默认做 Brotli 压缩。网关发送 `Accept-Encoding: identity`，
+> 并用标准库解码 `gzip`；本项目零第三方依赖，没有 Brotli 解码器，因此若中间层
+> 仍强行返回 `br`，会得到一个**明确指出编码**的错误，而不是乱码或静默空结果。
 
 ### 错误码
 
 | HTTP | code | 场景 |
 |---|---|---|
-| 400 | `invalid_request_error` | JSON 损坏、字段值非法、空消息 |
-| 400 | `unsupported_parameter` | 不支持的 OpenAI 参数（信息里列出全部） |
-| 400 | `content_part_unsupported` | 图片/音频/文件内容块 |
-| 400 | `tool_calling_unsupported` | 工具调用相关字段或消息 |
-| 400 | `context_length_exceeded` | 输入超过 `IL2API_CONTEXT_CHARS` |
+| 400 | `invalid_request_error` | JSON 损坏/尾部多余内容、缺 model/messages、消息无文本、类型错误 |
 | 401 | `invalid_api_key` | 缺少或错误的 Bearer Key |
 | 404 | `model_not_found` | 模型不在 `IL2API_MODELS` |
-| 502 | `upstream_error` / `upstream_stream_error` / `upstream_auth_failed` | 上游异常或流被截断 |
-| 503 | `upstream_unavailable` | 会话池为空（通常是出口 IP 被 Vercel 挑战） |
+| 502 | `upstream_error` / `upstream_stream_error` / `upstream_auth_failed` | 上游异常或流被截断（正文来自上游） |
+| 503 | `upstream_clearance_failed` | 上游挑战无法完成（PoW 版本变化、出口/UA 被拒） |
+| 503 | `upstream_unavailable` | 会话池为空且不是清关问题 |
 | 503 | `search_unavailable` | 上游 `/api/search-lab/config` 明确报告 `retrievalAvailable:false` |
 | 504 | `upstream_idle_timeout` | 上游超过空闲窗口没有任何事件 |
 
@@ -242,17 +263,17 @@ docker compose up -d --build      # 3000:3000，distroless nonroot (uid 65532)
 ```
 
 镜像为 `golang:1.24-alpine` 构建 → `gcr.io/distroless/static-debian12:nonroot` 运行，
-静态二进制、无 shell、无外部依赖。
+静态二进制、无 shell、零第三方 Go 依赖。
 
-> **出口 IP 很重要。** 上游的 Vercel 风控按 IP 挑战。如果部署机被挑战，
-> 服务仍能启动（不会崩溃），但 `/healthz` 的 `pool.size` 会一直是 0，
-> 聊天接口返回 `503 upstream_unavailable`，日志里会出现
-> `pool: refill failed ... status 429 ... Vercel Security Checkpoint`。
-> 搜索同理：启动探测失败时 `search.available` 保持 `null`（不会因此禁用接口），
-> 真正调用 `/v1/web_search` 时会返回 503。
-> 此时给容器设置 `IL2API_PROXY` 走一个未被挑战的出口即可，例如
-> `IL2API_PROXY=http://10.0.0.2:3128`。**部署环境的出口与本地探测环境可能不同**，
-> 请以部署后 `/healthz` 的 `pool.size` 为准。
+> **出口 IP 与清关。** `_vcrcs` cookie 绑定「出口 IP + UA + HTTP/2」，所以网关
+> 会从它实际使用的出口自行求解，无需外部刷新服务。若代理配置不正确，登录页
+> 仍会挑战：服务照常启动，但 `/healthz` 的 `clearance.has_cookie` 为 `false`、
+> `pool.size` 保持 0，聊天返回 `503 upstream_clearance_failed` 或
+> `503 upstream_unavailable`，日志里会看到
+> `upstream: checkpoint challenged ... refreshing clearance and replaying once`。
+> 请给容器设置 `IL2API_PROXY` 并把清关与业务流量放在**同一个**代理出口上
+> （例如 `IL2API_PROXY=http://10.0.0.2:3128`）。**部署环境的出口与本地探测环境
+> 可能不同**，请以部署后 `/healthz` 的 `clearance` 与 `pool.size` 为准。
 
 ### 观测
 
@@ -260,6 +281,7 @@ docker compose up -d --build      # 3000:3000，distroless nonroot (uid 65532)
 curl -s http://localhost:3000/healthz | jq
 # {"ok":true,"pool":{"size":2,"min":2,"max":8,"expired":0},
 #  "search":{"available":true},
+#  "clearance":{"has_cookie":true,"age_seconds":312,"refresh_count":3},
 #  "counters":{"requests":12,"streams":9,"errors":0,"upstream_errors":0}}
 ```
 
@@ -272,11 +294,13 @@ go test ./... -race -cover                              # 竞态 + 覆盖率（�
 ```
 
 测试策略：全部针对 `httptest` / 本地 TLS 监听器上的模拟上游，不访问真实的
-Vercel；utls 拨号器只用本地证书与本地 CONNECT 代理验证。搜索链路由模拟的
-NDJSON 上游覆盖：完整流水线、多轮 follow-up、Brotli/gzip 编码、缺失 `docs`、
-终止 `error`、流截断、非 200、`retrievalAvailable:false`、空闲超时、启动探测
-（成功/失败/关闭）以及恶意来源清洗。仓库根目录的 `Makefile` 提供 `make test` /
-`make race` / `make cover` / `make docker`。
+Vercel。PoW 求解器用真实 Chromium 抓取的 token/解做回归；清关管理器用模拟挑战端点
+覆盖获取、cookie 存储、45 分钟主动刷新、冷却、429 重新获取与 403 拒绝；传输层用
+本地 h2 服务端证明协商出 HTTP/2，并用本地 CONNECT 代理验证出口。搜索链路由模拟的
+NDJSON 上游覆盖：完整流水线、多轮 follow-up、gzip 编码（`br` 为带类型的错误）、
+缺失 `docs`、终止 `error`、流截断、非 200、`retrievalAvailable:false`、空闲超时、
+启动探测（成功/失败/关闭）以及恶意来源清洗。仓库根目录的 `Makefile` 提供
+`make test` / `make race` / `make cover` / `make docker`。
 
 ## 许可
 
