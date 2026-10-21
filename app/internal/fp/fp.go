@@ -55,6 +55,9 @@ type Options struct {
 	// RootCAs overrides the system trust store. Tests use a local CA so a
 	// TLS listener can be exercised end to end.
 	RootCAs *x509.CertPool
+	// ResponseHeaderTimeout bounds the wait for response headers only. The
+	// body is never subject to it, so long generations are unaffected.
+	ResponseHeaderTimeout time.Duration
 }
 
 // Transport returns an http.Transport whose TLS handshakes use the utls
@@ -68,9 +71,10 @@ func Transport(opts Options) (*http.Transport, error) {
 		return nil, err
 	}
 	return &http.Transport{
-		DialTLSContext:    dial,
-		ForceAttemptHTTP2: false,
-		DisableKeepAlives: true,
+		DialTLSContext:        dial,
+		ForceAttemptHTTP2:     false,
+		DisableKeepAlives:     true,
+		ResponseHeaderTimeout: opts.ResponseHeaderTimeout,
 	}, nil
 }
 

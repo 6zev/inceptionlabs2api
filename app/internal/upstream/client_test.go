@@ -426,3 +426,30 @@ func TestClientLogfAndBindPool(t *testing.T) {
 		t.Fatal("BindPool did not attach the pool")
 	}
 }
+
+func TestChatHeaderTimeoutIsBounded(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	block := make(chan struct{})
+	defer close(block)
+	m.chatHandler = func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-block:
+		case <-r.Context().Done():
+		}
+	}
+	c, _ := newTestClient(t, m, 1)
+	start := time.Now()
+	_, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), 100*time.Millisecond, nil)
+	var se *StatusError
+	if err == nil || errors.As(err, &se) {
+		// The client wraps the transport error; a timeout is the expected
+		// outcome and must not look like an auth rejection.
+		if errors.Is(err, ErrAuthRejected) {
+			t.Fatalf("header timeout misclassified as auth rejection: %v", err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("waited %s for headers, want the idle bound", elapsed)
+	}
+}

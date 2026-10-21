@@ -169,7 +169,7 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration,
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		}
-		resp, err := c.post(ctx, token, body)
+		resp, err := c.post(ctx, token, body, idle)
 		if err != nil {
 			return nil, err
 		}
@@ -196,8 +196,11 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration,
 	return nil, lastErr
 }
 
-func (c *Client) post(ctx context.Context, token string, body []byte) (*http.Response, error) {
-	tr, err := fp.Transport(fp.Options{Proxy: c.proxy, RootCAs: c.roots})
+func (c *Client) post(ctx context.Context, token string, body []byte, headerTimeout time.Duration) (*http.Response, error) {
+	if headerTimeout <= 0 {
+		headerTimeout = 60 * time.Second
+	}
+	tr, err := fp.Transport(fp.Options{Proxy: c.proxy, RootCAs: c.roots, ResponseHeaderTimeout: headerTimeout})
 	if err != nil {
 		return nil, err
 	}
