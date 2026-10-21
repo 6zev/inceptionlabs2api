@@ -782,3 +782,92 @@ func TestEndToEndClearancePrewarmFailureIsTolerated(t *testing.T) {
 		t.Fatalf("healthz after a refused prewarm = %s", raw)
 	}
 }
+
+// One streaming chat through the full stack: the upstream source-url events
+// become url_citation annotations on the finish frame, in arrival order.
+func TestEndToEndStreamCitations(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, 5*time.Second)
+	st.mock.setChat(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, `data: {"type":"source-url","sourceId":"__searching__","url":"","title":"__searching__"}
+
+data: {"type":"source-url","sourceId":"https://a.example","url":"https://a.example","title":"Alpha"}
+
+data: {"type":"source-url","sourceId":"https://b.example","url":"https://b.example","title":"Beta"}
+
+data: {"type":"text-start","id":"text-1"}
+
+data: {"type":"text-delta","id":"text-1","delta":"Claim one [1] and claim two [2]."}
+
+data: {"type":"text-end","id":"text-1"}
+
+data: [DONE]
+
+`)
+	})
+	resp, err := http.Post(st.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody(true)))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	var finish *sseChunk
+	var content strings.Builder
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		var c sseChunk
+		if err := json.Unmarshal([]byte(payload), &c); err != nil {
+			t.Fatalf("chunk %q: %v", payload, err)
+		}
+		if len(c.Choices) == 0 {
+			continue
+		}
+		content.WriteString(c.Choices[0].Delta.Content)
+		if c.Choices[0].FinishReason != nil && *c.Choices[0].FinishReason == "stop" {
+			finish = &c
+		}
+	}
+	if content.String() != "Claim one [1] and claim two [2]." {
+		t.Fatalf("content = %q", content.String())
+	}
+	if finish == nil {
+		t.Fatalf("no finish frame in %s", raw)
+	}
+	got := finish.Choices[0].Delta.Annotations
+	if len(got) != 2 {
+		t.Fatalf("annotations = %+v, want 2", got)
+	}
+	if got[0].Type != "url_citation" || got[0].Index != 1 || got[0].URL != "https://a.example" || got[0].Title != "Alpha" {
+		t.Fatalf("first annotation = %+v", got[0])
+	}
+	if got[1].Index != 2 || got[1].URL != "https://b.example" {
+		t.Fatalf("second annotation = %+v", got[1])
+	}
+	if strings.Contains(string(raw), "__searching__") {
+		t.Fatalf("sentinel leaked: %s", raw)
+	}
+}
+
+// sseChunk is the subset of a streaming frame the citation test inspects.
+type sseChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content     string `json:"content"`
+			Annotations []struct {
+				Type  string `json:"type"`
+				Index int    `json:"index"`
+				URL   string `json:"url"`
+				Title string `json:"title"`
+			} `json:"annotations"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+}
