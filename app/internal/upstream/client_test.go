@@ -103,6 +103,12 @@ type mockUpstream struct {
 	searchBodies    []string
 	searchEncodings []string
 
+	// Decide fixtures. Handler nil means a canned 200.
+	decideHandler func(w http.ResponseWriter, r *http.Request)
+	decideTokens  []string
+	decideAccepts []string
+	decideBodies  [][]byte
+
 	// Audio fixtures. Handlers nil means a canned 200.
 	ttsHandler      func(w http.ResponseWriter, r *http.Request)
 	sttHandler      func(w http.ResponseWriter, r *http.Request)
@@ -131,6 +137,7 @@ func startUpstream(t *testing.T) *mockUpstream {
 	mux.HandleFunc("/api/search-lab/config", m.handleConfig)
 	mux.HandleFunc("/api/search-lab/run", m.handleSearchRun)
 	m.addAudioRoutes(mux)
+	m.addDecideRoutes(mux)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
