@@ -19,13 +19,12 @@ idle watchdog, and a disconnect-safe pool.
 
 **Out of scope, deliberately:** usage/token accounting (upstream publishes
 none; the field is omitted rather than fabricated), tool calling (no prompt
-injection, no XML reassembler, no tool_choice), inline web search inside
-`/api/chat` (`webSearchEnabled` is pinned off and `source-url` events are
-ignored; the standalone endpoint is the supported search surface; the
-`__searching__` / `__search_error__` sentinel titles are never reproduced),
-the synthesized answer from `/api/search-lab/run` (only its sources are
-bridged), admin UI, and persistence. CORS preflight is answered so browser
-clients can call the keyed API.
+injection, no XML reassembler, no tool_choice), the synthesized answer from
+`/api/search-lab/run` (only its sources are bridged), admin UI, and
+persistence. Inline web search inside `/api/chat` is **on** — it is the
+upstream default for a new chat and its `source-url` events are translated
+into OpenAI `url_citation` annotations (§2.4). CORS preflight is answered so
+browser clients can call the keyed API.
 
 The project is a single static binary with **zero non-stdlib dependencies**
 (`go.mod` has no `require` block). See §1.1 for the pass-through philosophy
@@ -124,14 +123,24 @@ makes the edge re-issue a challenge on every request, so the gateway could
 never hold a successful clearance. `utls`, `internal/fp`, the ALPN override,
 and `DisableKeepAlives` are gone; `go.mod` has zero dependencies.
 
-**Acquisition** (`internal/clear`), run lazily the first time a request needs
-it, and again when the cookie is old:
+**Acquisition** (`internal/clear`), started at boot and again when the cookie
+is old:
 
 ```
 GET  <base>/api/session                                  -> 429 + x-vercel-challenge-token
 solve token locally (v2 PoW, below)                      ~70–100 ms CPU, no network
 POST <base>/.well-known/vercel/security/request-challenge -> 204 + Set-Cookie: _vcrcs=… (3600 s)
 ```
+
+**Prewarm semantics.** Boot starts clearance acquisition immediately in a
+background goroutine (`Client.StartClearancePrewarm`): it never blocks or
+fails boot, and a failure is logged and left to the ordinary retry paths
+(lazy `Ensure` on the next request, `Refresh` on a challenge). Because the
+solve is ~100 ms and the acquisition shares the gateway's egress, `/healthz`
+reports `clearance.has_cookie:true` within about a second of boot in the
+normal case. A background refresher (`RefreshLoop`) then re-acquires at the
+configured `IL2API_CLEARANCE_REFRESH` age (45 m of the 60 m TTL), measured
+from boot rather than from the first request. No new configuration knobs.
 
 The token format is
 `<version>.<seed>.<ttl>.<base64(payload)>.<signature>`, where
@@ -161,7 +170,8 @@ must verify offline).
 - `Refresh(ctx)` runs `GET → solve → POST` and stores the cookie with its
   issue time. It refuses to start another refresh within a 15 s cooldown per
   client, so a challenged burst cannot become a solve storm.
-- The cookie is refreshed **proactively at 45 min of its 60 min TTL**.
+- The cookie is refreshed **proactively at 45 min of its 60 min TTL**, and
+  that cycle starts at boot (§ acquisition above), not at first traffic.
 - On a `429` carrying `x-vercel-mitigated: challenge` (or a challenge token
   header) the request is retried **once** after a forced refresh. A challenge
   that survives that replay is reported as `upstream_clearance_failed`, never
@@ -214,7 +224,7 @@ Observed event vocabulary (the complete set):
 | `text-start` | `id`, optional `text` | a text block opens; `text` is a full snapshot |
 | `text-delta` | `id`, `delta` | incremental answer text |
 | `text-end` | `id` | block closes |
-| `source-url` | `sourceId`, `url`, `title` | web search citation or sentinel (ignored) |
+| `source-url` | `sourceId`, `url`, `title` | web search citation or sentinel (§2.4) |
 | `[DONE]` | — | normal end |
 
 There are no `usage`, `finish-*`, `tool-*`, or `error` events. Multiple
@@ -323,6 +333,73 @@ and 4096 per URL. On top of the sliding watchdog, a whole run is capped at
 ten idle windows (600 s with the default 60 s), so an upstream emitting one
 keep-alive line per window cannot pin a request forever.
 
+### 2.4 Search citations — translating `source-url`
+
+The upstream answer text carries bracket markers (`[13]`, `[19]`) that refer to
+the sources it retrieved. The gateway must not let those markers arrive with no
+sources attached, so `source-url` events become OpenAI `url_citation`
+annotations.
+
+**Captured event shape** (one authorized live probe, 2026-10-21; raw stream in
+`docs/source-url-capture.sse`):
+
+```
+data: {"type":"source-url","sourceId":"__searching__","url":"","title":"__searching__"}
+data: {"type":"source-url","sourceId":"https://autonomy.work/portfolio/uk4dwpilotresults","url":"https://autonomy.work/portfolio/uk4dwpilotresults","title":"The results are in: the UK's four-day week pilot - The Autonomy Institute"}
+…
+```
+
+Fields, and nothing else: `type`, `sourceId`, `url`, `title`. There is **no
+per-source index, rank, or offset field** in the event.
+
+**Rank mapping.** `sourceId` equals the URL for a real source, so it carries no
+ordering either. The only ordering the stream supplies is **arrival order**,
+which is also how the model numbers citations in practice. The gateway assigns
+`index = arrival rank` over the accepted sources, starting at 1. This mapping
+is an assumption, documented here because the upstream does not publish one.
+
+**Sentinels.** `title == "__searching__"` opens the search phase: a no-op.
+`title == "__search_error__"`: log it and keep the answer flowing; a search
+failure is never allowed to abort the chat stream. Both sentinels are dropped
+and never become annotations, and `__searching__` does not consume a rank.
+
+**Acceptance rules** (each accepted source is one annotation):
+
+- `url` must be an absolute `http`/`https` URL with a host, carry no ASCII
+  control characters, and be at most 4096 runes; otherwise it is dropped
+  (same `isHTTPURL` rule as `/v1/web_search`, so `javascript:`/`data:` never
+  reach a client that renders links).
+- `title` is whitespace-collapsed and trimmed, capped at 512 runes.
+- Duplicate URLs are dropped (the first occurrence keeps its rank).
+- At most 50 annotations per response.
+
+**Annotation shape** (identical in both paths):
+
+```json
+{"type":"url_citation","index":1,"url":"https://…","title":"…","start_index":0,"end_index":0}
+```
+
+`start_index`/`end_index` are **always 0**: the upstream events carry no
+character offsets into the answer text, and 0/0 is OpenAI's convention for
+"not available". The gateway does not invent offsets by searching the answer
+for a bracket marker, because a marker may repeat and the assumption would be
+silent and wrong. (OpenAI's field names are `start_index`/`end_index`.)
+
+**Where annotations attach.**
+
+- **Streaming:** after the upstream text blocks that precede the sources have
+  ended — concretely, on the gateway's `finish_reason:"stop"` frame, whose
+  `delta` is `{"annotations":[…]}` instead of `{}` — one chunk carrying the
+  whole array. This is the "annotations on the finish chunk" alternative from
+  the task, chosen because the upstream interleaves `text-end → sources →
+  text-start` and any earlier chunk could be followed by more text. A stream
+  with no accepted sources keeps the plain `delta:{}` finish frame.
+- **Non-streaming:** `choices[0].message.annotations` holds the same array in
+  response order. The field is omitted when there are no sources.
+
+Sources are collected in arrival order and emitted even when the upstream
+places them after the first text block and a later block follows (§2.4 probe).
+
 ## 3. Wire format — OpenAI Chat Completions
 
 ### 3.1 Request
@@ -362,7 +439,8 @@ Frames, in order:
    `reasoning-delta`, in arrival order (including later blocks)
 3. zero or more `delta:{"content":"..."}` frames, one per upstream
    `text-start` snapshot and `text-delta`
-4. finish frame: `delta:{}`, `finish_reason:"stop"`
+4. finish frame: `delta:{"annotations":[…]}` when web-search sources were
+   collected (§2.4), otherwise `delta:{}`; `finish_reason:"stop"`
 5. `data: [DONE]`
 
 Every frame carries `id` (`chatcmpl-<12 hex>`, stable per request), `object:
@@ -370,12 +448,11 @@ Every frame carries `id` (`chatcmpl-<12 hex>`, stable per request), `object:
 `choices:[{index:0,delta:...,finish_reason:null|"stop",logprobs:null}]`.
 
 `finish_reason` is `"stop"` when the upstream stream ends normally and is
-never `"length"` (there is no output cap). `source-url` events are ignored,
-including the reserved `__searching__` / `__search_error__` sentinel titles
-(the chat request pins `webSearchEnabled:false`, so they should never appear;
-if the upstream emits them anyway, they are dropped like any other source).
-`reasoning-start` / `reasoning-end` / `text-end` produce no frame of their
-own.
+never `"length"` (there is no output cap). `source-url` events are translated
+into `url_citation` annotations carried on the finish frame (§2.4); the
+`__searching__` sentinel is a no-op and `__search_error__` is logged while the
+answer keeps flowing. `reasoning-start` / `reasoning-end` / `text-end` produce
+no frame of their own.
 
 If the upstream fails after the headers are committed, the gateway emits one
 SSE frame `{"error":{"message","type":"upstream_error","code"}}` followed by
@@ -393,12 +470,18 @@ One JSON object:
   "model": "mercury-3",
   "choices": [{
     "index": 0,
-    "message": {"role": "assistant", "content": "...", "reasoning_content": "..."},
+    "message": {"role": "assistant", "content": "...", "reasoning_content": "...",
+                "annotations": [{"type": "url_citation", "index": 1,
+                                 "url": "https://…", "title": "…",
+                                 "start_index": 0, "end_index": 0}]},
     "finish_reason": "stop",
     "logprobs": null
   }]
 }
 ```
+
+`message.annotations` is omitted when the upstream sent no sources; the array
+is in arrival order (§2.4).
 
 `reasoning_content` is omitted when empty. `content` is always a string
 (`""` if the model produced only reasoning). There is **no** `usage` field —
@@ -636,6 +719,17 @@ Invalid values are startup errors with an actionable message.
   streams, snapshot text, mid-stream failure, idle timeout, auth, oversized
   input pass-through, dropped params, tools-as-plain-chat, media placeholder,
   and client disconnect.
+- Citation translation is pinned against scripted `source-url` streams:
+  normal sources (rank order, annotation shape, finish-frame delivery),
+  `__searching__` as a no-op that consumes no rank, `__search_error__`
+  logged without aborting the text, missing/empty URLs, non-http schemes,
+  duplicate URLs, sources after `text-end` followed by a later text block,
+  the capture fixture `testdata/source-url-capture.sse`, and the non-stream
+  `message.annotations` shape. The sentinel titles never reach a client.
+- Clearance prewarm is pinned: boot starts acquisition without blocking
+  (a stalled challenge does not delay `StartClearancePrewarm`'s return), a
+  failed acquisition is tolerated and leaves `has_cookie:false`, and the
+  refresh loop re-acquires at the configured age from boot.
 - Web search is tested entirely against an `httptest` NDJSON mock: the full
   plan → retrieve → rerank → docs pipeline, a gzip-encoded body, a `br` body
   typed error, a missing `docs` event, a terminal `error` event, truncation,
