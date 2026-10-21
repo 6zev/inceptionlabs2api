@@ -18,6 +18,12 @@ import (
 func (s *Server) upstreamError(err error) *openai.RequestError {
 	s.upErrors.Add(1)
 	switch {
+	case errors.Is(err, upstream.ErrIdleTimeout):
+		return openai.New(http.StatusGatewayTimeout, "upstream_error", openai.CodeUpstreamIdle, "",
+			"upstream sent nothing for the idle window; the generation was abandoned")
+	case errors.Is(err, upstream.ErrStreamTruncated):
+		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamStream, "",
+			"upstream closed the stream before completion")
 	case errors.Is(err, upstream.ErrUnavailable):
 		return openai.New(http.StatusServiceUnavailable, "server_error", openai.CodeUpstreamUnavailable, "",
 			"upstream session pool is empty; the upstream may be challenging this egress or unavailable, retry shortly")
@@ -25,7 +31,7 @@ func (s *Server) upstreamError(err error) *openai.RequestError {
 		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamAuth, "",
 			"upstream rejected newly acquired session tokens")
 	case errors.Is(err, context.Canceled):
-		return openai.New(http.StatusBadRequest, "invalid_request_error", openai.CodeInvalidRequest, "",
+		return openai.New(http.StatusRequestTimeout, "invalid_request_error", openai.CodeInvalidRequest, "",
 			"request canceled by the client")
 	}
 	var se *upstream.StatusError
@@ -35,6 +41,10 @@ func (s *Server) upstreamError(err error) *openai.RequestError {
 			fmt.Sprintf("upstream returned HTTP %d", se.Status))
 	}
 	s.logf("upstream: chat failed: %v", err)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return openai.New(http.StatusGatewayTimeout, "upstream_error", openai.CodeUpstreamIdle, "",
+			"the upstream did not respond before the request deadline")
+	}
 	return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamError, "",
 		"upstream request failed")
 }

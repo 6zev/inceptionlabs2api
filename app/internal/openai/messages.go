@@ -1,7 +1,9 @@
 package openai
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -19,8 +21,11 @@ func NormalizeMessages(msgs []Message, maxChars int) ([]TextMessage, int, *Reque
 	total := 0
 
 	for i, m := range msgs {
-		if len(m.ToolCalls) > 0 && string(m.ToolCalls) != "null" {
+		if hasToolCalls(m.ToolCalls) {
 			return nil, 0, toolUnsupported(fmt.Sprintf("messages[%d].tool_calls", i), "tool_calls")
+		}
+		if m.Role == "tool" || m.Role == "function" {
+			return nil, 0, toolUnsupported(fmt.Sprintf("messages[%d].role", i), fmt.Sprintf("role %q", m.Role))
 		}
 		role, ok := normalizeRole(m.Role)
 		if !ok {
@@ -64,6 +69,18 @@ func NormalizeMessages(msgs []Message, maxChars int) ([]TextMessage, int, *Reque
 	return out, total, nil
 }
 
+// hasToolCalls reports whether a raw tool_calls value carries anything. Null,
+// empty arrays and empty objects are treated as absent: many clients send
+// "tool_calls": [] on ordinary assistant history.
+func hasToolCalls(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	switch trimmed {
+	case "", "null", "[]", "{}":
+		return false
+	}
+	return true
+}
+
 // normalizeRole maps OpenAI roles onto the three roles the upstream accepts.
 func normalizeRole(role string) (string, bool) {
 	switch role {
@@ -73,8 +90,6 @@ func normalizeRole(role string) (string, bool) {
 		return "user", true
 	case "assistant":
 		return "assistant", true
-	case "tool", "function":
-		return "", false
 	default:
 		return "", false
 	}

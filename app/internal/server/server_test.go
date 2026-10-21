@@ -528,7 +528,7 @@ func TestValidationNeverReachesUpstream(t *testing.T) {
 		{"unknown param", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"temperature":0.5}`, 400, openai.CodeUnsupportedParam},
 		{"tools", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"tools":[]}`, 400, openai.CodeToolUnsupported},
 		{"image", `{"model":"mercury-3","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`, 400, openai.CodeContentUnsupported},
-		{"tool message", `{"model":"mercury-3","messages":[{"role":"tool","content":"x","tool_call_id":"c"}]}`, 400, openai.CodeInvalidRequest},
+		{"tool message", `{"model":"mercury-3","messages":[{"role":"tool","content":"x","tool_call_id":"c"}]}`, 400, openai.CodeToolUnsupported},
 		{"malformed", `{`, 400, openai.CodeInvalidRequest},
 		{"empty messages", `{"model":"mercury-3","messages":[]}`, 400, openai.CodeInvalidRequest},
 		{"bad effort", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"reasoning_effort":"max"}`, 400, openai.CodeInvalidRequest},
@@ -685,5 +685,34 @@ func TestCORSHeadersOnResponse(t *testing.T) {
 	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","messages":[{"role":"user","content":"q"}]}`)
 	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Fatal("CORS header missing on a normal response")
+	}
+}
+
+func TestTrailingJSONRejected(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{}
+	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","messages":[{"role":"user","content":"q"}]}{"x":1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var env openai.ErrorResponse
+	json.Unmarshal(rec.Body.Bytes(), &env)
+	if !strings.Contains(env.Error.Message, "unexpected data") {
+		t.Fatalf("message = %q", env.Error.Message)
+	}
+}
+
+func TestEmptyToolCallsAccepted(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return streamOf(hardStream), nil }}
+	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","messages":[
+		{"role":"user","content":"q"},
+		{"role":"assistant","content":"a","tool_calls":[]},
+		{"role":"user","content":"q2"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if got := len(up.lastRequest().Messages); got != 3 {
+		t.Fatalf("messages = %d, want 3", got)
 	}
 }

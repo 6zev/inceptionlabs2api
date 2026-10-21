@@ -135,6 +135,7 @@ func dialTLS(ctx context.Context, addr string, proxy *proxyAddr, roots *x509.Cer
 			tlsConn := tls.Client(raw, &tls.Config{
 				ServerName: proxyHostname(proxy.host),
 				MinVersion: tls.VersionTLS12,
+				RootCAs:    roots,
 			})
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				raw.Close()

@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -36,9 +37,13 @@ var reasoningEfforts = map[string]string{
 // are rejected with a *RequestError.
 func Decode(body []byte) (*ChatRequest, *RequestError) {
 	var raw map[string]json.RawMessage
-	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec := json.NewDecoder(bytes.NewReader(body))
 	if err := dec.Decode(&raw); err != nil {
 		return nil, Invalid(fmt.Sprintf("invalid JSON body: %v", err))
+	}
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); err == nil {
+		return nil, Invalid("invalid JSON body: unexpected data after the request object")
 	}
 	if raw == nil {
 		return nil, Invalid("request body must be a JSON object")

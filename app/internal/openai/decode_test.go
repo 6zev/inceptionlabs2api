@@ -164,7 +164,21 @@ func TestNormalizeRejectsToolMessages(t *testing.T) {
 
 	msgs = []Message{{Role: "tool", Content: "result", ToolCallID: "call_1"}}
 	_, _, re = NormalizeMessages(msgs, 0)
-	if re == nil || !strings.Contains(re.Message, "unsupported role") {
+	if re == nil || re.Code != CodeToolUnsupported {
+		t.Fatalf("err = %+v, want tool_calling_unsupported", re)
+	}
+
+	// Empty tool_calls arrays are ordinary history, not a tool request.
+	msgs = []Message{
+		{Role: "assistant", Content: "done", ToolCalls: json.RawMessage(`[]`)},
+		{Role: "assistant", Content: "done", ToolCalls: json.RawMessage(`null`)},
+	}
+	if _, _, re := NormalizeMessages(msgs, 0); re != nil {
+		t.Fatalf("empty tool_calls should be accepted, got %+v", re)
+	}
+
+	msgs = []Message{{Role: "bogus", Content: "x"}}
+	if _, _, re := NormalizeMessages(msgs, 0); re == nil || !strings.Contains(re.Message, "unsupported role") {
 		t.Fatalf("err = %+v, want unsupported role", re)
 	}
 }

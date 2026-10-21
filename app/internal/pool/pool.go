@@ -20,6 +20,9 @@ import (
 // Token shape bounds: {unix_ts}.{32 hex}.{64 hex}, where the unix timestamp
 // is 10 digits (11 after 2286).
 const (
+	// refillTimeout bounds the asynchronous refill started by Discard.
+	refillTimeout = 15 * time.Second
+
 	tokenParts  = 3
 	nonceHexLen = 32
 	signHexLen  = 64
@@ -158,7 +161,7 @@ func (p *Pool) Get(ctx context.Context) (string, error) {
 		return tok, nil
 	}
 	if err := p.grow(ctx); err != nil {
-		return "", fmt.Errorf("%w: %v", ErrNoToken, err)
+		return "", fmt.Errorf("%w: %w", ErrNoToken, err)
 	}
 	if tok, ok := p.pick(); ok {
 		return tok, nil
