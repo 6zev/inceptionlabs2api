@@ -16,12 +16,12 @@ OpenAI-compatible Chat Completions API.
 `POST /v1/web_search` (standalone retrieval, §2.3 / §7.1),
 `POST /v1/audio/speech` (TTS, §2.5.1 / §7.2),
 `POST /v1/audio/transcriptions` (STT, §2.5.2 / §7.3), `GET /v1/models`,
-`GET /healthz`, optional bearer-key auth, OpenAI-shaped errors, a 60 s sliding
-idle watchdog, and a disconnect-safe pool.
+`GET /healthz`, tool calling emulated over the prompt (§4.1), optional
+bearer-key auth, OpenAI-shaped errors, a 60 s sliding idle watchdog, and a
+disconnect-safe pool.
 
 **Out of scope, deliberately:** usage/token accounting (upstream publishes
-none; the field is omitted rather than fabricated), tool calling (no prompt
-injection, no XML reassembler, no tool_choice), the synthesized answer from
+none; the field is omitted rather than fabricated), the synthesized answer from
 `/api/search-lab/run` (only its sources are bridged), admin UI, and
 persistence. Inline web search inside `/api/chat` is **on** — it is the
 upstream default for a new chat and its `source-url` events are translated
@@ -58,7 +58,7 @@ Explicitly **not** validated (dropped, coerced, or passed through):
 | Input | Behaviour | Rationale |
 |---|---|---|
 | `temperature`, `top_p`, `n`, `logprobs`, `top_logprobs`, `stop`, `presence_penalty`, `frequency_penalty`, `seed`, `user`, `response_format`, `stream_options`, `logit_bias`, `parallel_tool_calls`, any other unknown top-level key | **silently dropped** | The upstream has no equivalent field. OpenAI SDKs send these on every ordinary call; a 400 would break them over a field that changes nothing. |
-| `tools`, `tool_choice`, `functions`, `function_call` | **dropped**; the request proceeds as plain chat | Tool calling is out of scope, but a caller that offers tools can still get an answer without them. |
+| `tools`, `tool_choice`, `functions`, `function_call` | **used when `tools` is non-empty** (§4.1); otherwise dropped and the request proceeds as plain chat | The upstream has no native tool slot; the gateway emulates the protocol over the prompt, and a request without tools pays nothing. |
 | `messages[].tool_calls` / `function_call` | **dropped** | Assistant history produced by another tool-using agent is just text here. |
 | `role:"tool"` / `role:"function"` | **coerced to `user`** | The tool result is text the model may find useful; erroring discards context the caller explicitly supplied. |
 | Unknown roles | **coerced to `user`** | Same reasoning; the upstream would reject anything it truly cannot use. |
@@ -726,13 +726,18 @@ Decoded fields:
 | `messages` | required, non-empty; see §4 |
 | `stream` | optional bool, default false |
 | `reasoning_effort` | optional; `minimal` maps to `low`; anything else is passed through; default `medium` |
+| `tools` | optional; non-empty activates §4.1, empty/absent is the plain-chat path |
+| `tool_choice` | optional; `none`/`auto`/`required`/named (§4.1, §5 of `DESIGN-TOOLS.md`) |
+| `parallel_tool_calls` | optional; only adds an instruction; the parser never enforces a count |
 
 Every other top-level key is **silently dropped** (§1.1). That includes
 `temperature`, `top_p`, `n`, `stop`, `logprobs`, `response_format`,
 `presence_penalty`, `frequency_penalty`, `seed`, `user`, `stream_options`,
-`tools`, `tool_choice`, `functions`, and `function_call`. A `tools` request is
-answered as plain chat: tool calling is out of scope, so the tools are not
-forwarded and no tool call is ever emitted.
+`functions`, and `function_call`. Legacy `functions`/`function_call` are not
+translated: their shapes are deprecated in OpenAI's own spec, and the gateway
+does not guess whether a caller wants the legacy or current wire shape. A
+request with non-empty `tools` is handled by §4.1; any other request is
+answered as plain chat.
 
 The request body is capped at 6 MiB (`http.MaxBytesReader`). The cap exists
 only to bound memory; it is far above any request the upstream accepts and is
@@ -861,12 +866,86 @@ Rules:
   renderable text at all is the only content 400 (§1.1, class 2).
 - `role:"tool"` and `role:"function"` messages are coerced to `user`;
   `tool_calls` / `function_call` on a message are dropped. Top-level `tools` /
-  `tool_choice` are dropped and the request proceeds as plain chat.
+  `tool_choice` are dropped and the request proceeds as plain chat — **unless
+  `tools` is non-empty**, in which case §4.1 applies.
 - `name` is accepted and ignored.
 - Unknown roles are coerced to `user`.
 - There is no input length guard. The upstream truncates at its own limit;
   that is the upstream's contract (§1.1). The total text length is still
   counted and returned for logging.
+
+### 4.1 Tool calling (emulated over the prompt)
+
+The upstream has no client-declared tool path (§2, and `TOOLCALL-PATH.md`);
+tool calling is a gateway feature. Full evidence and alternatives are in
+`DESIGN-TOOLS.md`; this section is normative.
+
+**Activation.** Everything here is gated on a **non-empty `tools` array**. A
+request without one takes exactly the pre-existing path: no preamble, no
+parser, `role:"tool"` coerced to `user`, `tool_calls` dropped. That path is
+byte-identical to the pre-v8 gateway and is pinned by a golden test and a live
+capture (`testdata/no-tools-baseline.sse`).
+
+**Request decoding.** `tools[]` items must be
+`{"type":"function","function":{"name":<non-empty string>,...}}`; `parameters`
+is any JSON value (an unparseable/absent schema renders as `{}`), `description`
+any string. A `tools` value that is not an array, or an item without a string
+name, is a 400 `invalid_request_error` — class 2 (a body the wire cannot
+express), not a policy judgement. `tool_choice` accepts `"none"`, `"auto"`,
+`"required"` and `{"type":"function","function":{"name":X}}`; an unrecognised
+value is treated as `"auto"`. `parallel_tool_calls` is read only to add an
+instruction.
+
+**Injection.** One system message, placed before the client's own messages,
+containing the `<tools>` list (one compact JSON object per line:
+`name`, `description`, `parameters`) and the `<tool_call>` output contract.
+Under a named `tool_choice` only that tool is listed. `tool_choice:"none"`
+disables injection and parsing entirely. Above **30** declared tools the list
+is a tier-1 index (names + descriptions, no `parameters`) plus a synthetic
+`tool_schema` loader (§4.1.1).
+
+**Parsing.** Accumulated text is scanned for `<tool_call>` … `</tool_call>`
+(JSON body: `name` string, `arguments` object) and, as drift tolerance,
+`<tool_calls><invoke name="…"><parameter name="…">…</parameter></invoke></tool_calls>`.
+A block becomes a call only if it parses, `name` is a declared tool, and it is
+≤64 KiB. Otherwise the raw block is emitted as `content`. At end of stream an
+unterminated block is emitted as content. No parse failure is ever a gateway
+error.
+
+**Streaming.** Content is released up to the longest suffix that is a prefix
+of a start marker. A completed call is emitted as one `tool_calls` delta
+(`index`, `id` (`call_` + 24 alnum on first sight), `type:"function"`,
+`function.name`, complete `function.arguments` string). `finish_reason` is
+`"tool_calls"` iff at least one call was emitted, else `"stop"`. No keepalive
+frames are emitted while buffering.
+
+**Non-streaming.** `message.tool_calls` in the same order; `message.content`
+stays a string (`""` when the turn is only a call); `finish_reason:"tool_calls"`.
+
+**Replay.** Assistant turns that carried `tool_calls` are rendered as their
+text followed by one `<tool_call>` block per call, including the call `id`.
+Consecutive `role:"tool"` messages are grouped into one user turn containing
+`<tool_response call_id="…" name="…">…</tool_response>` blocks in arrival
+order; a result with no matching call id keeps its `call_id` and omits `name`.
+
+#### 4.1.1 Tiered manifest
+
+When a request declares **more than 30 tools**, the system preamble lists every
+tool's name and description but **no parameter schemas**, plus a synthetic
+function `tool_schema({"names":[…]} | {"query":"…"})` that is not a client tool.
+If the model's buffered response calls `tool_schema`, the gateway builds a
+second upstream request whose preamble contains the full schemas of the
+requested tools (lexical match over name + description when `query` is used),
+repeats the original user turn, and at most **twice** repeats this. If the
+second round still calls `tool_schema`, that block is demoted to text, any
+other calls stand, and the response ends normally. The client never sees
+`tool_schema`; both probe rounds are buffered in full before anything is
+written, so the response shape is always one normal answer.
+
+The threshold and the tier shape are cited, not invented: 30 is the lower bound
+of the published 30–50-tool degradation range, and "names + descriptions in
+context, parameter schema deferred" is exactly what OpenAI's `defer_loading`
+documents (`DESIGN-TOOLS.md` §6.2).
 
 ## 5. Session pool
 
@@ -1203,6 +1282,16 @@ Invalid values are startup errors with an actionable message.
   streams, snapshot text, mid-stream failure, idle timeout, auth, oversized
   input pass-through, dropped params, tools-as-plain-chat, media placeholder,
   and client disconnect.
+- Tool calling (§4.1) is pinned by the `tools` package's failure-mode table
+  (each row in `DESIGN-TOOLS.md` §7 is one test): no-tools byte-identity
+  (golden prompt + golden frame sequence against
+  `testdata/no-tools-baseline.sse`), format drift, half a call, invalid JSON,
+  undeclared names, text-and-call in one response, parallel calls, marker
+  splits at every byte boundary, multi-byte runes at holdbacks, 64 KiB cap,
+  code fences, replay of assistant `tool_calls` and grouped `tool` results,
+  every `tool_choice` variant, and both tiered-manifest paths (loader honoured,
+  loader repeated twice → demoted). The live probe plan and its budget are in
+  `DESIGN-TOOLS.md` §8.
 - Citation translation is pinned against scripted `source-url` streams:
   normal sources (rank order, annotation shape, finish-frame delivery),
   `__searching__` as a no-op that consumes no rank, `__search_error__`
