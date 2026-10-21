@@ -110,8 +110,14 @@ type Config struct {
 	// ClearanceCooldown is the minimum retry interval after a failed
 	// acquisition. Zero means 15s.
 	ClearanceCooldown time.Duration
-	// ClearancePool is the size of the clearance ring. Zero means 3.
+	// ClearancePool is the size of the clearance ring. Zero means 20.
 	ClearancePool int
+	// ClearanceFillPace is the pause the background fill loop takes between
+	// acquisitions. Zero means 1.5s; negative disables it (tests).
+	ClearanceFillPace time.Duration
+	// ClearanceJitter is the extra random pause added to ClearanceFillPace.
+	// Zero means 500ms; negative disables it (tests).
+	ClearanceJitter time.Duration
 	// RootCAs is optional; nil means the system trust store.
 	RootCAs *x509.CertPool
 	// Logf is optional; nil means log.Printf.
@@ -147,6 +153,8 @@ func NewClient(cfg Config) (*Client, pool.Fetcher) {
 		Pool:     cfg.ClearancePool,
 		Refresh:  cfg.ClearanceRefresh,
 		Cooldown: cfg.ClearanceCooldown,
+		FillPace: cfg.ClearanceFillPace,
+		Jitter:   cfg.ClearanceJitter,
 		Logf:     logf,
 	})
 	return c, c.FetchSession
@@ -159,18 +167,23 @@ func (c *Client) BindPool(p *pool.Pool) { c.pool = p }
 // Clearance exposes the clearance state for /healthz.
 func (c *Client) Clearance() *clear.Clearance { return c.clear }
 
-// clearanceLoopInterval is how often the refresh loop checks cookie age. It
-// is short relative to the 60-minute TTL, so the proactive refresh happens
-// close to the configured margin without needing a precise timer.
-const clearanceLoopInterval = time.Minute
-
-// StartClearancePrewarm acquires the clearance cookie in the background at
-// boot and keeps it fresh from then on (SPEC §2.1.1). It never blocks and
-// never fails boot: an acquisition error is logged and the ordinary lazy
-// request paths retry. The loop stops when ctx is cancelled.
+// StartClearancePrewarm fills the first clearance slot and then starts the one
+// background fill loop (SPEC §2.1.1, §2.1.2):
+//
+//   - Boot waits for the first slot synchronously: ~0.1–0.4 s, "warm a base,
+//     not the maximum". The server starts as soon as this returns.
+//   - A failed boot fill is NOT a failed startup: it is logged, the service
+//     starts with `has_cookie:false`, and the loop keeps retrying.
+//   - The loop fills the remaining slots sequentially (1–2 s + jitter apart),
+//     refills any slot retired by a 429, and replaces stale slots one per
+//     iteration.
+//
+// The loop stops when ctx is cancelled.
 func (c *Client) StartClearancePrewarm(ctx context.Context) {
-	c.clear.Prewarm(ctx)
-	go c.clear.RunRefreshLoop(ctx, clearanceLoopInterval)
+	if err := c.clear.PrewarmBoot(ctx); err != nil {
+		c.logf("clear: boot prewarm failed (the service still starts; the fill loop retries): %v", err)
+	}
+	c.clear.StartFillLoop(ctx)
 }
 
 // applyClearance sets the shared UA and the clearance cookie on req.
@@ -197,29 +210,19 @@ func challengedCookie(resp *http.Response) string {
 	return ""
 }
 
-// retireClearance retires the ring slot a challenge just rejected and refills
-// it in the background (SPEC §2.1.2). Only that slot is touched, so requests
-// rotating over the other slots keep their cookies and ages.
+// retireClearance retires the ring slot a challenge just rejected. It never
+// solves: the fill loop notices the empty slot and refills it (SPEC §2.1.2).
+// Only that slot is touched, so requests rotating over the other slots keep
+// their cookies and ages.
 func (c *Client) retireClearance(cookie string) {
 	if err := c.clear.Retire(cookie); err != nil {
 		c.logf("upstream: retiring clearance slot: %v", err)
-		return
-	}
-	go c.refillClearance()
-}
-
-// refillClearance acquires one cookie for an empty slot, bounded by the
-// clearance timeout. It runs outside the request path so the replay never
-// waits for it.
-func (c *Client) refillClearance() {
-	ctx, cancel := context.WithTimeout(context.Background(), clear.DefaultTimeout)
-	defer cancel()
-	if err := c.clear.Refill(ctx); err != nil {
-		c.logf("upstream: refilling a retired clearance slot failed: %v", err)
 	}
 }
 
-// ensureClearance acquires (or refreshes) the clearance cookie.
+// ensureClearance acquires (or refreshes) the clearance cookie. It is the
+// request path's lazy fallback for a ring with nothing live; it never tops up
+// a partially filled ring (the fill loop does that).
 func (c *Client) ensureClearance(ctx context.Context) error {
 	if err := c.clear.Ensure(ctx); err != nil {
 		return fmt.Errorf("%w: %v", ErrClearance, err)
@@ -250,11 +253,13 @@ func (c *Client) Send(ctx context.Context, method, path string, body []byte, hea
 	c.logf("upstream: checkpoint challenged %s %s; retiring the slot and replaying once", method, path)
 
 	// The challenge proves *that* cookie is not accepted. Retire only the slot
-	// that carried it, replace it, and replay; the other slots keep serving
-	// requests in the meantime (SPEC §2.1.2).
+	// that carried it and replay immediately on the next live slot: the request
+	// path never waits for a solve. The fill loop refills the retired slot
+	// (SPEC §2.1.2). With a ring of one, the lazy Ensure below performs the
+	// solve because there is no other slot to replay on.
 	c.retireClearance(challengedCookie(resp))
-	if err := c.clear.Refresh(ctx); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrClearance, err)
+	if err := c.ensureClearance(ctx); err != nil {
+		return nil, err
 	}
 	resp, err = c.do(ctx, method, path, body, headerTimeout, prepare)
 	if err != nil {

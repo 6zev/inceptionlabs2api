@@ -69,7 +69,7 @@ func Defaults() Config {
 
 		ClearanceRefresh:  45 * time.Minute,
 		ClearanceCooldown: 15 * time.Second,
-		ClearancePool:     3,
+		ClearancePool:     20,
 	}
 }
 

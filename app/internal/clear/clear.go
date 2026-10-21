@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,18 +40,40 @@ const (
 	// DefaultRefresh is the age at which a cookie is proactively replaced:
 	// 45 minutes into the edge's 60-minute TTL.
 	DefaultRefresh = 45 * time.Minute
-	// DefaultCooldown is the minimum spacing between acquisitions. A burst of
-	// challenged requests must not turn into a solve storm.
+	// DefaultCooldown is the per-slot minimum spacing after a *failed*
+	// acquisition. A burst of challenged requests must not turn into a solve
+	// storm, while the loop keeps working the other slots.
 	DefaultCooldown = 15 * time.Second
-	// DefaultTimeout bounds one acquisition (GET + POST).
+	// DefaultTimeout bounds one acquisition (GET + solve + POST).
 	DefaultTimeout = 30 * time.Second
-	// DefaultPool is the ring size. Live probes (§2.1.2) showed cookies are
-	// fungible with no per-cookie penalty; 3 hedges a per-slot retirement
-	// without paying more than three solves at boot.
-	DefaultPool = 3
+	// DefaultPool is the ring size, matching the anonymous-stock shape of the
+	// chatglm2api identity pool (§2.1.2): a challenged cookie is disposable
+	// and losing one must not cost a stall.
+	DefaultPool = 20
+	// DefaultFillPace is the pause the fill loop takes between acquisitions.
+	// Together with the jitter it spreads a 20-slot fill over 30-60 s: the
+	// edge sees a mild trickle, not a burst (SPEC §2.1.2).
+	DefaultFillPace = 1500 * time.Millisecond
+	// DefaultJitter is the extra random pause added to FillPace, so the
+	// acquisitions are not a metronome.
+	DefaultJitter = 500 * time.Millisecond
 	// maxBodyBytes drops what we read from challenge responses; only headers
 	// and cookies matter.
 	maxBodyBytes = 1 << 20
+)
+
+// SlotState is the state of one ring slot (SPEC §2.1.2).
+type SlotState string
+
+const (
+	// SlotPending means the slot has never been filled, or was retired by a
+	// challenge and waits for the fill loop.
+	SlotPending SlotState = "pending"
+	// SlotLive means the slot holds a cookie.
+	SlotLive SlotState = "live"
+	// SlotCooldown means the slot's last acquisition failed and it waits out
+	// the per-slot cooldown before the loop retries it.
+	SlotCooldown SlotState = "cooldown"
 )
 
 // ErrRefused means the edge answered the submission with 403: the proof of
@@ -61,28 +84,51 @@ var ErrRefused = errors.New("clear: challenge solution refused")
 // there is nothing to clear: this egress is already welcome.
 var errNoChallenge = errors.New("clear: no challenge issued")
 
-// State is the /healthz view of clearance. The top-level fields describe the
-// ring as a whole (HasCookie = any live slot, AgeSeconds = the oldest live
-// slot); Slots reports each configured slot.
+// State is the /healthz view of clearance. Live/Pool describe the ring as a
+// whole (HasCookie = any live slot, AgeSeconds = the oldest live slot);
+// Slots reports each configured slot, so an operator can watch the ring fill
+// to 20/20 and see one retired slot against a healthy ring (SPEC §2.1.2).
 type State struct {
-	HasCookie    bool        `json:"has_cookie"`
-	AgeSeconds   int64       `json:"age_seconds"`
-	RefreshCount int64       `json:"refresh_count"`
-	Slots        []SlotState `json:"slots"`
+	Live         int        `json:"live"`
+	Pool         int        `json:"pool"`
+	HasCookie    bool       `json:"has_cookie"`
+	AgeSeconds   int64      `json:"age_seconds"`
+	RefreshCount int64      `json:"refresh_count"`
+	Slots        []SlotView `json:"slots"`
 }
 
-// SlotState is the health view of one ring slot.
-type SlotState struct {
-	Cookie       bool  `json:"cookie"`
-	AgeSeconds   int64 `json:"age_seconds"`
-	RefreshCount int64 `json:"refresh_count"`
+// SlotView is the health view of one ring slot.
+type SlotView struct {
+	Cookie       bool      `json:"cookie"`
+	State        SlotState `json:"state"`
+	AgeSeconds   int64     `json:"age_seconds"`
+	RefreshCount int64     `json:"refresh_count"`
 }
 
-// slot is one clearance cookie in the rotation ring.
+// slot is one clearance cookie in the rotation ring, plus the per-slot
+// bookkeeping of its lifecycle.
 type slot struct {
 	cookie    string
 	acquired  time.Time
 	refreshes int64
+
+	// lastAttempt and lastErr implement the per-slot failure cooldown: only a
+	// slot whose own attempt failed waits, so one broken attempt cannot freeze
+	// the fills or the serving of the others.
+	lastAttempt time.Time
+	failed      bool
+	lastErr     error
+}
+
+// stateLocked reports the slot's lifecycle state.
+func (s *slot) stateLocked(now time.Time, cooldown time.Duration) SlotState {
+	if s.cookie != "" {
+		return SlotLive
+	}
+	if s.failed && cooldown > 0 && !s.lastAttempt.IsZero() && now.Sub(s.lastAttempt) < cooldown {
+		return SlotCooldown
+	}
+	return SlotPending
 }
 
 // Config configures a Clearance.
@@ -97,9 +143,15 @@ type Config struct {
 	Pool int
 	// Refresh is the proactive replacement age. Zero means DefaultRefresh.
 	Refresh time.Duration
-	// Cooldown is the minimum spacing between acquisitions. Zero means
-	// DefaultCooldown; negative disables it (tests).
+	// Cooldown is the per-slot minimum spacing after a failed acquisition.
+	// Zero means DefaultCooldown; negative disables it (tests).
 	Cooldown time.Duration
+	// FillPace is the pause the fill loop takes between acquisitions. Zero
+	// means DefaultFillPace; negative disables it (tests).
+	FillPace time.Duration
+	// Jitter is the extra random pause added to FillPace. Zero means
+	// DefaultJitter; negative disables it (tests).
+	Jitter time.Duration
 	// Timeout bounds one acquisition. Zero means DefaultTimeout.
 	Timeout time.Duration
 	// Now is injectable for tests. Nil means time.Now.
@@ -108,8 +160,10 @@ type Config struct {
 	Logf func(format string, args ...any)
 }
 
-// Clearance holds a ring of cookies. It is safe for concurrent use; refresh
-// work is single-flight across the whole ring.
+// Clearance holds a ring of cookies. It is safe for concurrent use. All
+// acquisition work runs in at most one place: the request path may perform a
+// single lazy Ensure, and one background fill loop maintains the rest
+// (§2.1.2).
 type Clearance struct {
 	cfg    Config
 	base   string
@@ -130,12 +184,7 @@ type Clearance struct {
 	// schedule a cookie would be refreshed.
 	probedAt time.Time
 
-	refreshes   int64
-	lastAttempt time.Time
-	// lastFailed records that the most recent attempt failed, so a cooldown
-	// window opened by a success is not mistaken for a failing checkpoint.
-	lastFailed bool
-	lastErr    error
+	refreshes int64
 
 	inflight     bool
 	inflightDone chan struct{}
@@ -155,6 +204,18 @@ func New(cfg Config) *Clearance {
 	}
 	if cfg.Cooldown < 0 {
 		cfg.Cooldown = 0
+	}
+	if cfg.FillPace == 0 {
+		cfg.FillPace = DefaultFillPace
+	}
+	if cfg.FillPace < 0 {
+		cfg.FillPace = 0
+	}
+	if cfg.Jitter == 0 {
+		cfg.Jitter = DefaultJitter
+	}
+	if cfg.Jitter < 0 {
+		cfg.Jitter = 0
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultTimeout
@@ -230,11 +291,21 @@ func (c *Clearance) State() State {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
-	st := State{RefreshCount: c.refreshes, Slots: make([]SlotState, len(c.slots))}
+	st := State{
+		Pool:         len(c.slots),
+		RefreshCount: c.refreshes,
+		Slots:        make([]SlotView, len(c.slots)),
+	}
 	oldest := time.Duration(-1)
-	for i, s := range c.slots {
-		ss := SlotState{Cookie: s.cookie != "", RefreshCount: s.refreshes}
+	for i := range c.slots {
+		s := &c.slots[i]
+		ss := SlotView{
+			Cookie:       s.cookie != "",
+			State:        s.stateLocked(now, c.cfg.Cooldown),
+			RefreshCount: s.refreshes,
+		}
 		if s.cookie != "" {
+			st.Live++
 			age := now.Sub(s.acquired)
 			if age < 0 {
 				age = 0
@@ -286,109 +357,161 @@ func (c *Clearance) liveLocked() int {
 }
 
 // Ensure acquires a cookie if none is held, or replaces a slot past the refresh
-// margin when every slot is stale. Concurrent callers coalesce into one
-// acquisition. The per-request path never tops the ring up: rotation plus the
-// boot fill and RefreshStale are what maintain its size.
+// margin when every slot is stale. It is the lazy request path and never
+// waits for a fill that is already running; the per-request path never tops the
+// ring up — the background loop does that (SPEC §2.1.2).
 func (c *Clearance) Ensure(ctx context.Context) error {
 	c.mu.Lock()
 	needed := c.staleLocked()
+	idx := c.emptyLocked()
 	c.mu.Unlock()
 	if !needed {
 		return nil
 	}
-	// An explicit replacement (a stale ring) is not the lazy success-cooldown
-	// shortcut; only a failure window may stop it.
-	c.mu.Lock()
-	idx := c.emptyLocked()
-	c.mu.Unlock()
-	return c.acquireForce(ctx, idx)
+	return c.acquireSlot(ctx, idx)
 }
 
 // Refresh replaces the cookie a challenge just rejected, or acquires one when
 // none is held. It is the recovery path: a window opened by a failure still
 // spaces it, but it always attempts a solve when no healthy replay is
-// possible, even inside a success cooldown.
+// possible.
 func (c *Clearance) Refresh(ctx context.Context) error {
 	c.mu.Lock()
 	idx := c.emptyLocked()
 	c.mu.Unlock()
-	// Always force: a lazy success-cooldown skip would tell the caller "done"
-	// while the cookie it asked to replace still stands.
-	return c.acquireForce(ctx, idx)
+	return c.acquireSlot(ctx, idx)
 }
 
-// Prewarm starts the boot fill in the background and returns immediately. Boot
-// calls it so the first request does not pay the solve and network round trip
-// (SPEC §2.1.1); a failure is logged and left to the ordinary lazy path
-// (Ensure on the next request, Refresh on a challenge). The goroutine is
-// bounded by the acquisition timeout each acquisition inherits.
-func (c *Clearance) Prewarm(ctx context.Context) {
-	go func() {
-		if err := c.PrewarmNow(ctx); err != nil {
-			c.logf("clear: prewarm failed (requests will retry lazily): %v", err)
-		}
-	}()
-}
-
-// PrewarmNow fills every slot synchronously and reports the first failure.
-// Acquisitions are sequential (§2.1.2): concurrent solves are the storm the
-// cooldown exists to prevent. A failed fill stops there; the slots already
-// filled stay live, and Refill/RefreshStale recover the rest.
-func (c *Clearance) PrewarmNow(ctx context.Context) error {
-	c.mu.Lock()
-	empty := c.liveLocked() < c.cfg.Pool
-	c.mu.Unlock()
-	if !empty {
-		return nil
-	}
-	if err := c.Ensure(ctx); err != nil {
+// PrewarmBoot fills the first slot synchronously and returns when it is live
+// (SPEC §2.1.1, §2.1.2 — "warm a base, not the maximum"). Boot calls it, then
+// starts the server: one slot is enough to serve. An error is returned but is
+// NOT a failed startup: the caller logs it, serves `has_cookie:false`, and
+// StartFillLoop retries in the background.
+func (c *Clearance) PrewarmBoot(ctx context.Context) error {
+	idx := c.firstEmpty()
+	err := c.acquireSlot(ctx, idx)
+	if err != nil {
 		return err
 	}
+	if c.cfg.Pool > 1 {
+		c.logf("clear: boot slot live; the remaining %d slots fill in the background", c.cfg.Pool-1)
+	}
+	return nil
+}
+
+// PrewarmNow fills the whole ring sequentially and reports the first failure.
+// It is the blocking variant used by tests and by callers that want a full
+// ring before proceeding; boot uses PrewarmBoot instead. It does not apply
+// the loop's FillPace pause — the caller asked to wait for the full ring.
+func (c *Clearance) PrewarmNow(ctx context.Context) error {
+	var firstErr error
 	for {
-		c.mu.Lock()
-		need := c.liveLocked() < c.cfg.Pool && !c.probed
-		c.mu.Unlock()
-		if !need {
-			return nil
+		if c.liveLocked() >= c.cfg.Pool || c.probedLocked() {
+			break
 		}
-		if err := c.acquireForce(ctx, c.emptyLocked()); err != nil {
-			return err
+		idx := c.firstEmpty()
+		if idx < 0 {
+			break
+		}
+		if err := c.acquireSlot(ctx, idx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// StartFillLoop runs the one background goroutine that maintains the ring: it
+// fills a pending (never-filled or retired) slot, or replaces the oldest slot
+// past the refresh margin — one acquisition per iteration — then pauses
+// FillPace + jitter (SPEC §2.1.2). Filling and refreshing share the loop so a
+// 429's refill and the 45-minute rotation are the same code path, and so the
+// edge never sees two acquisitions at once.
+//
+// It returns a channel that is closed when the loop has exited, which makes
+// shutdown observable (the process does not leak the goroutine). Cancelling
+// ctx stops it promptly, including during a paced pause.
+func (c *Clearance) StartFillLoop(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.fillLoop(ctx)
+	}()
+	return done
+}
+
+// fillLoop is the body of StartFillLoop.
+func (c *Clearance) fillLoop(ctx context.Context) {
+	for {
+		filled := c.fillOnce(ctx)
+		if !c.sleep(ctx, c.nextPause(filled)) {
+			return
 		}
 	}
 }
 
-// RunRefreshLoop keeps the ring fresh from boot, checking at every tick for
-// slots at the configured refresh age and replacing at most one per tick, so a
-// multi-slot ring does not burst its solves (§2.1.2).
-//
-// It only maintains cookies it already holds: when none exists (an egress that
-// is never challenged, or a failed prewarm) it does nothing, because Ensure is
-// the path that retries acquisition and prewarm already ran once.
-//
-// It blocks until ctx is cancelled. Callers run it in a goroutine next to
-// Prewarm.
-func (c *Clearance) RunRefreshLoop(ctx context.Context, every time.Duration) {
-	if every <= 0 {
-		every = time.Minute
-	}
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if c.Cookie() == "" {
-				continue
-			}
-			if err := c.RefreshStale(ctx); err != nil {
-				c.logf("clear: proactive refresh failed: %v", err)
-			}
+// nextPause is the idle time after one iteration: FillPace + jitter after a
+// fill (so consecutive acquisitions are paced), and a second FillPace — at
+// least a second — when there was nothing to do, so an idle ring is still
+// checked often enough to react to a 429 promptly.
+func (c *Clearance) nextPause(filled bool) time.Duration {
+	pause := c.cfg.FillPace + c.jitter()
+	if !filled {
+		pause += c.cfg.FillPace
+		if pause < time.Second {
+			pause = time.Second
 		}
 	}
+	return pause
+}
+
+// fillOnce performs at most one acquisition: the lowest-numbered pending slot
+// first, else the oldest stale slot. It reports whether it filled any slot.
+// An unchallenged egress (probed, no cookies) is left alone.
+func (c *Clearance) fillOnce(ctx context.Context) bool {
+	c.mu.Lock()
+	if c.probed && c.liveLocked() == 0 {
+		c.mu.Unlock()
+		return false
+	}
+	idx := c.fillTargetLocked(c.now())
+	c.mu.Unlock()
+	if idx < 0 {
+		return false
+	}
+	if err := c.acquireSlot(ctx, idx); err != nil {
+		c.logf("clear: background fill of slot %d failed: %v", idx, err)
+	}
+	return true
+}
+
+// fillTargetLocked chooses the slot one iteration should work on: the first
+// pending slot (a retired one first, so a 429's gap is repaired before the
+// initial fill on a fresh process), then the oldest stale slot, else -1.
+func (c *Clearance) fillTargetLocked(now time.Time) int {
+	for i := range c.slots {
+		// A pending slot in its failure cooldown is not a target yet: the loop
+		// moves on and returns to it when the window closes. Without this a
+		// refusing checkpoint would make the loop spin on slot 0 forever.
+		if c.slots[i].stateLocked(now, c.cfg.Cooldown) == SlotPending {
+			return i
+		}
+	}
+	idx, oldest := -1, time.Duration(0)
+	for i := range c.slots {
+		age := now.Sub(c.slots[i].acquired)
+		if age < c.cfg.Refresh {
+			continue
+		}
+		if idx < 0 || age > oldest {
+			idx, oldest = i, age
+		}
+	}
+	return idx
 }
 
 // RefreshStale replaces at most one slot that has reached the refresh age.
+// The fill loop calls it once per iteration; the per-tick budget is one, so a
+// 20-slot ring rotates inside the 45m→60m headroom with no burst (§2.1.2).
 func (c *Clearance) RefreshStale(ctx context.Context) error {
 	c.mu.Lock()
 	idx, have := c.staleSlotLocked()
@@ -396,7 +519,50 @@ func (c *Clearance) RefreshStale(ctx context.Context) error {
 	if !have {
 		return nil
 	}
-	return c.acquireForce(ctx, idx)
+	return c.acquireSlot(ctx, idx)
+}
+
+// jitter returns a random pause in [0, Jitter).
+func (c *Clearance) jitter() time.Duration {
+	if c.cfg.Jitter <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(c.cfg.Jitter)))
+}
+
+// sleep waits for d or for ctx cancellation; it reports whether the wait
+// completed (false means cancelled).
+func (c *Clearance) sleep(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// firstEmpty returns the index of the first empty slot, or -1 when the ring
+// has no empty slot.
+func (c *Clearance) firstEmpty() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.slots {
+		if c.slots[i].cookie == "" {
+			return i
+		}
+	}
+	return -1
+}
+
+// probedLocked reports the recorded "this egress is not challenged" result,
+// which only means anything while no slot is live.
+func (c *Clearance) probedLocked() bool {
+	return c.probed && c.liveLocked() == 0
 }
 
 // staleSlotLocked returns the oldest slot past the refresh margin.
@@ -420,14 +586,19 @@ func (c *Clearance) staleSlotLocked() (int, bool) {
 
 // Retire removes the slot holding cookie (a value with or without the
 // "_vcrcs=" prefix). A 429 proves that cookie is not accepted; only that slot
-// is retired, and it is refilled in the background (SPEC §2.1.2). An unknown
-// value is a no-op.
+// is retired. The call is O(ring) and never solves: it runs on the request
+// path, whose caller immediately replays on the next live slot. The fill loop
+// notices the shortfall and refills the slot (SPEC §2.1.2). An unknown value
+// is a no-op.
 func (c *Clearance) Retire(cookie string) error {
 	cookie = strings.TrimPrefix(cookie, CookieName+"=")
 	c.mu.Lock()
 	for i := range c.slots {
 		if c.slots[i].cookie == cookie {
-			c.slots[i] = slot{}
+			// Drop only the cookie. The slot's cooldown bookkeeping belongs to
+			// a possible in-flight acquisition and must survive.
+			c.slots[i].cookie = ""
+			c.slots[i].acquired = time.Time{}
 			c.mu.Unlock()
 			c.logf("clear: retired slot %d after a challenge", i)
 			return nil
@@ -447,17 +618,9 @@ func (c *Clearance) Invalidate() {
 	c.mu.Unlock()
 }
 
-// acquireForce runs one single-flight acquisition into a chosen slot. It is
-// the only entry below "replace something": every caller (a challenge replay,
-// a stale slot, a retired slot, the boot fill) is an explicit instruction, and
-// the only thing that may stop it is a recorded *failure* inside the
-// cooldown. idx < 0 means "choose a slot".
-func (c *Clearance) acquireForce(ctx context.Context, idx int) error {
-	return c.acquireSlot(ctx, idx)
-}
-
 // Refill acquires one cookie into an empty slot, or replaces the oldest slot
-// when the ring is full. It is what a retired slot's background refill calls.
+// when the ring is full. It is the blocking primitive the fill loop's work
+// amounts to; the 429 path does not call it (the loop does).
 func (c *Clearance) Refill(ctx context.Context) error {
 	c.mu.Lock()
 	idx := c.emptyLocked()
@@ -482,13 +645,16 @@ func (c *Clearance) emptyLocked() int {
 }
 
 // acquireSlot runs at most one acquisition at a time, writing the result into
-// slot idx.
+// slot idx and recording the outcome on that slot. It is the existing
+// single-flight: the fill is sequential anyway, so it costs nothing, and it
+// keeps lazy request-path Ensure calls from stacking solves behind the fill
+// (§2.1.2 — zero concurrency).
 func (c *Clearance) acquireSlot(ctx context.Context, idx int) error {
 	c.mu.Lock()
 	if c.inflight {
 		done := c.inflightDone
 		c.mu.Unlock()
-		return c.wait(ctx, done)
+		return c.wait(ctx, idx, done)
 	}
 	c.inflight = true
 	c.inflightDone = make(chan struct{})
@@ -500,77 +666,84 @@ func (c *Clearance) acquireSlot(ctx context.Context, idx int) error {
 	c.mu.Lock()
 	c.inflight = false
 	c.inflightDone = nil
-	if err != nil {
-		c.lastErr = err
-		c.lastFailed = true
-	} else {
-		c.lastErr = nil
-		c.lastFailed = false
+	if idx >= 0 && idx < len(c.slots) {
+		c.slots[idx].lastAttempt = c.now()
+		c.slots[idx].failed = err != nil
+		c.slots[idx].lastErr = err
 	}
 	c.mu.Unlock()
 	close(done)
 	return err
 }
 
-// wait blocks until the owner's acquisition finishes and reports its result.
-func (c *Clearance) wait(ctx context.Context, done chan struct{}) error {
+// wait blocks until the owner acquisition finishes and reports its result.
+func (c *Clearance) wait(ctx context.Context, idx int, done chan struct{}) error {
 	select {
 	case <-done:
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		// A successful acquisition may legitimately end with no cookie: an
 		// unchallenged egress needs none. Only a recorded error is a failure.
-		return c.lastErr
+		if idx >= 0 && idx < len(c.slots) {
+			return c.slots[idx].lastErr
+		}
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-// refresh runs the GET -> solve -> POST flow, honouring the cooldown.
+// refresh runs the GET -> solve -> POST flow, honouring the slot's cooldown.
 //
-// The cooldown bounds *failed* attempts: a burst of requests against a
-// checkpoint that keeps refusing must not become a solve storm (SPEC §2.1.1).
-// Inside a window opened by a failure, a held cookie is reused (the caller's
-// request proceeds with it) and a caller without one gets lastErr back rather
-// than a silent success that would send an unprotected request. A window never
-// follows a successful acquisition, so recovery — a 429 challenge right after
-// a solve — is never blocked.
+// The cooldown bounds *failed* attempts on ONE slot: a burst of requests
+// against a checkpoint that keeps refusing must not become a solve storm
+// (SPEC §2.1.1), but it must not stop the other slots from filling or serving
+// either. A caller without a cookie gets that slot's recorded error back
+// rather than a silent success that would send an unprotected request. A
+// successful acquisition never opens a window, so recovery — a 429 challenge
+// right after a solve — is never blocked.
 func (c *Clearance) refresh(ctx context.Context, idx int) error {
+	if idx < 0 || idx >= len(c.slots) {
+		idx = c.firstEmpty()
+	}
 	now := c.now()
 	c.mu.Lock()
-	last := c.lastAttempt
-	lastErr := c.lastErr
-	openedByFailure := c.lastFailed
+	last := c.slots[idx].lastAttempt
+	lastErr := c.slots[idx].lastErr
+	openedByFailure := c.slots[idx].failed
 	c.mu.Unlock()
 
 	if c.cfg.Cooldown > 0 && !last.IsZero() && now.Sub(last) < c.cfg.Cooldown {
-		// Inside the window, a recorded failure means the checkpoint is down;
-		// neither a lazy request nor a forced fill may retry it yet.
+		// Inside this slot's window, a recorded failure means the checkpoint is
+		// down; neither a lazy request nor a fill may retry it yet.
 		if lastErr != nil && openedByFailure {
 			return fmt.Errorf("%w (retrying in %s)", lastErr, c.cfg.Cooldown-now.Sub(last))
 		}
-		// The window was opened by a success. Every caller that got here is an
-		// explicit replacement (the lazy "reuse a held cookie" decision lives
-		// in staleLocked), so it proceeds; otherwise a challenge replay inside
-		// the window would be silently skipped.
 	}
-
-	c.mu.Lock()
-	c.lastAttempt = now
-	c.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
 	defer cancel()
+
+	// Stamp the attempt before the network call, so a failed attempt opens its
+	// cooldown even if the process is busy for the whole timeout.
+	c.mu.Lock()
+	if idx >= 0 && idx < len(c.slots) {
+		c.slots[idx].lastAttempt = now
+	}
+	c.mu.Unlock()
 
 	start := c.now()
 	token, err := c.fetchChallenge(ctx)
 	if errors.Is(err, errNoChallenge) {
 		// Not challenged: no cookie is needed on this egress. Successful
 		// acquisition with nothing to hold; every slot stays empty and the
-		// probe result is what marks the ring as done.
+		// probe result is what tells the fill loop to stop probing.
 		c.mu.Lock()
 		for i := range c.slots {
-			c.slots[i] = slot{}
+			// Drop only the cookies: cooldown bookkeeping belongs to the slot
+			// that recorded it.
+			c.slots[i].cookie = ""
+			c.slots[i].acquired = time.Time{}
 		}
 		c.probed = true
 		c.probedAt = c.now()
@@ -594,7 +767,9 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 	if idx < 0 || idx >= len(c.slots) {
 		idx = c.emptyLocked()
 	}
-	c.slots[idx] = slot{cookie: cookie, acquired: c.now(), refreshes: c.slots[idx].refreshes + 1}
+	c.slots[idx].cookie = cookie
+	c.slots[idx].acquired = c.now()
+	c.slots[idx].refreshes++
 	c.probed = false
 	c.probedAt = time.Time{}
 	c.refreshes++

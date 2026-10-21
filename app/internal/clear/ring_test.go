@@ -150,8 +150,8 @@ func TestRingSkipsStaleSlots(t *testing.T) {
 	}
 }
 
-// The refresh loop replaces one stale slot per tick: a three-slot ring does
-// not burst three solves in one tick (SPEC §2.1.2).
+// RefreshStale replaces one stale slot per call: a three-slot ring does not
+// burst three solves in one iteration (SPEC §2.1.2).
 func TestRingRefreshReplacesOneSlotPerTick(t *testing.T) {
 	t.Parallel()
 	cs := newChallengeServer(t)
@@ -230,7 +230,8 @@ func TestRingRetireTouchesOnlyThatSlot(t *testing.T) {
 			t.Fatal("retired cookie was served again")
 		}
 	}
-	// And the slot can be refilled, landing in the empty slot.
+	// And the slot can be refilled, landing in the empty slot. Refill is the
+	// blocking primitive the background loop's fill action calls.
 	if err := c.Refill(context.Background()); err != nil {
 		t.Fatalf("Refill: %v", err)
 	}

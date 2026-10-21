@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -203,8 +204,10 @@ func writeSessionToken(w http.ResponseWriter, n int) {
 }
 
 func writeSessionTokenValue(n int) string {
-	sign := strings.Repeat(string(rune('a'+(n%26))), 64)
-	return "1792553057." + strings.Repeat("0", 31) + string(rune('a'+(n%26))) + "." + sign
+	// The signature must be hex (pool.ValidateToken): a 20-slot prewarm
+	// already pushes the counter past the hex letters, so format it.
+	sign := fmt.Sprintf("%064x", n)
+	return "1792553057." + strings.Repeat("0", 31) + "a." + sign
 }
 
 func (m *mockUpstream) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -890,7 +893,7 @@ func TestChallengeRetiresTheSlotAndRefills(t *testing.T) {
 	}
 	// One slot is held; a challenge must not clear others or leave the ring
 	// short. (With one held slot the retirement is observable as a gap that
-	// the immediate Refresh and the background refill both target.)
+	// the lazy Ensure performs when there is no other slot to replay on.)
 	if got := live(); got != 1 {
 		t.Fatalf("live slots before = %d, want 1", got)
 	}
@@ -935,5 +938,45 @@ func TestSearchConfigRetriesOn401(t *testing.T) {
 	}
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("probe attempts = %d, want 2 (401 then retry)", got)
+	}
+}
+
+// A 429 retires its slot and the replay goes out immediately on another live
+// slot: the request path never waits for a solve (SPEC §2.1.2). The fill loop
+// is stopped and its slot refill is not triggered, so the only way the replay
+// can succeed is by rotating to a slot that is already live.
+func TestChallengeReplayDoesNotWaitForASolve(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	var attempts atomic.Int32
+	m.chatHandler = func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			m.challenge(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"type\":\"text-delta\",\"id\":\"text-0\",\"delta\":\"ok\"}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}
+	c, _ := newTestClient(t, m, 1)
+	// The fill loop is NOT started: no background refill can be happening.
+	// A full ring is filled synchronously, so a live slot exists to replay on.
+	if err := c.Clearance().PrewarmNow(context.Background()); err != nil {
+		t.Fatalf("PrewarmNow: %v", err)
+	}
+	// Warm the token pool while the ring is live: once a slot is retired, a
+	// fetch made with no clearance would challenge the session route.
+	if _, err := c.FetchSession(context.Background()); err != nil {
+		t.Fatalf("FetchSession: %v", err)
+	}
+	submitsBefore := m.challengeSubmits.Load()
+
+	stream, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	stream.Close()
+	if got := m.challengeSubmits.Load(); got != submitsBefore {
+		t.Fatalf("clearance submissions = %d during the replay, want %d (no inline solve)", got, submitsBefore)
 	}
 }

@@ -55,11 +55,13 @@ func run() error {
 	defer p.Close()
 	up.BindPool(p)
 
-	// Prewarm the clearance ring and keep it fresh from boot, so the first chat
-	// request does not pay the PoW + round trip and /healthz reports a filled
-	// ring within about a second (SPEC §2.1.1, §2.1.2). Non-blocking; failures
-	// are logged. The pool then fills behind it (it needs clearance to fetch a
-	// token), and the search probe runs last (it needs a pooled token).
+	// Fill the clearance ring's first slot at boot (~0.1-0.4 s, so the first
+	// chat request does not pay the PoW + round trip) and start the one
+	// background loop that fills the rest, refills retired slots and refreshes
+	// stale ones (SPEC §2.1.1, §2.1.2). A boot failure is logged, never fatal:
+	// the service starts and the loop retries. The pool then fills behind it
+	// (it needs clearance to fetch a token), and the search probe runs last
+	// (it needs a pooled token).
 	bootCtx, stopBoot := context.WithCancel(context.Background())
 	defer stopBoot()
 	up.StartClearancePrewarm(bootCtx)

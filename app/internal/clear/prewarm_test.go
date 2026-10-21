@@ -5,14 +5,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// Prewarm must return immediately even when the challenge endpoint stalls:
-// boot is never allowed to wait on the network.
-func TestPrewarmDoesNotBlock(t *testing.T) {
+// Boot fills the first slot synchronously and is bounded by the acquisition
+// timeout, so a stalled challenge cannot hold the server forever: the boot
+// fill fails, boot proceeds, and the service starts (SPEC §2.1.1, §2.1.2).
+func TestPrewarmBootIsBounded(t *testing.T) {
 	t.Parallel()
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -21,93 +21,97 @@ func TestPrewarmDoesNotBlock(t *testing.T) {
 	defer srv.Close()
 	defer close(release)
 
-	c := newTestClearance(t, srv)
+	c := New(Config{BaseURL: srv.URL, Timeout: 100 * time.Millisecond, Logf: func(string, ...any) {}})
 	start := time.Now()
-	done := make(chan struct{})
-	go func() {
-		c.Prewarm(context.Background())
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Prewarm blocked on a stalled challenge endpoint")
+	if err := c.PrewarmBoot(context.Background()); err == nil {
+		t.Fatal("a stalled boot acquisition must report the failure")
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("Prewarm took %s, want an immediate return", elapsed)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("PrewarmBoot took %s, want the acquisition timeout bound", elapsed)
+	}
+	if st := c.State(); st.HasCookie {
+		t.Fatalf("a stalled edge reported a cookie: %+v", st)
 	}
 }
 
-// Prewarm acquires the cookie in the background so /healthz can report it
-// moments after boot.
-func TestPrewarmAcquiresCookie(t *testing.T) {
+// Boot returns as soon as the first slot is live. The rest of the ring is the
+// fill loop's job (SPEC §2.1.2): one loop, started once at boot, completes it.
+func TestPrewarmBootThenLoopFillsTheRing(t *testing.T) {
 	t.Parallel()
 	cs := newChallengeServer(t)
-	c := newTestClearance(t, cs.srv)
-	c.Prewarm(context.Background())
+	// The default ring size with a test-sized pause: the property is that the
+	// loop reaches every slot, not that a production fill takes 30-60 s.
+	c := New(Config{BaseURL: cs.srv.URL, Cooldown: -1, FillPace: 5 * time.Millisecond, Jitter: -1, Logf: func(string, ...any) {}})
+	if err := c.PrewarmBoot(context.Background()); err != nil {
+		t.Fatalf("PrewarmBoot: %v", err)
+	}
+	if got := c.State().Live; got != 1 {
+		t.Fatalf("boot left %d live, want exactly 1", got)
+	}
 
-	// A deadline, not a latency claim: under -race with the full suite the
-	// three sequential solves plus TLS handshakes can take seconds. The
-	// property under test is that the boot fill reaches every slot.
-	deadline := time.Now().Add(20 * time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := c.StartFillLoop(ctx)
+
+	// A deadline, not a latency claim: under -race each real PoW solve costs
+	// about a second, so 19 paced acquisitions are slow. The property is that
+	// the loop reaches every slot.
+	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
-		st := c.State()
-		if st.HasCookie && len(st.Slots) == DefaultPool {
-			filled := 0
-			for _, s := range st.Slots {
-				if s.Cookie {
-					filled++
-				}
+		if st := c.State(); st.Live == DefaultPool {
+			cancel()
+			<-done
+			if got := cs.tokenCount(); got != DefaultPool {
+				t.Fatalf("challenge fetches = %d, want one per slot", got)
 			}
-			if filled == DefaultPool {
-				if got := cs.tokenCount(); got != DefaultPool {
-					t.Fatalf("challenge fetches = %d, want one per slot", got)
-				}
-				return
-			}
+			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("ring never filled after Prewarm (state %+v)", c.State())
+	t.Fatalf("ring never filled after boot (state %+v)", c.State())
 }
 
-// A failed acquisition is tolerated: it is logged, boot continues, and the
-// next Ensure can retry.
+// A failed boot acquisition is reported but tolerated: boot continues, and
+// the loop recovers the ring once the endpoint does (SPEC §2.1.2 — a failed
+// warm-up is not a failed startup).
 func TestPrewarmFailureIsTolerated(t *testing.T) {
 	t.Parallel()
 	cs := newChallengeServer(t)
 	cs.failSubmit = http.StatusBadGateway
-	var logged atomic.Int32
 	c := New(Config{
 		BaseURL:  cs.srv.URL,
-		Cooldown: -1,
-		Logf:     func(string, ...any) { logged.Add(1) },
+		Pool:     3,
+		Cooldown: time.Millisecond,
+		FillPace: time.Millisecond,
+		Jitter:   -1,
+		Logf:     func(string, ...any) {},
 	})
-	c.Prewarm(context.Background())
-
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && logged.Load() == 0 {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if logged.Load() == 0 {
-		t.Fatal("failed prewarm must be logged")
+	if err := c.PrewarmBoot(context.Background()); err == nil {
+		t.Fatal("a failed boot acquisition must be reported")
 	}
 	if st := c.State(); st.HasCookie {
 		t.Fatalf("failed prewarm reported a cookie: %+v", st)
 	}
-	// A later request can still acquire once the endpoint recovers.
+
 	cs.failSubmit = 0
-	if err := c.Ensure(context.Background()); err != nil {
-		t.Fatalf("Ensure after failed prewarm: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := c.StartFillLoop(ctx)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.State().Live == 3 {
+			cancel()
+			<-done
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if !c.State().HasCookie {
-		t.Fatal("Ensure did not recover after a failed prewarm")
-	}
+	t.Fatalf("the loop did not recover after a failed boot: %+v", c.State())
 }
 
-// RunRefreshLoop keeps the cookie fresh from boot: with a tiny refresh age it
-// re-acquires without any traffic.
-func TestRefreshLoopRefreshesFromBoot(t *testing.T) {
+// The fill loop keeps the ring fresh from boot: with a tiny refresh age it
+// re-acquires without any request traffic.
+func TestFillLoopRefreshesFromBoot(t *testing.T) {
 	t.Parallel()
 	cs := newChallengeServer(t)
 	var mu sync.Mutex
@@ -118,13 +122,16 @@ func TestRefreshLoopRefreshesFromBoot(t *testing.T) {
 		return now
 	}
 	c := New(Config{
-		BaseURL: cs.srv.URL,
-		Refresh: time.Minute,
-		Now:     clock,
-		Logf:    func(string, ...any) {},
+		BaseURL:  cs.srv.URL,
+		Pool:     1,
+		Refresh:  time.Minute,
+		FillPace: 5 * time.Millisecond,
+		Jitter:   -1,
+		Now:      clock,
+		Logf:     func(string, ...any) {},
 	})
-	if err := c.Ensure(context.Background()); err != nil {
-		t.Fatalf("initial Ensure: %v", err)
+	if err := c.PrewarmBoot(context.Background()); err != nil {
+		t.Fatalf("PrewarmBoot: %v", err)
 	}
 	if got := cs.tokenCount(); got != 1 {
 		t.Fatalf("fetches = %d, want 1", got)
@@ -132,11 +139,7 @@ func TestRefreshLoopRefreshesFromBoot(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	loopDone := make(chan struct{})
-	go func() {
-		c.RunRefreshLoop(ctx, 5*time.Millisecond)
-		close(loopDone)
-	}()
+	done := c.StartFillLoop(ctx)
 
 	// Age the cookie past the refresh margin; the loop must replace it
 	// without any request traffic.
@@ -156,42 +159,37 @@ func TestRefreshLoopRefreshesFromBoot(t *testing.T) {
 	}
 	cancel()
 	select {
-	case <-loopDone:
+	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("RunRefreshLoop did not stop on context cancellation")
+		t.Fatal("the fill loop did not stop on context cancellation")
 	}
 }
 
-// The loop maintains an existing cookie; when none is held (an egress that is
-// never challenged, or a failed prewarm) it must not spin on solves — the
-// lazy Ensure path is what retries.
-func TestRefreshLoopWithoutCookieDoesNotAcquire(t *testing.T) {
+// On an egress that is never challenged the boot probe records the fact and
+// the loop does not spin on solves: there is no cookie to hold or refresh.
+func TestFillLoopWithoutCookieDoesNotAcquire(t *testing.T) {
 	t.Parallel()
 	cs := newChallengeServer(t)
 	c := newTestClearance(t, cs.srv)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
-	c.RunRefreshLoop(ctx, 5*time.Millisecond)
+	c.StartFillLoop(ctx)
 	if got := cs.tokenCount(); got != 0 {
-		t.Fatalf("fetches = %d, want none without a held cookie", got)
+		t.Fatalf("fetches = %d, want none before a boot probe", got)
 	}
 }
 
 // The loop exits promptly on cancellation.
-func TestRefreshLoopStopsOnCancel(t *testing.T) {
+func TestFillLoopStopsOnCancel(t *testing.T) {
 	t.Parallel()
 	cs := newChallengeServer(t)
 	c := newTestClearance(t, cs.srv)
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		c.RunRefreshLoop(ctx, time.Hour)
-		close(done)
-	}()
+	done := c.StartFillLoop(ctx)
 	cancel()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("RunRefreshLoop ignored cancellation")
+		t.Fatal("StartFillLoop ignored cancellation")
 	}
 }

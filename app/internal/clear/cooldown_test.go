@@ -63,8 +63,9 @@ func TestCooldownFromFailureSpacesForcedFills(t *testing.T) {
 	}
 }
 
-// A ring that is being filled by boot is not gated by the success cooldown of
-// the slot it just filled: PrewarmNow must fill all slots back-to-back.
+// A ring that is being filled by PrewarmNow is not gated by the success
+// cooldown of the slot it just filled: PrewarmNow must fill all slots
+// back-to-back.
 func TestCooldownDoesNotStallTheBootFill(t *testing.T) {
 	t.Parallel()
 	cs := newChallengeServer(t)

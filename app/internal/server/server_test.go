@@ -1033,11 +1033,11 @@ func (f fakeClearance) State() clear.State { return f.st }
 func TestHealthzReportsClearance(t *testing.T) {
 	t.Parallel()
 	s := newTestServer(&fakeChatter{})
-	s.SetClearance(fakeClearance{st: clear.State{HasCookie: true, AgeSeconds: 12, RefreshCount: 3,
-		Slots: []clear.SlotState{
-			{Cookie: true, AgeSeconds: 12, RefreshCount: 1},
-			{Cookie: true, AgeSeconds: 8, RefreshCount: 1},
-			{Cookie: false, RefreshCount: 1},
+	s.SetClearance(fakeClearance{st: clear.State{Live: 2, Pool: 3, HasCookie: true, AgeSeconds: 12, RefreshCount: 3,
+		Slots: []clear.SlotView{
+			{Cookie: true, State: clear.SlotLive, AgeSeconds: 12, RefreshCount: 1},
+			{Cookie: true, State: clear.SlotLive, AgeSeconds: 8, RefreshCount: 1},
+			{Cookie: false, State: clear.SlotPending, RefreshCount: 1},
 		}}})
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -1053,15 +1053,19 @@ func TestHealthzReportsClearance(t *testing.T) {
 	if !body.Clearance.HasCookie || body.Clearance.AgeSeconds != 12 || body.Clearance.RefreshCount != 3 {
 		t.Fatalf("clearance = %+v", body.Clearance)
 	}
+	// live/pool is the operator's one-line view of the ring filling to size.
+	if body.Clearance.Live != 2 || body.Clearance.Pool != 3 {
+		t.Fatalf("live/pool = %d/%d, want 2/3", body.Clearance.Live, body.Clearance.Pool)
+	}
 	// Per-slot detail is what lets an operator see one retired slot against a
 	// healthy ring (SPEC §2.1.2).
 	if len(body.Clearance.Slots) != 3 {
 		t.Fatalf("slots = %+v, want 3", body.Clearance.Slots)
 	}
-	want := []clear.SlotState{
-		{Cookie: true, AgeSeconds: 12, RefreshCount: 1},
-		{Cookie: true, AgeSeconds: 8, RefreshCount: 1},
-		{Cookie: false, RefreshCount: 1},
+	want := []clear.SlotView{
+		{Cookie: true, State: clear.SlotLive, AgeSeconds: 12, RefreshCount: 1},
+		{Cookie: true, State: clear.SlotLive, AgeSeconds: 8, RefreshCount: 1},
+		{Cookie: false, State: clear.SlotPending, RefreshCount: 1},
 	}
 	for i := range want {
 		if body.Clearance.Slots[i] != want[i] {

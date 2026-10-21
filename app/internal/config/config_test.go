@@ -49,8 +49,8 @@ func TestDefaults(t *testing.T) {
 	if cfg.ClearanceCooldown != 15*time.Second {
 		t.Errorf("ClearanceCooldown = %s, want 15s", cfg.ClearanceCooldown)
 	}
-	if cfg.ClearancePool != 3 {
-		t.Errorf("ClearancePool = %d, want the default 3", cfg.ClearancePool)
+	if cfg.ClearancePool != 20 {
+		t.Errorf("ClearancePool = %d, want the default 20", cfg.ClearancePool)
 	}
 }
 

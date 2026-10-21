@@ -232,7 +232,11 @@ func newStack(t *testing.T, idle time.Duration) *stack {
 		// The production default: clearance acquisition nests inside it.
 		SessionTimeout: 15 * time.Second,
 		RootCAs:        m.roots,
-		Logf:           func(string, ...any) {},
+		// The production ring, with a test-sized fill pace: a 20-slot ring at
+		// 1.5-2 s per slot would make every boot assertion a 40 s wait.
+		ClearanceFillPace: 5 * time.Millisecond,
+		ClearanceJitter:   -1,
+		Logf:              func(string, ...any) {},
 	})
 	p := pool.New(pool.Config{Min: 2, Max: 8, TTL: 30 * time.Minute, Interval: time.Hour}, fetch)
 	t.Cleanup(p.Close)
@@ -761,12 +765,13 @@ func TestRunRejectsBadConfig(t *testing.T) {
 	}
 }
 
-// Boot prewarm: starting the clearance prewarm is immediate, and /healthz
-// reports has_cookie without any chat traffic. The acquisition deadline is
-// generous on purpose: the PoW solve is CPU-bound, and this test runs in
-// parallel with the rest of the suite under -race, where the solve and TLS
-// handshake can take well over the ~1 s SPEC quotes for an idle boot. The
-// property under test is "non-blocking start, eventual cookie", not latency.
+// Boot prewarm: starting the clearance prewarm blocks only for the first
+// slot, and /healthz reports has_cookie without any chat traffic. The
+// acquisition deadline is generous on purpose: the PoW solve is CPU-bound,
+// and this test runs in parallel with the rest of the suite under -race,
+// where the solve and TLS handshake can take well over the ~0.4 s SPEC quotes
+// for an idle boot. The property under test is "first slot at boot, eventual
+// full ring", not latency.
 func TestEndToEndClearancePrewarmAtBoot(t *testing.T) {
 	t.Parallel()
 	st := newStack(t, 5*time.Second)
@@ -775,8 +780,12 @@ func TestEndToEndClearancePrewarmAtBoot(t *testing.T) {
 
 	start := time.Now()
 	st.client.StartClearancePrewarm(ctx)
-	if elapsed := time.Since(start); elapsed > time.Second {
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Fatalf("StartClearancePrewarm blocked for %s", elapsed)
+	}
+	// The first slot is live when boot returns; the rest is the loop's work.
+	if st := st.client.Clearance().State(); st.Live != 1 {
+		t.Fatalf("boot left %d live, want exactly 1 (the base, not the max)", st.Live)
 	}
 
 	deadline := time.Now().Add(30 * time.Second)

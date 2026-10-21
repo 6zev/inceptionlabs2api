@@ -50,19 +50,26 @@ func prewarmToken() string {
 func TestStartClearancePrewarmAcquiresWithoutRequests(t *testing.T) {
 	t.Parallel()
 	ps := newPrewarmServer(t)
-	c, _ := NewClient(Config{BaseURL: ps.srv.URL, Logf: func(string, ...any) {}})
+	c, _ := NewClient(Config{BaseURL: ps.srv.URL, ClearanceFillPace: 5 * time.Millisecond,
+		ClearanceJitter: -1, Logf: func(string, ...any) {}})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Boot waits for exactly one slot (SPEC §2.1.2) and no longer. The bound
+	// is generous because the solve is CPU-bound and this runs under -race.
 	start := time.Now()
 	c.StartClearancePrewarm(ctx)
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("StartClearancePrewarm took %s, want an immediate return", elapsed)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("StartClearancePrewarm took %s, want a first-slot return", elapsed)
+	}
+	if st := c.Clearance().State(); st.Live != 1 {
+		t.Fatalf("boot left %d live, want exactly 1", st.Live)
 	}
 
-	// The boot fill lands one slot at a time; wait for the ring to be full and
-	// report which slots are up if it never is.
-	deadline := time.Now().Add(20 * time.Second)
+	// The loop fills one slot at a time; wait for the ring to be full and
+	// report which slots are up if it never is. Under -race each real solve
+	// costs about a second, so 19 paced acquisitions need a longer deadline.
+	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		st := c.Clearance().State()
 		filled := 0
@@ -84,7 +91,8 @@ func TestStartClearancePrewarmAcquiresWithoutRequests(t *testing.T) {
 func TestStartClearancePrewarmCancelsWithContext(t *testing.T) {
 	t.Parallel()
 	ps := newPrewarmServer(t)
-	c, _ := NewClient(Config{BaseURL: ps.srv.URL, Logf: func(string, ...any) {}})
+	c, _ := NewClient(Config{BaseURL: ps.srv.URL, ClearanceFillPace: 5 * time.Millisecond,
+		ClearanceJitter: -1, Logf: func(string, ...any) {}})
 	ctx, cancel := context.WithCancel(context.Background())
 	c.StartClearancePrewarm(ctx)
 	cancel()
@@ -98,7 +106,8 @@ func TestStartClearancePrewarmCancelsWithContext(t *testing.T) {
 func TestStartClearancePrewarmFillsTheRing(t *testing.T) {
 	t.Parallel()
 	ps := newPrewarmServer(t)
-	c, _ := NewClient(Config{BaseURL: ps.srv.URL, ClearancePool: 2, Logf: func(string, ...any) {}})
+	c, _ := NewClient(Config{BaseURL: ps.srv.URL, ClearancePool: 2, ClearanceFillPace: 5 * time.Millisecond,
+		ClearanceJitter: -1, Logf: func(string, ...any) {}})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c.StartClearancePrewarm(ctx)

@@ -16,6 +16,11 @@ import (
 	"inceptionlabs2api/internal/pool"
 )
 
+// audioCallTimeout is the per-call bound the audio tests pass. It must cover
+// the first clearance acquisition (a real PoW solve, ~1 s under -race) and is
+// not the property under test; the stall tests pass their own short bound.
+const audioCallTimeout = 30 * time.Second
+
 // addAudioRoutes wires /api/tts and /api/stt onto the shared TLS mock.
 func (m *mockUpstream) addAudioRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tts", m.handleTTS)
@@ -63,7 +68,7 @@ func TestSpeechSendsTextAndVoice(t *testing.T) {
 	m := startUpstream(t)
 	c, _ := newTestClient(t, m, 0)
 
-	got, err := c.Speech(context.Background(), SpeechRequest{Text: "hello", Voice: "sarah"}, time.Second)
+	got, err := c.Speech(context.Background(), SpeechRequest{Text: "hello", Voice: "sarah"}, audioCallTimeout)
 	if err != nil {
 		t.Fatalf("Speech: %v", err)
 	}
@@ -90,7 +95,7 @@ func TestSpeechOmitsEmptyVoice(t *testing.T) {
 	t.Parallel()
 	m := startUpstream(t)
 	c, _ := newTestClient(t, m, 0)
-	if _, err := c.Speech(context.Background(), SpeechRequest{Text: "hello"}, time.Second); err != nil {
+	if _, err := c.Speech(context.Background(), SpeechRequest{Text: "hello"}, audioCallTimeout); err != nil {
 		t.Fatalf("Speech: %v", err)
 	}
 	bodies := m.ttsRequests()
@@ -109,7 +114,7 @@ func TestSpeechStatusError(t *testing.T) {
 		io.WriteString(w, `{"error":"bad text"}`)
 	}
 	c, _ := newTestClient(t, m, 0)
-	_, err := c.Speech(context.Background(), SpeechRequest{Text: "x"}, time.Second)
+	_, err := c.Speech(context.Background(), SpeechRequest{Text: "x"}, audioCallTimeout)
 	var se *StatusError
 	if !errors.As(err, &se) || se.Status != http.StatusBadRequest {
 		t.Fatalf("err = %v, want StatusError 400", err)
@@ -122,7 +127,7 @@ func TestSpeechStatusError(t *testing.T) {
 func TestSpeechUnavailableWithoutPool(t *testing.T) {
 	t.Parallel()
 	c, _ := NewClient(Config{BaseURL: "https://127.0.0.1:1", Logf: func(string, ...any) {}})
-	_, err := c.Speech(context.Background(), SpeechRequest{Text: "x"}, time.Second)
+	_, err := c.Speech(context.Background(), SpeechRequest{Text: "x"}, audioCallTimeout)
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v, want ErrUnavailable", err)
 	}
@@ -254,7 +259,7 @@ func TestSpeechRejectsEmptyBody(t *testing.T) {
 		w.Header().Set("Content-Type", "audio/mpeg")
 	}
 	c, _ := newTestClient(t, m, 0)
-	if _, err := c.Speech(context.Background(), SpeechRequest{Text: "x"}, time.Second); err == nil {
+	if _, err := c.Speech(context.Background(), SpeechRequest{Text: "x"}, audioCallTimeout); err == nil {
 		t.Fatal("a 200 with no bytes was accepted as audio")
 	}
 }
@@ -264,7 +269,7 @@ func TestTranscribeForwardsMultipartAndSniffsMPEG(t *testing.T) {
 	m := startUpstream(t)
 	c, _ := newTestClient(t, m, 0)
 
-	text, err := c.Transcribe(context.Background(), AudioUpload{Filename: "speech.mp3", Data: testMP3}, time.Second)
+	text, err := c.Transcribe(context.Background(), AudioUpload{Filename: "speech.mp3", Data: testMP3}, audioCallTimeout)
 	if err != nil {
 		t.Fatalf("Transcribe: %v", err)
 	}
@@ -299,7 +304,7 @@ func TestTranscribeTypesNonMPEGAsOctetStream(t *testing.T) {
 	m := startUpstream(t)
 	c, _ := newTestClient(t, m, 0)
 	wav := append([]byte("RIFF\x00\x00\x00\x00WAVEfmt "), make([]byte, 16)...)
-	if _, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.wav", Data: wav}, time.Second); err != nil {
+	if _, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.wav", Data: wav}, audioCallTimeout); err != nil {
 		t.Fatalf("Transcribe: %v", err)
 	}
 	calls := m.sttRequests()
@@ -318,7 +323,7 @@ func TestTranscribeEmptyTextIsNotAnError(t *testing.T) {
 	m := startUpstream(t)
 	m.sttHandler = func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, `{"text":""}`) }
 	c, _ := newTestClient(t, m, 0)
-	text, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.wav", Data: []byte("RIFF....")}, time.Second)
+	text, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.wav", Data: []byte("RIFF....")}, audioCallTimeout)
 	if err != nil {
 		t.Fatalf("empty text became an error: %v", err)
 	}
@@ -335,7 +340,7 @@ func TestTranscribeUpstreamInvalidFileType(t *testing.T) {
 		io.WriteString(w, `{"error":"Invalid file type"}`)
 	}
 	c, _ := newTestClient(t, m, 0)
-	_, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.bin", Data: []byte("nope")}, time.Second)
+	_, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.bin", Data: []byte("nope")}, audioCallTimeout)
 	var se *StatusError
 	if !errors.As(err, &se) || se.Message() != "Invalid file type" {
 		t.Fatalf("err = %v", err)
@@ -347,7 +352,7 @@ func TestTranscribeRejectsUnparseableBody(t *testing.T) {
 	m := startUpstream(t)
 	m.sttHandler = func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "<html>") }
 	c, _ := newTestClient(t, m, 0)
-	_, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.mp3", Data: testMP3}, time.Second)
+	_, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.mp3", Data: testMP3}, audioCallTimeout)
 	if err == nil {
 		t.Fatal("html body parsed as a transcript")
 	}

@@ -39,6 +39,11 @@ type challengeServer struct {
 	failSubmit int
 	// seedBase advances the seed per challenge so each token is distinct.
 	seedBase int64
+	// tokenAt records when each challenge was issued; submitAt records when
+	// each submission arrived. Together they show whether the fill is
+	// sequential and how its iterations are paced.
+	tokenAt  []time.Time
+	submitAt []time.Time
 }
 
 func newChallengeServer(t *testing.T) *challengeServer {
@@ -53,6 +58,9 @@ func newChallengeServer(t *testing.T) *challengeServer {
 		c.challenge(w)
 	})
 	mux.HandleFunc(challengePath, func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		c.submitAt = append(c.submitAt, time.Now())
+		c.mu.Unlock()
 		c.submits.Add(1)
 		if c.failSubmit != 0 {
 			w.WriteHeader(c.failSubmit)
@@ -89,11 +97,28 @@ func newChallengeServer(t *testing.T) *challengeServer {
 }
 
 func (c *challengeServer) challenge(w http.ResponseWriter) {
+	c.mu.Lock()
+	c.tokenAt = append(c.tokenAt, time.Now())
+	c.mu.Unlock()
 	n := c.tokens.Add(1)
 	seed := c.seedBase + int64(n)
 	w.Header().Set("x-vercel-mitigated", "challenge")
 	w.Header().Set("x-vercel-challenge-token", makeToken(seed))
 	w.WriteHeader(http.StatusTooManyRequests)
+}
+
+// tokenTimes returns a copy of the challenge issue times.
+func (c *challengeServer) tokenTimes() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.tokenAt...)
+}
+
+// submissions returns a copy of the submission arrival times.
+func (c *challengeServer) submissions() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.submitAt...)
 }
 
 // makeToken builds a syntactically valid v2 token whose payload is a real
