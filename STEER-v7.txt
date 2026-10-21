@@ -1,0 +1,21 @@
+User steering update (overrides the concurrency part of TASK-v7, everything else stands):
+
+NO CONCURRENCY. Simplify the design:
+
+- Boot: fill the FIRST slot (as today), return as soon as it is live - service starts.
+- The remaining 19 slots fill SEQUENTIALLY in one background goroutine, no rush
+  (they naturally pace submissions one at a time; may even add a small sleep
+  between fills, e.g. 1-2s, extra WAF-civil; total fill of 30-60s is FINE).
+- No new concurrency primitives: the existing single-flight acquireSlot is
+  actually CORRECT for sequential background fill - keep it, just make
+  prewarm's background loop call it slot by slot until full.
+- Keep from the task: 20 default sync everywhere (README/SPEC/tests/compose/.env
+  - note config tests are currently RED because fixtures still say 3, fix them),
+  429 retire -> async refill picked up by the same background fill loop (the
+  "fill until live==Pool" goroutine also covers retired slots), refresh-loop
+  one-per-tick math for 20 slots within the 45min window.
+- SPEC 2.1.2 rewrite accordingly: sequential background fill, first-slot boot,
+  no concurrency claims at all. Simple, boring, correct.
+
+TDD as specified otherwise. Atomic commits, green each, push, restart :3000
+with the new binary, confirm ring reaches 20/20 via healthz, leave it running.

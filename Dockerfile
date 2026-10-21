@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.24-alpine AS build
+# Mirrors Sliverkiss/simple-chat's Dockerfile (the proven belmo-deployable shape):
+# pinned golang:1.23-alpine, GOTOOLCHAIN=local so Go never tries to fetch a
+# newer toolchain inside the builder, zero-dependency module needs no go.sum.
+FROM golang:1.23-alpine AS build
+ENV GOTOOLCHAIN=local
 WORKDIR /src
-# The module has no `require` block, so there is no go.sum to copy (and
-# `go mod download` has nothing to fetch). COPY . alone is sufficient and
-# keeps the build working on a clean checkout.
 COPY app/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /inceptionlabs2api .
 
