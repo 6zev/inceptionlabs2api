@@ -83,10 +83,10 @@ func TestManifestIsCompact(t *testing.T) {
 	if strings.Contains(m.Preamble, "\n  ") {
 		t.Fatalf("preamble is indented:\n%s", m.Preamble)
 	}
-	// One tool: the example must use its real name and first parameter; the
-	// placeholder form returned empty upstream answers in probes.
-	if !strings.Contains(m.Preamble, `{"name": "get_weather", "arguments": {"city": "…"}}`) {
-		t.Fatalf("single-tool example is not concrete:\n%s", m.Preamble)
+	// The winning skeleton instructs with the contract line, not a filled-in
+	// example (the 14-probe matrix, 7/8 live hit, used no example block).
+	if !strings.Contains(m.Preamble, `respond with a <tool_call> JSON block containing {"name": "tool name", "arguments": {…}}`) {
+		t.Fatalf("tool contract missing:\\n%s", m.Preamble)
 	}
 }
 
@@ -164,16 +164,20 @@ func TestManifestBadParametersBecomeEmptyObject(t *testing.T) {
 	}
 }
 
-// Several tools keep a placeholder example, but never one fabricated from an
-// arbitrary tool's schema.
+// Several tools still carry the same contract line; no fabricated examples.
 func TestManifestMultiToolExampleStaysGeneric(t *testing.T) {
 	t.Parallel()
 	m, err := BuildManifest([]Tool{weatherTool(), {Name: "send_email", Parameters: json.RawMessage(`{"properties":{"to":{}}}`)}}, Choice{Auto: true}, false)
 	if err != nil {
 		t.Fatalf("BuildManifest: %v", err)
 	}
-	if !strings.Contains(m.Preamble, `{"name": "<operation>", "arguments": {"<arg>": "…"}}`) {
-		t.Fatalf("multi-tool example:\n%s", m.Preamble)
+	if !strings.Contains(m.Preamble, `respond with a <tool_call> JSON block containing {"name": "tool name", "arguments": {…}}`) {
+		t.Fatalf("multi-tool preamble missing the contract line:\\n%s", m.Preamble)
+	}
+	for _, fabricated := range []string{`{"name": "get_weather", "arguments": {"city": "…"}}`, `"<operation>"`} {
+		if strings.Contains(m.Preamble, fabricated) {
+			t.Fatalf("fabricated example leaked into multi-tool preamble: %s", fabricated)
+		}
 	}
 }
 

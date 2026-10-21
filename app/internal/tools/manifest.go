@@ -57,8 +57,14 @@ type Manifest struct {
 	opening string
 }
 
-// openingClause names the catalogue for the preamble. It deliberately avoids
-// the word "function", which the probes tied to empty answers.
+// openingClause is part of the stable hermes-compact preamble measured in the
+// 14-probe wording matrix (2026-10-22, probe/outP1..C): the fixed skeleton
+// "You are a helpful assistant with access to the following tools: <JSON lines>
+// <contract>" hit tool calls in 7/8 live requests (incl. multi-tool selection,
+// no-hint natural ask, tool_choice=required, and a no-tool chat staying clean),
+// while the previous draft wording missed 3/3 locally and scored 5/7 in its own
+// validation. The skeleton's exact text is protocol: re-probe before rewording
+// (DESIGN-TOOLS.md §1.1).
 func openingClause(n int) string {
 	if n == 1 {
 		return "one operation, described below"
@@ -90,15 +96,30 @@ const tierNote = "\nSome argument details are omitted to save context. If you ne
 // phrasing is therefore part of the protocol, not copy: re-probe before
 // rewording (DESIGN-TOOLS.md §1.1).
 func (m *Manifest) header() string {
-	example := m.example()
-	return "You have access to " + m.opening + ". " +
-		"When the user's request needs one, reply with exactly:\n\n" +
-		callStart + "\n" +
-		example + "\n" +
-		callEnd + "\n\n" +
-		"Use only the operation names listed below; never invent one. " +
-		"Otherwise answer normally.\n" +
-		m.instructions
+	// The hermes-compact skeleton from the 14-probe wording matrix (7/8 live
+	// hit rate; probe/outP1..C). The previous "You have access to N
+	// operations..." draft missed 3/3 locally — do not reword without a new
+	// live matrix (DESIGN-TOOLS.md §1.1).
+	var defs strings.Builder
+	if m.Tiered {
+		for _, t := range m.tools {
+			fmt.Fprintf(&defs, `{"name":%s,"description":%s}`+"\n", quoteJSON(t.Name), quoteJSON(t.Description))
+		}
+	} else {
+		for _, t := range m.tools {
+			fmt.Fprintf(&defs, `{"name":%s,"description":%s,"parameters":%s}`+"\n",
+				quoteJSON(t.Name), quoteJSON(t.Description), compactParams(t.Parameters))
+		}
+	}
+	preamble := "You are a helpful assistant with access to the following tools:\n\n" +
+		defs.String() +
+		"\nIf you need to use a tool, respond with a " + callStart + " JSON block " +
+		"containing {\"name\": \"tool name\", \"arguments\": {…}}. " +
+		"Use only the tools listed; never invent one. Otherwise answer normally.\n"
+	if m.Tiered {
+		preamble += tierNote
+	}
+	return preamble + m.instructions
 }
 
 // example renders the call block's example. With one operation it uses that
@@ -186,27 +207,16 @@ func BuildManifest(list []Tool, c Choice, parallelOff bool) (*Manifest, error) {
 
 	m.instructions = instructions(c, parallelOff)
 
-	var b strings.Builder
-	b.WriteString(m.header())
-
+	// The preamble is fully assembled in header(): the hermes-compact skeleton
+	// carries the definitions inline (that ordering is what the 14-probe
+	// wording matrix measured, probe/outP1..C). Tiered manifests keep the
+	// schema-withholding note and declare the synthetic loader last so it never
+	// shadows a real tool's name.
 	if m.Tiered {
 		m.Loader = true
-		b.WriteString(tierNote)
-		b.WriteString(definitionHeader)
-		for _, t := range selected {
-			fmt.Fprintf(&b, `{"name":%s,"description":%s}`+"\n", quoteJSON(t.Name), quoteJSON(t.Description))
-		}
-		// Declare the loader last so it never shadows a real tool's name.
 		m.Declared = append(m.Declared, toolSchemaName)
-	} else {
-		b.WriteString(definitionHeader)
-		for _, t := range selected {
-			fmt.Fprintf(&b, `{"name":%s,"description":%s,"parameters":%s}`+"\n",
-				quoteJSON(t.Name), quoteJSON(t.Description), compactParams(t.Parameters))
-		}
 	}
-
-	m.Preamble = b.String()
+	m.Preamble = m.header()
 	return m, nil
 }
 

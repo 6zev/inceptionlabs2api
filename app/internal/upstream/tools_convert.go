@@ -95,9 +95,16 @@ func NewToolChatRequestHistory(hist []openai.History, effort string, m *tools.Ma
 	if effort == "" {
 		effort = "medium"
 	}
+	// Web search is disabled whenever a tool manifest is present. Measured
+	// 2026-10-22 (probe/outQ): with webSearchEnabled:true the upstream injects
+	// its own server-side web-search tool definitions, and preamble-aside those
+	// two catalogues conflict — 3/3 empty answers regardless of reasoning
+	// effort (medium/instant/high), while the identical preamble with
+	// webSearchEnabled:false answered with a clean <tool_call> block. A client that
+	// declares tools wants ITS tools honored; tool-less chat keeps search on.
 	return &ChatRequest{
 		ReasoningEffort:  effort,
-		WebSearchEnabled: true,
+		WebSearchEnabled: m == nil,
 		VoiceMode:        false,
 		Timezone:         "UTC",
 		Language:         "en-US",
