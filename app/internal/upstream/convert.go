@@ -57,7 +57,7 @@ func NewChatRequest(msgs []openai.TextMessage, effort string) *ChatRequest {
 	}
 	return &ChatRequest{
 		ReasoningEffort:  effort,
-		WebSearchEnabled: false,
+		WebSearchEnabled: true,
 		VoiceMode:        false,
 		Timezone:         "UTC",
 		Language:         "en-US",

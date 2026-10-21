@@ -16,7 +16,7 @@ func TestNewChatRequestShape(t *testing.T) {
 		{Role: "assistant", Texts: []string{"hi"}},
 	}, "high")
 
-	if req.ReasoningEffort != "high" || req.WebSearchEnabled || req.VoiceMode {
+	if req.ReasoningEffort != "high" || !req.WebSearchEnabled || req.VoiceMode {
 		t.Errorf("fixed fields wrong: %+v", req)
 	}
 	if req.Timezone != "UTC" || req.Language != "en-US" || req.Trigger != "submit-message" {
@@ -68,7 +68,7 @@ func TestNewChatRequestJSONKeys(t *testing.T) {
 			t.Errorf("missing key %q in %s", key, b)
 		}
 	}
-	if raw["webSearchEnabled"] != false || raw["voiceMode"] != false {
+	if raw["webSearchEnabled"] != true || raw["voiceMode"] != false {
 		t.Errorf("booleans = %v/%v, want false", raw["webSearchEnabled"], raw["voiceMode"])
 	}
 	msg := raw["messages"].([]any)[0].(map[string]any)

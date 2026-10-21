@@ -362,7 +362,7 @@ func TestChatSendsTokenAndBody(t *testing.T) {
 	if err := json.Unmarshal([]byte(m.bodies()[0]), &body); err != nil {
 		t.Fatalf("body: %v", err)
 	}
-	if body.ReasoningEffort != "high" || body.WebSearchEnabled {
+	if body.ReasoningEffort != "high" || !body.WebSearchEnabled {
 		t.Fatalf("body = %+v", body)
 	}
 	if len(body.Messages) != 1 || body.Messages[0].Parts[0].Text != "hello" {
