@@ -65,30 +65,34 @@ type Config struct {
 	AudioTimeout time.Duration
 	// AudioMaxBytes caps a transcription upload. Zero means 25 MiB.
 	AudioMaxBytes int64
+	// DecisionTimeout bounds one whole /api/decide/run call. Zero means 120s.
+	DecisionTimeout time.Duration
 	// Logf is optional; nil means log.Printf.
 	Logf func(format string, args ...any)
 }
 
 // Counters is a snapshot of request accounting for /healthz.
 type Counters struct {
-	Requests uint64 `json:"requests"`
-	Streams  uint64 `json:"streams"`
-	Errors   uint64 `json:"errors"`
-	Upstream uint64 `json:"upstream_errors"`
-	TTS      uint64 `json:"tts"`
-	STT      uint64 `json:"stt"`
+	Requests  uint64 `json:"requests"`
+	Streams   uint64 `json:"streams"`
+	Errors    uint64 `json:"errors"`
+	Upstream  uint64 `json:"upstream_errors"`
+	TTS       uint64 `json:"tts"`
+	STT       uint64 `json:"stt"`
+	Decisions uint64 `json:"decisions"`
 }
 
 // Server holds the handler dependencies.
 type Server struct {
-	cfg   Config
-	up    Chatter
-	se    Searcher
-	pool  PoolStats
-	clr   ClearanceStats
-	audio Speech
-	now   func() time.Time
-	logf  func(format string, args ...any)
+	cfg    Config
+	up     Chatter
+	se     Searcher
+	pool   PoolStats
+	clr    ClearanceStats
+	audio  Speech
+	decide Decider
+	now    func() time.Time
+	logf   func(format string, args ...any)
 
 	searchMu sync.Mutex
 	// searchAvailable is nil until the config probe succeeds; false is a
@@ -96,12 +100,13 @@ type Server struct {
 	searchAvailable *bool
 	probeOnce       sync.Once
 
-	requests atomic.Uint64
-	streams  atomic.Uint64
-	errors   atomic.Uint64
-	upErrors atomic.Uint64
-	tts      atomic.Uint64
-	stt      atomic.Uint64
+	requests      atomic.Uint64
+	streams       atomic.Uint64
+	errors        atomic.Uint64
+	upErrors      atomic.Uint64
+	tts           atomic.Uint64
+	stt           atomic.Uint64
+	decisionCalls atomic.Uint64
 }
 
 // New builds a Server. Models defaults to [Model].
@@ -192,6 +197,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/web_search", s.webSearch)
 	mux.HandleFunc("/v1/audio/speech", s.speech)
 	mux.HandleFunc("/v1/audio/transcriptions", s.transcription)
+	mux.HandleFunc("/v1/decisions", s.decisions)
 	mux.HandleFunc("/v1/models", s.models)
 	mux.HandleFunc("/healthz", s.healthz)
 	return cors(s.authenticate(mux))
@@ -328,12 +334,13 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{
 		"ok": true,
 		"counters": Counters{
-			Requests: s.requests.Load(),
-			Streams:  s.streams.Load(),
-			Errors:   s.errors.Load(),
-			Upstream: s.upErrors.Load(),
-			TTS:      s.tts.Load(),
-			STT:      s.stt.Load(),
+			Requests:  s.requests.Load(),
+			Streams:   s.streams.Load(),
+			Errors:    s.errors.Load(),
+			Upstream:  s.upErrors.Load(),
+			TTS:       s.tts.Load(),
+			STT:       s.stt.Load(),
+			Decisions: s.decisionCalls.Load(),
 		},
 		"search": map[string]any{"available": s.SearchAvailable()},
 	}

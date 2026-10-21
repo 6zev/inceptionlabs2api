@@ -54,6 +54,7 @@ type tlsUpstream struct {
 	config func(w http.ResponseWriter, r *http.Request)
 	tts    func(w http.ResponseWriter, r *http.Request)
 	stt    func(w http.ResponseWriter, r *http.Request)
+	decide func(w http.ResponseWriter, r *http.Request)
 	status atomic.Int32
 	// sessionBody overrides the /api/session body when non-empty.
 	sessionBody string
@@ -183,6 +184,16 @@ func newTLSUpstream(t *testing.T) *tlsUpstream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, "data: [DONE]\n\n")
 	})
+	mux.HandleFunc("/api/decide/run", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		fn := m.decide
+		m.mu.Unlock()
+		if fn == nil {
+			http.NotFound(w, r)
+			return
+		}
+		fn(w, r)
+	})
 	mux.HandleFunc("/api/search-lab/run", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
 		fn := m.search
@@ -250,6 +261,7 @@ func newStack(t *testing.T, idle time.Duration) *stack {
 	}, c, p)
 	gs.SetSearcher(c)
 	gs.SetSpeech(c)
+	gs.SetDecider(c)
 	gs.SetClearance(c.Clearance())
 	srv := httptest.NewServer(gs.Handler())
 	t.Cleanup(srv.Close)
@@ -1167,5 +1179,51 @@ func TestE2EToolCallRoundTrip(t *testing.T) {
 		if !strings.Contains(string(secondBody), want) {
 			t.Fatalf("second upstream body missing %q: %s", want, secondBody)
 		}
+	}
+}
+
+// TestE2EDecisionRoundTrip drives POST /v1/decisions through the whole stack:
+// clearance, pooled token, /api/decide/run, and the handler's pass-through.
+// The client body must reach the upstream byte-for-byte in the web shape and
+// the upstream answer must reach the client byte-for-byte.
+func TestE2EDecisionRoundTrip(t *testing.T) {
+	st := newStack(t, 5*time.Second)
+
+	var mu sync.Mutex
+	var bodies [][]byte
+	var tokens []string
+	st.mock.decide = func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, b)
+		tokens = append(tokens, r.Header.Get("x-session-token"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"answers":{"team":{"type":"choice","choice":"billing","probabilities":{"billing":1},"confidence":1}},"inputTokens":42,"latencyMs":9}`)
+	}
+
+	payload := `{"state":"charged twice","questions":[{"id":"q-1","name":"team","type":"choice","instructions":"which team?","options":[{"id":"o-1","name":"billing","description":"money"}]}],"images":[]}`
+	resp, err := http.Post(st.srv.URL+"/v1/decisions", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d: %s", resp.StatusCode, body)
+	}
+	if string(body) != `{"answers":{"team":{"type":"choice","choice":"billing","probabilities":{"billing":1},"confidence":1}},"inputTokens":42,"latencyMs":9}` {
+		t.Fatalf("body = %s, want the upstream bytes verbatim", body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 1 {
+		t.Fatalf("upstream calls = %d", len(bodies))
+	}
+	if string(bodies[0]) != payload {
+		t.Fatalf("upstream body = %s, want the client bytes verbatim", bodies[0])
+	}
+	if tokens[0] == "" {
+		t.Fatal("upstream request carried no pooled token")
 	}
 }
