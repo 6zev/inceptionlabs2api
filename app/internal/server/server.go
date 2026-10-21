@@ -261,14 +261,9 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("model %q does not exist; available models: %s", req.Model, strings.Join(s.cfg.Models, ", "))))
 		return
 	}
-	msgs, _, re := openai.NormalizeMessages(req.Messages)
-	if re != nil {
-		s.fail(w, re)
-		return
-	}
-
-	// Tool-bearing requests take §4.1's path. A nil plan means the legacy one,
-	// which must stay byte-identical for every request without tools.
+	// Tool-bearing requests take §4.1's path, which normalises history with
+	// tool payloads intact. A nil plan means the legacy one, and it must stay
+	// byte-identical for every request without tools.
 	plan, re := planTools(req)
 	if re != nil {
 		s.fail(w, re)
@@ -276,6 +271,12 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if plan != nil {
 		s.chatWithTools(w, r, req, plan)
+		return
+	}
+
+	msgs, _, re := openai.NormalizeMessages(req.Messages)
+	if re != nil {
+		s.fail(w, re)
 		return
 	}
 

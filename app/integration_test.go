@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"mime/multipart"
@@ -1073,5 +1074,98 @@ func TestEndToEndAudioRoundTrip(t *testing.T) {
 	h.Body.Close()
 	if !strings.Contains(string(hb), `"tts":1`) || !strings.Contains(string(hb), `"stt":1`) {
 		t.Fatalf("healthz = %s", hb)
+	}
+}
+
+// testTLSUpstreamToolCall drives a real tool round trip through the whole
+// stack: clearance, pooled token, /api/chat, and the handler's parser.
+func TestE2EToolCallRoundTrip(t *testing.T) {
+	st := newStack(t, 5*time.Second)
+
+	var mu sync.Mutex
+	var bodies []map[string]any
+	st.mock.setChat(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		bodies = append(bodies, body)
+		n := len(bodies)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		var answer string
+		if n == 1 {
+			answer = `<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>`
+		} else {
+			answer = "It is 21 C in Paris."
+		}
+		fmt.Fprintf(w, "data: {\"type\":\"text-start\",\"id\":\"text-0\"}\n\n")
+		fmt.Fprintf(w, "data: {\"type\":\"text-delta\",\"id\":\"text-0\",\"delta\":%q}\n\n", answer)
+		io.WriteString(w, "data: {\"type\":\"text-end\",\"id\":\"text-0\"}\n\ndata: [DONE]\n\n")
+	})
+
+	post := func(payload string) []byte {
+		t.Helper()
+		resp, err := http.Post(st.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(payload))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d: %s", resp.StatusCode, b)
+		}
+		return b
+	}
+
+	// Round 1: the model calls the tool.
+	first := post(`{"model":"mercury-3","tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"messages":[{"role":"user","content":"weather in Paris?"}]}`)
+	var completion struct {
+		Choices []struct {
+			Message struct {
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(first, &completion); err != nil {
+		t.Fatalf("decode: %v (%s)", err, first)
+	}
+	calls := completion.Choices[0].Message.ToolCalls
+	if completion.Choices[0].FinishReason != "tool_calls" || len(calls) != 1 {
+		t.Fatalf("first = %s", first)
+	}
+
+	// Round 2: the client returns a tool result; the final answer must use it.
+	second := post(`{"model":"mercury-3","tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"messages":[
+		{"role":"user","content":"weather in Paris?"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"` + calls[0].ID + `","type":"function","function":{"name":"` + calls[0].Function.Name + `","arguments":"` + strings.ReplaceAll(calls[0].Function.Arguments, `"`, `\"`) + `"}}]},
+		{"role":"tool","tool_call_id":"` + calls[0].ID + `","content":"{\"tempC\":21}"}]}`)
+	if !strings.Contains(string(second), "It is 21 C in Paris.") {
+		t.Fatalf("second = %s", second)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("upstream calls = %d", len(bodies))
+	}
+	// The first upstream body carries the preamble; the second carries the
+	// tool result envelope and the replayed call id.
+	firstBody, _ := json.Marshal(bodies[0])
+	if !strings.Contains(string(firstBody), "# Tool calling") {
+		t.Fatalf("preamble missing: %s", firstBody)
+	}
+	secondBody, _ := json.Marshal(bodies[1])
+	for _, want := range []string{"tool_response", calls[0].ID, "tempC"} {
+		if !strings.Contains(string(secondBody), want) {
+			t.Fatalf("second upstream body missing %q: %s", want, secondBody)
+		}
 	}
 }
