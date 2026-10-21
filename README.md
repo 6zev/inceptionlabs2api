@@ -19,13 +19,16 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
 
 - **匿名会话池**：min 2 / max 8，TTL 30 分钟到期销毁重建，401/403 丢弃换新并最多重试 2 次。
   客户端断连、超时、上游 5xx 都**不会**污染 token。
-- **标准库 HTTP/2 + `_vcrcs` 通关**：上游的 Vercel 安全网关要求「清除凭证
-  cookie + 求解时同一个 Chrome UA + HTTP/2」三者同时成立。网关在**启动时**即
-  后台本地求解 v2 工作量证明（3 轮 SHA-256 前缀链，约 0.1 秒 CPU，无外部依赖），
-  拿到 1 小时有效的 `_vcrcs` cookie，`/healthz` 通常在 1 秒内就能看到
-  `has_cookie:true`；此后从启动起算、每 45 分钟主动更换一次；请求被 429 挑战
-  时立即重解一次并重放。全部走标准库 `crypto/tls` + `ForceAttemptHTTP2`，
-  支持 HTTP CONNECT 代理（`HTTPS_PROXY` 风格），清关与业务请求共用同一出口。
+- **标准库 HTTP/2 + `_vcrcs` 通关（轮换环）**：上游的 Vercel 安全网关要求
+  「清除凭证 cookie + 求解时同一个 Chrome UA + HTTP/2」三者同时成立。网关在
+  **启动时**即后台本地求解 v2 工作量证明（3 轮 SHA-256 前缀链，约 0.1 秒 CPU，
+  无外部依赖），默认一次预热 **3 个** cookie（`IL2API_CLEARANCE_POOL`），
+  `/healthz` 通常在 1 秒内就能看到 `has_cookie:true` 与三个槽位全部就绪；
+  每个 cookie 从获取起算、45 分钟主动更换一次（每次 tick 只换一个槽）；
+  请求在槽位间**按请求轮询**；某个请求被 429 挑战时只退役它用过的那一个槽位、
+  立即补上一个新 cookie 并重放一次，其它槽位继续服务。全部走标准库
+  `crypto/tls` + `ForceAttemptHTTP2`，支持 HTTP CONNECT 代理（`HTTPS_PROXY`
+  风格），清关与业务请求共用同一出口。
   （此前的 utls + ALPN `http/1.1` 方案已被证明是反的：强制 h1.1 恰恰会让
   cookie 永远失效，整段实现已删除。）
 - **零第三方依赖**：`go.mod` 没有 require，`go.sum` 已移除，单一静态二进制。
@@ -120,8 +123,9 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `IL2API_POOL_TTL` | `30m` | token 寿命，到期销毁重建 |
 | `IL2API_IDLE_TIMEOUT` | `60s` | 滑动空闲看门狗（每个上游事件都会重置） |
 | `IL2API_CONTEXT_CHARS` | `0` | 已废弃的空操作，仅为配置兼容保留；不再有输入长度守卫 |
-| `IL2API_CLEARANCE_REFRESH` | `45m` | `_vcrcs` 主动刷新年龄（cookie 实际有效期 60 分钟） |
-| `IL2API_CLEARANCE_COOLDOWN` | `15s` | 清关**失败**后的最小重试间隔，避免挑战风暴（成功求解不会开启窗口，429 重放不受阻） |
+| `IL2API_CLEARANCE_REFRESH` | `45m` | 每个 `_vcrcs` 槽位的主动刷新年龄（cookie 实际有效期 60 分钟） |
+| `IL2API_CLEARANCE_COOLDOWN` | `15s` | 清关**失败**后的最小重试间隔，避免挑战风暴（成功求解不会开启窗口，429 重放与被退役槽位的补位不受阻） |
+| `IL2API_CLEARANCE_POOL` | `3` | 清关 cookie 轮换环大小；`1` 即回到单 cookie 行为 |
 | `IL2API_SESSION_TIMEOUT` | `15s` | 单次 `/api/session` 请求超时 |
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` 的滑动空闲看门狗（每个 NDJSON 行都会重置） |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`，是否在启动时后台探测一次 `/api/search-lab/config`；`off` 时 `search.available` 恒为 `null` |
@@ -215,8 +219,9 @@ curl http://localhost:3000/v1/web_search \
 ```
 
 - `config` 可省略：`fanout` 默认 3、`depth` 默认 1、`keep_top_k` 默认 10、`effort`
-  默认 `instant`；`fanout`/`depth` 会按上游公布的范围（1–5 / 1–3）收敛，
-  `keep_top_k` 收敛到 1–50，`effort` 原样透传。
+  默认 `instant`；只有 `fanout`/`depth` 按上游公布的范围（1–5 / 1–3）收敛——
+  这两个范围是上游 `/api/search-lab/config` 自己声明的。`keep_top_k` **不收敛**
+  （上游没公布范围，收敛到 1–50 是网关自己编的数），`effort` 原样透传。
 - `queries` 收集自所有 `queries` 事件（含多轮 follow-up），去重后按出现顺序返回。
 - `results` 是最终一轮 `docs` 的名称/链接/名次，`cite_index` 为 1..N；
   **`snippet` 恒为空**——上游 NDJSON 里根本没有逐条摘要，本网关不编造。
@@ -224,19 +229,24 @@ curl http://localhost:3000/v1/web_search \
   提前停止可省下数秒与多次 LLM 调用。
 - 只返回绝对的 `http(s)` 链接；`javascript:`、`data:`、相对路径与含控制字符的
   URL 会被丢弃（消费方通常直接把它们渲染成可点击链接）。
-- 未知字段（含 `config` 内未知字段）静默丢弃，数值越界按上游公布范围收敛；
-  `effort` 原样透传（上游自己判断）。只有 JSON 损坏、尾部多余内容、查询缺失/
-  非字符串/为空才是 400。
+- 未知字段（含 `config` 内未知字段）静默丢弃；只有 `fanout`/`depth` 按上游
+  公布范围收敛，`keep_top_k` 与 `effort` 原样透传（上游自己判断）。只有 JSON
+  损坏、尾部多余内容、查询缺失/非字符串/为空才是 400。
 - 上游没有结果时返回 `200` + `"results":[]`，这是诚实的空列表，不重试。
 - 响应带 `Cache-Control: no-store`；本接口不流式，整次检索完成后一次性返回。
 
-错误映射与聊天接口一致：会话池为空 `503 upstream_unavailable`；上游配置
-`retrievalAvailable:false` 时 `503 search_unavailable`（探测请求会带上清关 cookie
-与会话 token；如果响应里根本没有 `retrievalAvailable` 字段——例如又一个挑战
-JSON——`search.available` 会保持 `null`，绝不会被误读成 `false`）；上游非 200 或流内出现
-终止 `error` 事件 `502 upstream_error`；`docs` 之前流被截断
-`502 upstream_stream_error`；滑动空闲窗口（默认 60 秒，每行重置）超时
-`504 upstream_idle_timeout`，整次运行另有 10 个空闲窗口的绝对上限。
+错误映射与聊天接口一致：会话池为空 `503 upstream_unavailable`；上游非 200
+或流内终止 `error` 事件 `502 upstream_error`（**上游自己的错误文本会原样保留**
+在信封里）；`docs` 之前流被截断 `502 upstream_stream_error`；滑动空闲窗口
+（默认 60 秒，每行重置）超时 `504 upstream_idle_timeout`，整次运行另有 10 个
+空闲窗口的绝对上限。
+
+> **配置探测只供参考。** 启动时对 `/api/search-lab/config` 的探测只会写入
+> `/healthz` 的 `search.available`，**从不拦截请求**：即使上游明确报告
+> `retrievalAvailable:false`（或探测结果已经过期/被挑战页误读），请求照样发往
+> 上游，客户端看到的是上游自己的回答或错误。探测请求会带上清关 cookie 与会话
+> token；如果响应里根本没有 `retrievalAvailable` 字段——例如又一个挑战 JSON——
+> `search.available` 会保持 `null`，绝不会被误读成 `false`。
 
 > 上游对 NDJSON 默认做 Brotli 压缩。网关发送 `Accept-Encoding: identity`，
 > 并用标准库解码 `gzip`；本项目零第三方依赖，没有 Brotli 解码器，因此若中间层
@@ -254,7 +264,7 @@ curl http://localhost:3000/v1/audio/speech \
 | 字段 | 行为 |
 |---|---|
 | `input` | **必填**：缺失、非字符串或全空白 → 400（`param:"input"`）。**没有长度上限**，原样交给上游（上游网页端自己截到 5 000 字符） |
-| `voice` | 大小写不敏感。`alloy→sarah`、`echo→chris`、`fable→charlie`、`onyx→chris`、`nova→jessica`、`shimmer→jessica`；上游名 `sarah`/`chris`/`charlie`/`jessica` 原样通过；留空则用上游默认。**其它值 400**，错误信息里列出可用音色 |
+| `voice` | 大小写不敏感、两端空白会被去掉。OpenAI 的六个标准名会被**映射**到上游音色：`alloy→sarah`、`echo→chris`、`fable→charlie`、`onyx→chris`、`nova→jessica`、`shimmer→jessica`。**其它任何名字都原样转发**（小写化后），由上游决定如何回答；留空则用上游默认。上游**不校验**音色名：一个它不认识的音色会返回 `200` 加一段约 0.44 秒的短音频，而不是报错——这是上游的行为，网关不替它拒绝 |
 | `response_format` | 接受但忽略：上游只产 MP3，响应**永远是** `audio/mpeg`。要 wav 请客户端自己转 |
 | `speed` | 静默丢弃（上游没有语速参数） |
 | `model` | 接受但忽略（上游只有一个语音引擎） |
@@ -266,6 +276,12 @@ curl http://localhost:3000/v1/audio/speech \
 音色清单来自 bundle 考古（网页端从不下发音色数组，只有场景配置里的
 `sarah`/`chris`/`charlie`/`jessica`）加上 3 次实测确认：同样文本下三种音色的音频
 字节与时长各不相同（chris 2.09 s / charlie 2.22 s / sarah 2.27 s）。
+所以想拿到“真正的语音”，请用上面六个 OpenAI 名字之一或那四个上游名；
+写错名字不会得到 400，只会得到一段很短的、可能不符合预期的音频。
+
+`/v1/audio/transcriptions` 的 25 MiB 上限是**网关自己的**保护（上传要整个读进
+内存；按实测约 12 秒/MB 的上游处理速度，25 MB 也已经超过 120 秒调用超时），
+不是上游的限额：实测中上游接受了 2.5 MB 的音频并用了约 31 秒返回文本。
 
 ### 语音转写 `POST /v1/audio/transcriptions`
 
@@ -301,7 +317,6 @@ curl http://localhost:3000/v1/audio/transcriptions \
 | 502 | `upstream_error` / `upstream_stream_error` / `upstream_auth_failed` | 上游异常或流被截断（正文来自上游） |
 | 503 | `upstream_clearance_failed` | 上游挑战无法完成（PoW 版本变化、出口/UA 被拒） |
 | 503 | `upstream_unavailable` | 会话池为空且不是清关问题 |
-| 503 | `search_unavailable` | 上游 `/api/search-lab/config` 明确报告 `retrievalAvailable:false` |
 | 504 | `upstream_idle_timeout` | 上游超过空闲窗口没有任何事件 |
 | 413 | `request_too_large` | `/v1/audio/transcriptions` 上传超过 `IL2API_AUDIO_MAX_BYTES` |
 
@@ -334,7 +349,7 @@ docker compose up -d --build      # 3000:3000，distroless nonroot (uid 65532)
 > 仍会挑战：服务照常启动，但 `/healthz` 的 `clearance.has_cookie` 为 `false`、
 > `pool.size` 保持 0，聊天返回 `503 upstream_clearance_failed` 或
 > `503 upstream_unavailable`，日志里会看到
-> `upstream: checkpoint challenged ... refreshing clearance and replaying once`。
+> `upstream: checkpoint challenged ... retiring the slot and replaying once`。
 > 请给容器设置 `IL2API_PROXY` 并把清关与业务流量放在**同一个**代理出口上
 > （例如 `IL2API_PROXY=http://10.0.0.2:3128`）。**部署环境的出口与本地探测环境
 > 可能不同**，请以部署后 `/healthz` 的 `clearance` 与 `pool.size` 为准。
@@ -345,7 +360,10 @@ docker compose up -d --build      # 3000:3000，distroless nonroot (uid 65532)
 curl -s http://localhost:3000/healthz | jq
 # {"ok":true,"pool":{"size":2,"min":2,"max":8,"expired":0},
 #  "search":{"available":true},
-#  "clearance":{"has_cookie":true,"age_seconds":312,"refresh_count":3},
+#  "clearance":{"has_cookie":true,"age_seconds":312,"refresh_count":7,
+#               "slots":[{"cookie":true,"age_seconds":312,"refresh_count":3},
+#                        {"cookie":true,"age_seconds":104,"refresh_count":2},
+#                        {"cookie":true,"age_seconds":9,"refresh_count":2}]},
 #  "counters":{"requests":12,"streams":9,"errors":0,"upstream_errors":0,"tts":0,"stt":0}}
 ```
 
@@ -354,11 +372,12 @@ curl -s http://localhost:3000/healthz | jq
 ```bash
 cd app
 go build ./... && go vet ./... && go test ./...        # 每个提交都必须是绿的
-go test ./... -race -cover                              # 竞态 + 覆盖率（约 90%）
+go test ./... -race -cover                              # 竞态 + 覆盖率（约 92%）
 ```
 
 测试策略：全部针对 `httptest` / 本地 TLS 监听器上的模拟上游，不访问真实的
-Vercel。PoW 求解器用真实 Chromium 抓取的 token/解做回归；清关管理器用模拟挑战端点
+Vercel（本次的线上探测只有 6 次清关环证据 + 1 次 2.5 MB 上传，外加最后的 3 次
+冒烟）。PoW 求解器用真实 Chromium 抓取的 token/解做回归；清关管理器用模拟挑战端点
 覆盖获取、cookie 存储、45 分钟主动刷新、冷却、429 重新获取与 403 拒绝；传输层用
 本地 h2 服务端证明协商出 HTTP/2，并用本地 CONNECT 代理验证出口。搜索链路由模拟的
 NDJSON 上游覆盖：完整流水线、多轮 follow-up、gzip 编码（`br` 为带类型的错误）、
