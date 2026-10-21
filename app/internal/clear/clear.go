@@ -294,17 +294,30 @@ func (c *Clearance) wait(ctx context.Context, done chan struct{}) error {
 	}
 }
 
-// refresh runs the GET -> solve -> POST flow, honouring the cooldown when a
-// usable cookie is already held.
+// refresh runs the GET -> solve -> POST flow, honouring the cooldown.
+//
+// The cooldown bounds *failed* attempts: a burst of requests against a
+// checkpoint that keeps refusing must not become a solve storm (SPEC §2.1.1).
+// Inside a window opened by a failure, a held cookie is reused (the caller's
+// request proceeds with it) and a caller without one gets lastErr back rather
+// than a silent success that would send an unprotected request. A window never
+// follows a successful acquisition, so recovery — a 429 challenge right after
+// a solve — is never blocked.
 func (c *Clearance) refresh(ctx context.Context) error {
 	now := c.now()
 	c.mu.Lock()
 	last := c.lastAttempt
 	has := c.cookie != ""
+	lastErr := c.lastErr
 	c.mu.Unlock()
 
-	if has && c.cfg.Cooldown > 0 && !last.IsZero() && now.Sub(last) < c.cfg.Cooldown {
-		return nil
+	if c.cfg.Cooldown > 0 && !last.IsZero() && now.Sub(last) < c.cfg.Cooldown {
+		if has {
+			return nil
+		}
+		if lastErr != nil {
+			return fmt.Errorf("%w (retrying in %s)", lastErr, c.cfg.Cooldown-now.Sub(last))
+		}
 	}
 
 	c.mu.Lock()

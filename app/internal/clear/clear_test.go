@@ -230,6 +230,56 @@ func TestRefreshRespectsCooldown(t *testing.T) {
 	}
 }
 
+// A failing checkpoint must not turn a burst of requests into a solve storm.
+// With no cookie held, a *failed* acquisition is still spaced by the cooldown
+// (SPEC §2.1.1), and callers inside the window get an error rather than a
+// silent success that would send an unprotected request.
+func TestFailedAcquisitionIsCooldownBounded(t *testing.T) {
+	t.Parallel()
+	cs := newChallengeServer(t)
+	cs.failSubmit = http.StatusBadGateway
+	now := time.Unix(1_800_000_000, 0)
+	c := New(Config{BaseURL: cs.srv.URL, Now: func() time.Time { return now }, Logf: func(string, ...any) {}})
+
+	if err := c.Ensure(context.Background()); err == nil {
+		t.Fatal("expected the first acquisition to fail")
+	}
+	if err := c.Ensure(context.Background()); err == nil {
+		t.Fatal("a failed acquisition inside the cooldown must not report success")
+	}
+	if got := cs.submitCount(); got != 1 {
+		t.Fatalf("submissions = %d, want 1 inside the cooldown (no solve storm)", got)
+	}
+	// After the cooldown a request may try again.
+	now = now.Add(c.cfg.Cooldown)
+	if err := c.Ensure(context.Background()); err == nil {
+		t.Fatal("expected the retry to fail too (checkpoint still down)")
+	}
+	if got := cs.submitCount(); got != 2 {
+		t.Fatalf("submissions = %d, want a retry after the cooldown", got)
+	}
+}
+
+// A challenge that arrives right after a successful acquisition (429 replay)
+// must be allowed to re-acquire immediately: the cooldown guards failures, not
+// the recovery path.
+func TestSuccessfulAcquireIsNotCooldownBlocked(t *testing.T) {
+	t.Parallel()
+	cs := newChallengeServer(t)
+	now := time.Unix(1_800_000_000, 0)
+	c := New(Config{BaseURL: cs.srv.URL, Now: func() time.Time { return now }, Logf: func(string, ...any) {}})
+	if err := c.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	c.Invalidate()
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh after invalidation: %v (recovery must not be cooldown-blocked)", err)
+	}
+	if got := cs.submitCount(); got != 2 {
+		t.Fatalf("submissions = %d, want 2 (initial + immediate re-acquire)", got)
+	}
+}
+
 func TestEnsureRefreshesAtSafetyMargin(t *testing.T) {
 	t.Parallel()
 	cs := newChallengeServer(t)
