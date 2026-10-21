@@ -82,7 +82,7 @@ parseable answer):
 | none (control) | 3/3 |
 | **v8 first draft**: Markdown heading + "You can call the functions listed below" + `<tools>…</tools>` | 0/5 |
 | short prose + concrete `get_weather` example + `<tools>` block | 0/4 |
-| short prose + concrete example, definitions as plain lines (**shipped**) | 1/3 |
+| short prose + concrete example, definitions as plain lines (**shipped**) | 5/7 |
 | long benign paragraph in the system message | 1/1 |
 | tool-flavoured text, no block ("The following function is available: …") | 0/2 |
 
