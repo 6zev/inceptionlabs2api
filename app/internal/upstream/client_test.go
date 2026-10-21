@@ -708,9 +708,10 @@ func TestChallengeIsRetriedOnlyOnce(t *testing.T) {
 	}
 	c, _ := newTestClient(t, m, 1)
 	_, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
-	var se *StatusError
-	if !errors.As(err, &se) || se.Status != http.StatusTooManyRequests {
-		t.Fatalf("err = %v, want StatusError 429", err)
+	// A challenge that survives a fresh clearance is reported as a clearance
+	// failure, not handed back as an ordinary 429 body.
+	if !errors.Is(err, ErrClearance) {
+		t.Fatalf("err = %v, want ErrClearance", err)
 	}
 	// One attempt plus exactly one replay; postAuthed retries 401/403 only,
 	// so a persistent 429 ends the request rather than looping.

@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -281,11 +282,24 @@ func truncateRunes(s string, n int) string {
 	return s
 }
 
-// SearchConfig calls GET /api/search-lab/config. It needs no session token
-// (the live probe succeeded without one) and is used once at startup.
+// SearchConfig calls GET /api/search-lab/config. The live route is challenged
+// independently of /api/session and answers 401 to a cleared but unauthenticated
+// request, so the probe carries both clearance and a pooled token. When the
+// pool cannot supply one the probe is reported as failed (availability stays
+// unknown) rather than guessed.
 func (c *Client) SearchConfig(ctx context.Context) (*SearchConfigResponse, error) {
+	if c.pool == nil {
+		return nil, fmt.Errorf("%w: no pool bound", ErrUnavailable)
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	token, err := c.pool.Get(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
 	resp, err := c.Send(ctx, http.MethodGet, "/api/search-lab/config", nil, c.timeout, func(r *http.Request) {
 		r.Header.Set("Accept", "application/json")
+		r.Header.Set("x-session-token", token)
 	})
 	if err != nil {
 		return nil, err
@@ -298,6 +312,12 @@ func (c *Client) SearchConfig(ctx context.Context) (*SearchConfigResponse, error
 	var cfg SearchConfigResponse
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("upstream: parse search config: %w (body %q)", err, truncate(string(raw), 200))
+	}
+	// A body that does not actually say retrievalAvailable must not be read as
+	// "false". A checkpoint challenge is JSON without that key; treating it as
+	// a kill-switch would silently disable a working endpoint.
+	if !bytes.Contains(raw, []byte(`"retrievalAvailable"`)) {
+		return nil, fmt.Errorf("upstream: search config response has no retrievalAvailable field (body %q)", truncate(string(raw), 200))
 	}
 	return &cfg, nil
 }

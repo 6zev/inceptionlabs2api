@@ -163,9 +163,11 @@ must verify offline).
   client, so a challenged burst cannot become a solve storm.
 - The cookie is refreshed **proactively at 45 min of its 60 min TTL**.
 - On a `429` carrying `x-vercel-mitigated: challenge` (or a challenge token
-  header) the request is retried **once** after a forced refresh. A `403`
-  challenge is surfaced, not retried: that means the PoW itself was rejected
-  (version drift) and looping cannot fix it.
+  header) the request is retried **once** after a forced refresh. A challenge
+  that survives that replay is reported as `upstream_clearance_failed`, never
+  handed back as an ordinary response body (a capability probe could otherwise
+  misread it). A `403` challenge is surfaced, not retried: that means the PoW
+  itself was rejected (version drift) and looping cannot fix it.
 - Acquisition shares the client's `*http.Transport`, so it egresses through the
   configured proxy exactly like ordinary requests; the cookie is IP-bound, so
   this is mandatory, not an optimisation.
@@ -239,7 +241,12 @@ GET /api/search-lab/config
         "limits":{"minFanout":1,"maxFanout":5,"minDepth":1,"maxDepth":3}}
 ```
 
-`retrievalAvailable:false` is the deployment kill-switch. `limits` publishes
+A response without a `retrievalAvailable` field (for example a checkpoint JSON
+challenge) is **not** read as `false`: availability stays unknown. The probe
+carries clearance and a pooled session token, because the live route is
+challenged independently of `/api/session` and answers 401 to a cleared but
+unauthenticated request. `retrievalAvailable:false` is the deployment
+kill-switch. `limits` publishes
 ranges for `fanout` and `depth` only; `keepTopK` has no documented range and
 `effort` is verified only for `instant`.
 

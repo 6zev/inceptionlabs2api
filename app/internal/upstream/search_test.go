@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"inceptionlabs2api/internal/clear"
 	"inceptionlabs2api/internal/pool"
 )
 
@@ -482,5 +483,44 @@ func TestSearchCapsSourceCount(t *testing.T) {
 	}
 	if len(res.Sources) != maxCollectedSources {
 		t.Fatalf("sources = %d, want capped at %d", len(res.Sources), maxCollectedSources)
+	}
+}
+
+// A config body without retrievalAvailable (e.g. a checkpoint JSON error) must
+// not be recorded as retrievalAvailable:false: that would silently disable a
+// working endpoint.
+func TestSearchConfigWithoutFieldIsUnknown(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	m.configHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"error":{"code":"challenge","message":"This request requires a challenge"}}`)
+	}
+	c, _ := newTestClient(t, m, 0)
+	if _, err := c.SearchConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "retrievalAvailable") {
+		t.Fatalf("err = %v, want a missing-field error", err)
+	}
+}
+
+// The probe must carry clearance and a session token: the live config route
+// challenges an unauthenticated request independently of /api/session.
+func TestSearchConfigUsesClearanceAndToken(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	var gotCookie, gotToken string
+	m.configHandler = func(w http.ResponseWriter, r *http.Request) {
+		gotCookie = r.Header.Get("Cookie")
+		gotToken = r.Header.Get("x-session-token")
+		io.WriteString(w, `{"retrievalAvailable":true}`)
+	}
+	c, _ := newTestClient(t, m, 1)
+	if _, err := c.SearchConfig(context.Background()); err != nil {
+		t.Fatalf("SearchConfig: %v", err)
+	}
+	if gotCookie != clear.CookieName+"=cleared" {
+		t.Fatalf("cookie = %q", gotCookie)
+	}
+	if !pool.ValidateToken(gotToken) {
+		t.Fatalf("token = %q, want a pooled session token", gotToken)
 	}
 }

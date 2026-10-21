@@ -198,7 +198,19 @@ func (c *Client) Send(ctx context.Context, method, path string, body []byte, hea
 	if err := c.clear.Refresh(ctx); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrClearance, err)
 	}
-	return c.do(ctx, method, path, body, headerTimeout, prepare)
+	resp, err = c.do(ctx, method, path, body, headerTimeout, prepare)
+	if err != nil {
+		return nil, err
+	}
+	if clear.IsChallenge(resp) {
+		// Replaying once already failed. Returning the challenge body would
+		// let a caller misread it as an ordinary response (e.g. an empty
+		// capability probe); say what happened instead.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
+		resp.Body.Close()
+		return nil, fmt.Errorf("%w: the checkpoint challenged %s even after a fresh clearance", ErrClearance, path)
+	}
+	return resp, nil
 }
 
 // do issues one upstream request. A nil body means no request body.
