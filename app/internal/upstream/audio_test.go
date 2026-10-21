@@ -126,6 +126,68 @@ func TestSpeechUnavailableWithoutPool(t *testing.T) {
 	}
 }
 
+// The audio suite has no streaming watchdog, so the whole call (headers and
+// body) must be bounded: an upstream that sends 200 and then stalls the body
+// would otherwise hold the handler open until the client gives up. This is
+// the audio analogue of the chat idle window.
+func TestSpeechStalledBodyIsBounded(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	m.ttsHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}
+	c, p := newTestClient(t, m, 1)
+	// Warm the pool and clearance first: the audio timeout bounds the call,
+	// and the test measures the body phase, not the one-off solve.
+	if _, err := p.Get(context.Background()); err != nil {
+		t.Fatalf("warm pool: %v", err)
+	}
+	start := time.Now()
+	_, err := c.Speech(context.Background(), SpeechRequest{Text: "x"}, 300*time.Millisecond)
+	if !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("err = %v, want ErrIdleTimeout for a stalled body", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Speech waited %s on a stalled body", elapsed)
+	}
+}
+
+func TestTranscribeStalledBodyIsBounded(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	m.sttHandler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}
+	c, p := newTestClient(t, m, 1)
+	if _, err := p.Get(context.Background()); err != nil {
+		t.Fatalf("warm pool: %v", err)
+	}
+	start := time.Now()
+	_, err := c.Transcribe(context.Background(), AudioUpload{Filename: "a.mp3", Data: testMP3}, 300*time.Millisecond)
+	if !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("err = %v, want ErrIdleTimeout for a stalled body", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Transcribe waited %s on a stalled body", elapsed)
+	}
+}
+
 func TestSpeechRejectsEmptyBody(t *testing.T) {
 	t.Parallel()
 	m := startUpstream(t)

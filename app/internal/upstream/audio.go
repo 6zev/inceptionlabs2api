@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -42,6 +43,12 @@ type AudioUpload struct {
 // Speech posts req to /api/tts and returns the complete MP3 body. The bytes
 // are never decoded or rewritten: the upstream is the encoder.
 func (c *Client) Speech(ctx context.Context, req SpeechRequest, timeout time.Duration) ([]byte, error) {
+	// The upstream sends one complete body, so timeout bounds the whole call,
+	// not only the header phase: a 200 followed by a stalled body must not
+	// hold the handler open indefinitely.
+	ctx, cancel := withCallTimeout(ctx, timeout)
+	defer cancel()
+
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("upstream: marshal speech request: %w", err)
@@ -56,7 +63,7 @@ func (c *Client) Speech(ctx context.Context, req SpeechRequest, timeout time.Dur
 
 	audio, err := io.ReadAll(io.LimitReader(resp.Body, maxAudioBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("upstream: read speech body: %w", err)
+		return nil, audioReadError(ctx, "speech", err)
 	}
 	if len(audio) > maxAudioBytes {
 		return nil, fmt.Errorf("upstream: speech body exceeds %d bytes", maxAudioBytes)
@@ -73,6 +80,9 @@ func (c *Client) Speech(ctx context.Context, req SpeechRequest, timeout time.Dur
 // verbatim. The uploaded bytes are never transcoded (SPEC §2.5.2); only the
 // multipart part's content type is chosen, by sniffing.
 func (c *Client) Transcribe(ctx context.Context, up AudioUpload, timeout time.Duration) (string, error) {
+	ctx, cancel := withCallTimeout(ctx, timeout)
+	defer cancel()
+
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	partType := up.ContentType
@@ -116,7 +126,7 @@ func (c *Client) Transcribe(ctx context.Context, up AudioUpload, timeout time.Du
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxTranscriptBytes))
 	if err != nil {
-		return "", fmt.Errorf("upstream: read transcript body: %w", err)
+		return "", audioReadError(ctx, "transcript", err)
 	}
 	var out struct {
 		Text string `json:"text"`
@@ -125,6 +135,26 @@ func (c *Client) Transcribe(ctx context.Context, up AudioUpload, timeout time.Du
 		return "", fmt.Errorf("upstream: parse transcript: %w (body %q)", err, truncate(string(raw), 200))
 	}
 	return out.Text, nil
+}
+
+// withCallTimeout bounds a whole audio call. A zero or negative timeout leaves
+// the caller's context untouched.
+func withCallTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+// audioReadError classifies a body-read failure. The call timeout expiring
+// mid-body is the audio suite's idle window (SPEC §7.2), so it is reported as
+// ErrIdleTimeout and mapped to 504 like chat; a caller cancellation stays the
+// caller's.
+func audioReadError(ctx context.Context, what string, err error) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: reading %s body: %v", ErrIdleTimeout, what, err)
+	}
+	return fmt.Errorf("upstream: read %s body: %w", what, err)
 }
 
 // escapeQuotes escapes a filename for a quoted Content-Disposition parameter.
