@@ -22,7 +22,10 @@ type Speech interface {
 	Transcribe(ctx context.Context, up upstream.AudioUpload, timeout time.Duration) (string, error)
 }
 
-// defaultAudioMaxBytes is OpenAI's own upload limit. It is far above the 6 MiB
+// defaultAudioMaxBytes caps a transcription upload. It matches OpenAI's own
+// limit but is not the upstream's: the live upstream accepted a 2.5 MB body
+// (SPEC §2.5.1, probe 6), so this number is the gateway's memory/latency
+// bound, not a translation of an upstream rule. It is far above the 6 MiB
 // JSON cap because recordings legitimately run to tens of megabytes.
 const defaultAudioMaxBytes = 25 << 20
 
