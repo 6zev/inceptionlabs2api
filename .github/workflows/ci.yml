@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: app/go.sum
+      - name: build
+        working-directory: app
+        run: go build ./...
+      - name: vet
+        working-directory: app
+        run: go vet ./...
+      - name: test
+        working-directory: app
+        run: go test ./... -count=1 -race
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t inceptionlabs2api:ci .
