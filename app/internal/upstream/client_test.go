@@ -101,6 +101,15 @@ type mockUpstream struct {
 	searchTokens    []string
 	searchBodies    []string
 	searchEncodings []string
+
+	// Audio fixtures. Handlers nil means a canned 200.
+	ttsHandler      func(w http.ResponseWriter, r *http.Request)
+	sttHandler      func(w http.ResponseWriter, r *http.Request)
+	ttsTokens       []string
+	ttsBodies       []string
+	sttTokens       []string
+	sttContentTypes []string
+	sttBodies       [][]byte
 }
 
 func startUpstream(t *testing.T) *mockUpstream {
@@ -120,6 +129,7 @@ func startUpstream(t *testing.T) *mockUpstream {
 	mux.HandleFunc("/api/chat", m.handleChat)
 	mux.HandleFunc("/api/search-lab/config", m.handleConfig)
 	mux.HandleFunc("/api/search-lab/run", m.handleSearchRun)
+	m.addAudioRoutes(mux)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
@@ -263,6 +273,31 @@ func (m *mockUpstream) searchRequests() (tokens, bodies, encodings []string) {
 	return append([]string(nil), m.searchTokens...),
 		append([]string(nil), m.searchBodies...),
 		append([]string(nil), m.searchEncodings...)
+}
+
+func (m *mockUpstream) ttsRequests() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.ttsBodies...)
+}
+
+type sttRequest struct {
+	contentType string
+	body        []byte
+}
+
+func (m *mockUpstream) sttRequests() []sttRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]sttRequest, 0, len(m.sttContentTypes))
+	for i := range m.sttContentTypes {
+		var body []byte
+		if i < len(m.sttBodies) {
+			body = m.sttBodies[i]
+		}
+		out = append(out, sttRequest{contentType: m.sttContentTypes[i], body: body})
+	}
+	return out
 }
 
 func (m *mockUpstream) sessions() int {

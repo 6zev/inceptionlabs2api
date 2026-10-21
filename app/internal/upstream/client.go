@@ -54,16 +54,27 @@ func (e *StatusError) Message() string {
 		return ""
 	}
 	// Some upstream errors are JSON envelopes; surface their message field so
-	// the client sees prose rather than raw JSON inside a JSON string.
+	// the client sees prose rather than raw JSON inside a JSON string. The
+	// audio routes answer `{"error":"..."}` (a bare string) while chat uses
+	// the nested object form, so both are accepted.
 	var env struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-		Message string `json:"message"`
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
 	}
 	if json.Unmarshal([]byte(body), &env) == nil {
-		if msg := strings.TrimSpace(env.Error.Message); msg != "" {
-			return truncate(msg, maxClientMessage)
+		var nested struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(env.Error, &nested) == nil {
+			if msg := strings.TrimSpace(nested.Message); msg != "" {
+				return truncate(msg, maxClientMessage)
+			}
+		}
+		var bare string
+		if json.Unmarshal(env.Error, &bare) == nil {
+			if msg := strings.TrimSpace(bare); msg != "" {
+				return truncate(msg, maxClientMessage)
+			}
 		}
 		if msg := strings.TrimSpace(env.Message); msg != "" {
 			return truncate(msg, maxClientMessage)
