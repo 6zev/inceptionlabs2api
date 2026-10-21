@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -53,8 +52,10 @@ func (s *Server) audioMaxBytes() int64 {
 
 // voiceAliases maps OpenAI's standard voice names onto the four upstream
 // voices (SPEC §2.5.1). The upstream does not validate voice names: an unknown
-// one answers 200 with a 0.44 s nonsense clip, so the gateway must resolve
-// every accepted name to a real one rather than forward it.
+// one answers 200 with a short nonsense clip. Under the pass-through rule that
+// answer is the upstream's to give, so a name outside this table is forwarded
+// unchanged rather than rejected — the table is a translation for OpenAI
+// clients, not a whitelist.
 var voiceAliases = map[string]string{
 	"alloy":   "sarah",
 	"echo":    "chris",
@@ -64,25 +65,15 @@ var voiceAliases = map[string]string{
 	"shimmer": "jessica",
 }
 
-// upstreamVoices is the discovered whitelist in a stable order for messages.
-var upstreamVoices = []string{"charlie", "chris", "jessica", "sarah"}
-
-// resolveVoice maps an OpenAI or upstream voice name onto an upstream voice.
-// An empty name means "the upstream default" and returns "".
-func resolveVoice(name string) (string, bool) {
+// resolveVoice maps an OpenAI voice name onto an upstream voice and lowercases
+// every other name, leaving it for the upstream to interpret. An empty name
+// means "the upstream default" and returns "".
+func resolveVoice(name string) string {
 	v := strings.ToLower(strings.TrimSpace(name))
-	if v == "" {
-		return "", true
+	if mapped, ok := voiceAliases[v]; ok {
+		return mapped
 	}
-	if _, ok := voiceAliases[v]; ok {
-		return voiceAliases[v], true
-	}
-	for _, u := range upstreamVoices {
-		if v == u {
-			return v, true
-		}
-	}
-	return "", false
+	return v
 }
 
 // speechRequest is the POST /v1/audio/speech body. Only the structurally
@@ -127,13 +118,8 @@ func (s *Server) speech(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, errNoAudioBackend)
 		return
 	}
-	voice, ok := resolveVoice(req.Voice)
-	if !ok {
-		s.fail(w, unknownVoice(req.Voice))
-		return
-	}
 
-	audio, err := s.audio.Speech(r.Context(), upstream.SpeechRequest{Text: req.Input, Voice: voice}, s.audioTimeout())
+	audio, err := s.audio.Speech(r.Context(), upstream.SpeechRequest{Text: req.Input, Voice: resolveVoice(req.Voice)}, s.audioTimeout())
 	if err != nil {
 		if clientGone(r, err) {
 			return
@@ -204,24 +190,6 @@ func readBodyError(err error) *openai.RequestError {
 			fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
 	}
 	return openai.Invalid(fmt.Sprintf("read request body: %v", err))
-}
-
-// unknownVoice builds the 400 for a voice the upstream cannot produce. The
-// accepted list is in the message because the error is the only discovery
-// surface OpenAI clients have.
-func unknownVoice(name string) *openai.RequestError {
-	names := append([]string(nil), upstreamVoices...)
-	sort.Strings(names)
-	openaiNames := make([]string, 0, len(voiceAliases))
-	for a := range voiceAliases {
-		openaiNames = append(openaiNames, a)
-	}
-	sort.Strings(openaiNames)
-	return &openai.RequestError{
-		Status: http.StatusBadRequest, Type: "invalid_request_error", Code: openai.CodeInvalidRequest, Param: "voice",
-		Message: fmt.Sprintf("unknown voice %q; OpenAI voices: %s; upstream voices: %s",
-			name, strings.Join(openaiNames, ", "), strings.Join(names, ", ")),
-	}
 }
 
 // decodeSpeech accepts only what the upstream call cannot express: malformed

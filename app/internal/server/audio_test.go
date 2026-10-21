@@ -106,7 +106,7 @@ func TestSpeechResponseIsMP3(t *testing.T) {
 	if req.Text != "Hello there." {
 		t.Fatalf("text = %q", req.Text)
 	}
-	// OpenAI's `alloy` maps onto an upstream voice from the whitelist.
+	// OpenAI's `alloy` maps onto an upstream voice.
 	if req.Voice != "sarah" {
 		t.Fatalf("voice = %q, want the alloy mapping", req.Voice)
 	}
@@ -166,24 +166,41 @@ func TestSpeechVoiceMapping(t *testing.T) {
 	}
 }
 
-func TestSpeechUnknownVoiceIs400(t *testing.T) {
+// An unknown voice is passed through: the upstream answers it with its own
+// behaviour (a short clip), and SPEC §1.1 makes the upstream the authority on
+// what voice names exist. Mocking a 200 with audio bytes pins the pass-through.
+func TestSpeechUnknownVoicePassesThrough(t *testing.T) {
+	t.Parallel()
+	sp := &fakeSpeech{speech: func(int) ([]byte, error) {
+		return []byte("ID3\x04\x00\x00short"), nil
+	}}
+	s := newAudioServer(sp)
+	rec := postSpeech(t, s, `{"input":"hi","voice":"nonexistent-voice"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytes.HasPrefix(got, []byte("ID3")) {
+		t.Fatalf("body is not the upstream audio: %q", got)
+	}
+	req, ok := sp.lastSpeech()
+	if !ok {
+		t.Fatal("an unknown voice must reach the upstream")
+	}
+	if req.Voice != "nonexistent-voice" {
+		t.Fatalf("voice = %q, want it forwarded unchanged", req.Voice)
+	}
+}
+
+// An unknown voice does not get silently swapped for a real one either: the
+// caller asked for that name, so the upstream sees that name.
+func TestSpeechUnknownVoiceIsNotRewritten(t *testing.T) {
 	t.Parallel()
 	sp := &fakeSpeech{}
 	s := newAudioServer(sp)
-	rec := postSpeech(t, s, `{"input":"hi","voice":"nonexistent-voice"}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
-	}
-	var env openai.ErrorResponse
-	json.Unmarshal(rec.Body.Bytes(), &env)
-	if env.Error.Param != "voice" || env.Error.Code != openai.CodeInvalidRequest {
-		t.Fatalf("envelope = %+v", env.Error)
-	}
-	if !strings.Contains(env.Error.Message, "sarah") {
-		t.Fatalf("message does not list the accepted voices: %q", env.Error.Message)
-	}
-	if _, ok := sp.lastSpeech(); ok {
-		t.Fatal("an unknown voice reached the upstream")
+	postSpeech(t, s, `{"input":"hi","voice":"  Not-A-Voice "}`)
+	req, _ := sp.lastSpeech()
+	if req.Voice != "not-a-voice" {
+		t.Fatalf("voice = %q, want the trimmed, lowercased passthrough", req.Voice)
 	}
 }
 
