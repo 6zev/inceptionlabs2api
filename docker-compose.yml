@@ -1,0 +1,19 @@
+services:
+  inceptionlabs2api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - IL2API_ADDR=:3000
+      - IL2API_API_KEY=${IL2API_API_KEY:-}
+      - IL2API_UPSTREAM_BASE=${IL2API_UPSTREAM_BASE:-https://chat.inceptionlabs.ai}
+      - IL2API_MODEL=${IL2API_MODEL:-mercury-3}
+      - IL2API_MODELS=${IL2API_MODELS:-}
+      # Outbound proxy. Also honours a host-level HTTPS_PROXY when unset.
+      - IL2API_PROXY=${IL2API_PROXY:-}
+      - IL2API_POOL_MIN=${IL2API_POOL_MIN:-2}
+      - IL2API_POOL_MAX=${IL2API_POOL_MAX:-8}
+      - IL2API_POOL_TTL=${IL2API_POOL_TTL:-30m}
+      - IL2API_IDLE_TIMEOUT=${IL2API_IDLE_TIMEOUT:-60s}
+      - IL2API_CONTEXT_CHARS=${IL2API_CONTEXT_CHARS:-250000}
+    restart: unless-stopped

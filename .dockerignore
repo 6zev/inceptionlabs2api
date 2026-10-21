@@ -1,0 +1,11 @@
+.git
+.github
+docs
+*.md
+TASK.md
+CLAUDE.md
+app/*_test.go
+app/**/*_test.go
+app/app
+coverage.*
+*.log

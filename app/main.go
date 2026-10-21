@@ -5,9 +5,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -19,9 +19,17 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// run builds the gateway and serves until SIGINT/SIGTERM. It returns an error
+// instead of exiting so the wiring is testable.
+func run() error {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		return fmt.Errorf("config: %w", err)
 	}
 	logf := log.Printf
 
@@ -76,7 +84,7 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		logf("shutdown: %v", err)
-		os.Exit(1)
+		return fmt.Errorf("shutdown: %w", err)
 	}
+	return nil
 }
