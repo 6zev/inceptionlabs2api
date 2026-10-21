@@ -407,12 +407,16 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration,
 	}, nil
 }
 
-// postAuthed POSTs body to path with a pooled token, retrying with a fresh
-// token on 401/403 at most maxAuthRetries times. It returns a 200 response
-// whose body the caller owns. A 401/403 discards that token; other non-200
-// statuses are a typed *StatusError and keep the token, since the pool never
-// poisons a token for an upstream fault. prepare may customise headers.
-func (c *Client) postAuthed(ctx context.Context, path, label string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
+// authed issues one request with a pooled token, retrying with a fresh token
+// on 401/403 at most maxAuthRetries times. It returns a 200 response whose
+// body the caller owns. A 401/403 discards that token; other non-200 statuses
+// are a typed *StatusError and keep the token, since the pool never poisons a
+// token for an upstream fault. prepare may customise headers.
+//
+// This is the one token-bearing request path (§6.1): chat, search, TTS, STT
+// and the search-config probe all call it, so none of them can grow its own
+// retry loop or forget to discard a rejected token.
+func (c *Client) authed(ctx context.Context, method, path, label string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
 	if c.pool == nil {
 		return nil, fmt.Errorf("%w: no pool bound", ErrUnavailable)
 	}
@@ -428,7 +432,7 @@ func (c *Client) postAuthed(ctx context.Context, path, label string, body []byte
 			}
 			return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
 		}
-		resp, err := c.Send(ctx, http.MethodPost, path, body, headerTimeout, func(req *http.Request) {
+		resp, err := c.Send(ctx, method, path, body, headerTimeout, func(req *http.Request) {
 			req.Header.Set("x-session-token", token)
 			if prepare != nil {
 				prepare(req)
@@ -455,6 +459,11 @@ func (c *Client) postAuthed(ctx context.Context, path, label string, body []byte
 		}
 	}
 	return nil, lastErr
+}
+
+// postAuthed is the POST form of authed, used by every JSON/audio family.
+func (c *Client) postAuthed(ctx context.Context, path, label string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
+	return c.authed(ctx, http.MethodPost, path, label, body, headerTimeout, prepare)
 }
 
 func truncate(s string, n int) string {

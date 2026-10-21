@@ -229,7 +229,8 @@ func newStack(t *testing.T, idle time.Duration) *stack {
 	m := newTLSUpstream(t)
 	c, fetch := upstream.NewClient(upstream.Config{
 		BaseURL:        m.base,
-		SessionTimeout: 5 * time.Second,
+		// The production default: clearance acquisition nests inside it.
+		SessionTimeout: 15 * time.Second,
 		RootCAs:        m.roots,
 		Logf:           func(string, ...any) {},
 	})

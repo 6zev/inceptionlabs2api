@@ -206,18 +206,12 @@ func normalizeSources(in []SearchSource) []SearchSource {
 // pool cannot supply one the probe is reported as failed (availability stays
 // unknown) rather than guessed.
 func (c *Client) SearchConfig(ctx context.Context) (*SearchConfigResponse, error) {
-	if c.pool == nil {
-		return nil, fmt.Errorf("%w: no pool bound", ErrUnavailable)
-	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	token, err := c.pool.Get(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
-	}
-	resp, err := c.Send(ctx, http.MethodGet, "/api/search-lab/config", nil, c.timeout, func(r *http.Request) {
+	// Through the one token-bearing wrapper, so a probe that meets a rejected
+	// token retries like every other family instead of failing first try.
+	resp, err := c.authed(ctx, http.MethodGet, "/api/search-lab/config", "search-config", nil, c.timeout, func(r *http.Request) {
 		r.Header.Set("Accept", "application/json")
-		r.Header.Set("x-session-token", token)
 	})
 	if err != nil {
 		return nil, err

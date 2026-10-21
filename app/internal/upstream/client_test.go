@@ -310,7 +310,10 @@ func newTestClient(t *testing.T, m *mockUpstream, min int) (*Client, *pool.Pool)
 	t.Helper()
 	c, fetch := NewClient(Config{
 		BaseURL:        m.baseURL,
-		SessionTimeout: 5 * time.Second,
+		// The production default. Acquisition (solve + POST) runs inside this
+		// context, so a short test value turns a slow CI solve into an
+		// unrelated "clearance unavailable" failure.
+		SessionTimeout: 15 * time.Second,
 		RootCAs:        m.roots,
 		Logf:           func(string, ...any) {},
 	})
@@ -907,4 +910,30 @@ func TestChallengeRetiresTheSlotAndRefills(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("ring is empty after the challenge: %+v", c.Clearance().State())
+}
+
+// The config probe goes through the same token wrapper as every family: a
+// first 401 is retried with a fresh token, not surfaced.
+func TestSearchConfigRetriesOn401(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	var calls atomic.Int32
+	m.configHandler = func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		io.WriteString(w, `{"retrievalAvailable":true}`)
+	}
+	c, _ := newTestClient(t, m, 1)
+	cfg, err := c.SearchConfig(context.Background())
+	if err != nil {
+		t.Fatalf("SearchConfig: %v", err)
+	}
+	if !cfg.RetrievalAvailable {
+		t.Fatal("probe did not report availability")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("probe attempts = %d, want 2 (401 then retry)", got)
+	}
 }
