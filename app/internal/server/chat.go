@@ -120,7 +120,14 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 		return
 	}
 
+	// Sources are collected as they arrive and ride the finish frame
+	// (SPEC §2.4): the upstream interleaves text-end → sources → text-start,
+	// so no earlier chunk is known to be the last one.
+	var cites upstream.CitationCollector
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
+		if err := cites.Observe(ev, s.logf); err != nil {
+			return err
+		}
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
 			if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
@@ -155,7 +162,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 	}
 
 	stop := "stop"
-	if !write(openai.Delta{}, &stop) {
+	if !write(openai.Delta{Annotations: cites.Citations()}, &stop) {
 		return
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
@@ -179,7 +186,11 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, ureq *upstream
 	defer stream.Close()
 
 	var content, reasoning strings.Builder
+	var cites upstream.CitationCollector
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
+		if err := cites.Observe(ev, s.logf); err != nil {
+			return err
+		}
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
 			reasoning.WriteString(ev.Reasoning())
@@ -207,6 +218,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, ureq *upstream
 				Role:             "assistant",
 				Content:          content.String(),
 				ReasoningContent: reasoning.String(),
+				Annotations:      cites.Citations(),
 			},
 			FinishReason: "stop",
 		}},

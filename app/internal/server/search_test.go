@@ -421,7 +421,8 @@ var (
 )
 
 // The chat stream never reproduces search sentinels: a `source-url` titled
-// __search_error__ must not reach the client as content or a citation.
+// __search_error__ must not reach the client as content or a citation, while a
+// real source still becomes an annotation.
 func TestChatStreamDropsSearchSentinels(t *testing.T) {
 	t.Parallel()
 	body := `data: {"type":"text-start","id":"text-0"}
@@ -438,13 +439,17 @@ data: [DONE]
 		t.Fatalf("status = %d", rec.Code)
 	}
 	out := rec.Body.String()
-	for _, sentinel := range []string{"__searching__", "__search_error__", "real.example"} {
+	for _, sentinel := range []string{"__searching__", "__search_error__"} {
 		if strings.Contains(out, sentinel) {
 			t.Fatalf("chat stream leaked %q: %s", sentinel, out)
 		}
 	}
 	if !strings.Contains(out, `"content":"answer"`) {
 		t.Fatalf("content lost: %s", out)
+	}
+	// The real source survives as a citation, ranked after the sentinels.
+	if !strings.Contains(out, `"type":"url_citation"`) || !strings.Contains(out, `"index":1`) || !strings.Contains(out, "real.example") {
+		t.Fatalf("real source lost its citation: %s", out)
 	}
 }
 

@@ -325,8 +325,9 @@ data: [DONE]
 	if got := content.String(); got != "snapshot block plus delta second answer" {
 		t.Fatalf("content = %q", got)
 	}
-	if strings.Contains(rec.Body.String(), "example.com") {
-		t.Fatal("source-url should be ignored")
+	// The source becomes a citation annotation on the finish frame (§2.4).
+	if !strings.Contains(rec.Body.String(), `"type":"url_citation"`) || !strings.Contains(rec.Body.String(), "example.com") {
+		t.Fatal("source-url should become a url_citation annotation")
 	}
 }
 
