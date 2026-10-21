@@ -426,6 +426,39 @@ func TestRefreshNoChallengeIsSuccess(t *testing.T) {
 	}
 }
 
+// An unchallenged egress needs no cookie, and that fact is itself worth
+// remembering: Send calls Ensure before every upstream request, so re-probing
+// on each one would double the session traffic the pool already generates.
+// The probe result is re-checked at the same age a cookie would be refreshed.
+func TestEnsureDoesNotReprobeUnchallengedEgress(t *testing.T) {
+	t.Parallel()
+	var probes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probes.Add(1)
+		io.WriteString(w, `{"ok":true,"token":"1792553057.`+strings.Repeat("0", 31)+`a.`+strings.Repeat("f", 64)+`"}`)
+	}))
+	defer srv.Close()
+	now := time.Unix(1_800_000_000, 0)
+	c := New(Config{BaseURL: srv.URL, Refresh: 45 * time.Minute, Now: func() time.Time { return now }, Logf: func(string, ...any) {}})
+	for i := 0; i < 5; i++ {
+		if err := c.Ensure(context.Background()); err != nil {
+			t.Fatalf("Ensure %d: %v", i, err)
+		}
+	}
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("probes = %d across 5 requests, want 1", got)
+	}
+	// Past the refresh age the egress is re-probed: it may have started
+	// challenging (new egress IP, edge rollout).
+	now = now.Add(46 * time.Minute)
+	if err := c.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure after refresh age: %v", err)
+	}
+	if got := probes.Load(); got != 2 {
+		t.Fatalf("probes = %d after the refresh age, want 2", got)
+	}
+}
+
 func TestRefreshOtherStatusIsError(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

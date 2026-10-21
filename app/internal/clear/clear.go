@@ -96,6 +96,10 @@ type Clearance struct {
 	mu       sync.Mutex
 	cookie   string
 	acquired time.Time
+	// probed records a successful "this egress is not challenged" result.
+	// Without it Ensure would perform the /api/session probe before every
+	// upstream request, doubling the session traffic the pool already makes.
+	probed bool
 
 	refreshes   int64
 	lastAttempt time.Time
@@ -173,10 +177,12 @@ func (c *Clearance) State() State {
 	return st
 }
 
-// staleLocked reports whether the held cookie is past the refresh margin.
+// staleLocked reports whether the clearance state is past the refresh margin.
+// An unchallenged egress holds no cookie but is still fresh for one refresh
+// window, for the same reason a cookie is.
 func (c *Clearance) staleLocked() bool {
 	if c.cookie == "" {
-		return true
+		return !c.probed || c.now().Sub(c.acquired) >= c.cfg.Refresh
 	}
 	return c.now().Sub(c.acquired) >= c.cfg.Refresh
 }
@@ -249,6 +255,7 @@ func (c *Clearance) RunRefreshLoop(ctx context.Context, every time.Duration) {
 func (c *Clearance) Invalidate() {
 	c.mu.Lock()
 	c.cookie = ""
+	c.probed = false
 	c.mu.Unlock()
 }
 
@@ -334,6 +341,8 @@ func (c *Clearance) refresh(ctx context.Context) error {
 		// acquisition with nothing to hold.
 		c.mu.Lock()
 		c.cookie = ""
+		c.acquired = c.now()
+		c.probed = true
 		c.mu.Unlock()
 		c.logf("clear: probe was not challenged; no clearance needed")
 		return nil
@@ -353,6 +362,7 @@ func (c *Clearance) refresh(ctx context.Context) error {
 	c.mu.Lock()
 	c.cookie = cookie
 	c.acquired = c.now()
+	c.probed = false
 	c.refreshes++
 	c.mu.Unlock()
 	c.logf("clear: acquired %s (solved in %s)", CookieName, c.now().Sub(start).Round(time.Millisecond))
