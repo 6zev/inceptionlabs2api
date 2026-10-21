@@ -48,7 +48,7 @@ func (c *CitationCollector) Observe(ev Event, logf func(format string, args ...a
 	}
 
 	url := strings.TrimSpace(ev.URL)
-	if !isHTTPURL(url) || len([]rune(url)) > maxURLRunes || hasControl(url) {
+	if !usableSource(url) {
 		return
 	}
 	if c.seen == nil {
@@ -62,12 +62,11 @@ func (c *CitationCollector) Observe(ev Event, logf func(format string, args ...a
 	}
 	c.seen[url] = struct{}{}
 
-	title := strings.Join(strings.Fields(ev.Title), " ")
 	c.cites = append(c.cites, openai.Citation{
 		Type:       "url_citation",
 		Index:      len(c.cites) + 1,
 		URL:        url,
-		Title:      truncateRunes(title, maxTitleRunes),
+		Title:      sourceTitle(ev.Title),
 		StartIndex: 0,
 		EndIndex:   0,
 	})

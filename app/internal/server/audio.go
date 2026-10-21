@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -98,18 +97,15 @@ type transcriptionResponse struct {
 // still produces a JSON error envelope instead of a truncated audio stream.
 func (s *Server) speech(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
-			"method not allowed; use POST"))
+		methodNotAllowed(w, http.MethodPost)
 		return
 	}
 	s.requests.Add(1)
 	s.tts.Add(1)
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.fail(w, readBodyError(err))
+	body, re := s.readJSONBody(w, r)
+	if re != nil {
+		s.fail(w, re)
 		return
 	}
 	req, re := decodeSpeech(body)
@@ -142,9 +138,7 @@ func (s *Server) speech(w http.ResponseWriter, r *http.Request) {
 // (SPEC §2.5.2).
 func (s *Server) transcription(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
-			"method not allowed; use POST"))
+		methodNotAllowed(w, http.MethodPost)
 		return
 	}
 	s.requests.Add(1)
@@ -185,30 +179,12 @@ func clientGone(r *http.Request, err error) bool {
 	return errors.Is(err, context.Canceled) && r.Context().Err() != nil
 }
 
-// readBodyError maps an io.ReadAll failure on the request body.
-func readBodyError(err error) *openai.RequestError {
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		return openai.New(http.StatusRequestEntityTooLarge, "invalid_request_error", openai.CodeRequestTooLarge, "",
-			fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
-	}
-	return openai.Invalid(fmt.Sprintf("read request body: %v", err))
-}
-
 // decodeSpeech accepts only what the upstream call cannot express: malformed
 // JSON, trailing data, a non-object body, and an empty or non-string input.
 // Everything else is dropped (SPEC §7.2).
 func decodeSpeech(body []byte) (*speechRequest, *openai.RequestError) {
-	var raw map[string]json.RawMessage
-	dec := json.NewDecoder(bytes.NewReader(body))
-	if err := dec.Decode(&raw); err != nil {
-		return nil, openai.Invalid(fmt.Sprintf("invalid JSON body: %v", err))
-	}
-	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
-		return nil, openai.Invalid("invalid JSON body: unexpected data after the request object")
-	}
-	if raw == nil {
-		return nil, openai.Invalid("request body must be a JSON object")
+	if _, re := decodeJSONObject(body); re != nil {
+		return nil, re
 	}
 
 	var req speechRequest

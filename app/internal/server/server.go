@@ -5,9 +5,7 @@ package server
 import (
 	"context"
 	"crypto/subtle"
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -243,27 +241,16 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
-			"method not allowed; use POST"))
+		methodNotAllowed(w, http.MethodPost)
 		return
 	}
 	s.requests.Add(1)
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			s.fail(w, openai.New(http.StatusRequestEntityTooLarge, "invalid_request_error", openai.CodeRequestTooLarge, "",
-				fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes)))
-			return
-		}
-		s.fail(w, openai.New(http.StatusBadRequest, "invalid_request_error", openai.CodeInvalidRequest, "",
-			fmt.Sprintf("read request body: %v", err)))
+	body, re := s.readJSONBody(w, r)
+	if re != nil {
+		s.fail(w, re)
 		return
 	}
-
 	req, re := openai.Decode(body)
 	if re != nil {
 		s.fail(w, re)
@@ -307,8 +294,7 @@ func (s *Server) fail(w http.ResponseWriter, re *openai.RequestError) {
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
-			"method not allowed; use GET"))
+		methodNotAllowed(w, "GET, HEAD")
 		return
 	}
 	created := s.now().Unix()
@@ -323,8 +309,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 // behind auth, so orchestrators can probe it.
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
-			"method not allowed; use GET"))
+		methodNotAllowed(w, "GET, HEAD")
 		return
 	}
 	body := map[string]any{

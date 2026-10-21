@@ -1,11 +1,9 @@
 package upstream
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -20,8 +18,9 @@ var ErrStreamTruncated = errors.New("upstream: stream ended before [DONE]")
 // window. It is distinct from a client disconnect and from a transport error.
 var ErrIdleTimeout = errors.New("upstream: stream idle timeout")
 
-// maxLineBytes caps one SSE line. The upstream sends whole answers in single
-// events on this diffusion model, so the buffer is generous.
+// maxLineBytes caps one upstream line (SSE or NDJSON). The upstream sends
+// whole answers in single events on this diffusion model and whole source
+// lists in one docs event, so the buffer is generous.
 const maxLineBytes = 16 << 20
 
 // Reader parses an upstream SSE body and emits one callback per event.
@@ -42,101 +41,38 @@ func NewReader(body io.Reader, idle time.Duration, onMalformed func(string)) *Re
 // cancelled, or the stream ends.
 //
 // The idle watchdog is sliding: every line read, including blank separators,
-// resets it. The scan runs in a helper goroutine so Read can abandon a stalled
-// body; that goroutine exits when the caller closes the body.
+// resets it (lines, §6.1). A clean end before [DONE] is ErrStreamTruncated.
 func (r *Reader) Read(ctx context.Context, onEvent func(Event) error) error {
-	if r.idle <= 0 {
-		r.idle = 60 * time.Second
-	}
-
-	// The watchdog returns from Read; the scanner goroutine is released via
-	// done, and the caller's deferred body Close unblocks any pending read.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	type lineResult struct {
-		line string
-		err  error
-	}
-	lines := make(chan lineResult)
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		scanner := bufio.NewScanner(r.r)
-		scanner.Buffer(make([]byte, 64*1024), maxLineBytes)
-		for scanner.Scan() {
-			select {
-			case lines <- lineResult{line: scanner.Text()}:
-			case <-done:
-				return
-			}
+	err := lines(ctx, r.r, r.idle, 0, func(line string) error {
+		if !strings.HasPrefix(line, "data:") {
+			return nil
 		}
-		err := scanner.Err()
-		if err == nil {
-			err = io.EOF
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" {
+			return nil
 		}
-		select {
-		case lines <- lineResult{err: err}:
-		case <-done:
+		if payload == "[DONE]" {
+			return errStopLines
 		}
-	}()
-
-	timer := time.NewTimer(r.idle)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return ErrIdleTimeout
-		case res := <-lines:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
+		var ev Event
+		if err := json.Unmarshal([]byte(payload), &ev); err != nil || ev.Type == "" {
+			if r.onMalformed != nil {
+				r.onMalformed(payload)
 			}
-			timer.Reset(r.idle)
-
-			if res.err != nil {
-				if errors.Is(res.err, io.EOF) {
-					return ErrStreamTruncated
-				}
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				return fmt.Errorf("upstream: read stream: %w", res.err)
-			}
-
-			line := res.line
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if payload == "" {
-				continue
-			}
-			if payload == "[DONE]" {
-				return nil
-			}
-			var ev Event
-			if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-				if r.onMalformed != nil {
-					r.onMalformed(payload)
-				}
-				continue
-			}
-			if ev.Type == "" {
-				if r.onMalformed != nil {
-					r.onMalformed(payload)
-				}
-				continue
-			}
-			if err := onEvent(ev); err != nil {
-				return err
-			}
+			return nil
 		}
+		return onEvent(ev)
+	})
+	switch {
+	case errors.Is(err, errStopLines):
+		return nil
+	case errors.Is(err, io.EOF):
+		return ErrStreamTruncated
+	default:
+		return err
 	}
 }
+
+// errStopLines is the sentinel a line callback returns to end the pump
+// successfully (chat's [DONE], search's terminal event).
+var errStopLines = errors.New("upstream: line pump stopped")

@@ -464,3 +464,25 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
+
+// collapseSpace collapses runs of whitespace (and newlines/tabs) to single
+// spaces and trims the ends. The upstream titles arrive with raw HTML
+// whitespace; both the search results and the citation annotations use this
+// one rule (SPEC §6.1).
+func collapseSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// clampInt returns v bounded to [lo,hi], or def when v is unset (zero). It is
+// the translation a family applies to a numeric field whose range the upstream
+// publishes; the server's search mapping uses it for fanout/depth (§7.1).
+func ClampInt(v, lo, hi, def int) int {
+	if v == 0 {
+		return def
+	}
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}

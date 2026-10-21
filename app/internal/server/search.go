@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -57,23 +56,14 @@ type webSearchResult struct {
 // request, and the endpoint answers only once sources exist.
 func (s *Server) webSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
-			"method not allowed; use POST"))
+		methodNotAllowed(w, http.MethodPost)
 		return
 	}
 	s.requests.Add(1)
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			s.fail(w, openai.New(http.StatusRequestEntityTooLarge, "invalid_request_error", openai.CodeRequestTooLarge, "",
-				fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes)))
-			return
-		}
-		s.fail(w, openai.Invalid(fmt.Sprintf("read request body: %v", err)))
+	body, re := s.readJSONBody(w, r)
+	if re != nil {
+		s.fail(w, re)
 		return
 	}
 	req, re := decodeWebSearch(body)
@@ -93,7 +83,7 @@ func (s *Server) webSearch(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
 			return
 		}
-		s.fail(w, s.searchError(err))
+		s.fail(w, s.upstreamError(err))
 		return
 	}
 	// Results derive from the caller's query; keep them out of shared caches.
@@ -119,28 +109,14 @@ func searchRequest(req *webSearchRequest) *upstream.SearchRequest {
 	return &upstream.SearchRequest{
 		Query: req.Query,
 		Config: upstream.SearchConfig{
-			Fanout:   clamp(in.Fanout, 1, maxFanout, 3),
-			Depth:    clamp(in.Depth, 1, maxDepth, 1),
+			Fanout:   upstream.ClampInt(in.Fanout, 1, maxFanout, 3),
+			Depth:    upstream.ClampInt(in.Depth, 1, maxDepth, 1),
 			KeepTopK: keepTopK(in.KeepTopK),
 			Effort:   effort,
 		},
 		Timezone: "UTC",
 		Language: "en-US",
 	}
-}
-
-// clamp returns v bounded to [lo,hi], or def when v is unset (zero).
-func clamp(v, lo, hi, def int) int {
-	if v == 0 {
-		return def
-	}
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
 }
 
 // keepTopK defaults an unset value and passes everything else through: the
@@ -180,21 +156,10 @@ func nonNil(in []string) []string {
 // query, and a config that is not an object. Unknown keys are dropped and
 // numeric bounds are clamped; effort is passed through (SPEC §1.1).
 func decodeWebSearch(body []byte) (*webSearchRequest, *openai.RequestError) {
-	var raw map[string]json.RawMessage
-	dec := json.NewDecoder(bytes.NewReader(body))
-	if err := dec.Decode(&raw); err != nil {
-		return nil, openai.Invalid(fmt.Sprintf("invalid JSON body: %v", err))
+	raw, re := decodeJSONObject(body)
+	if re != nil {
+		return nil, re
 	}
-	// Anything other than EOF after the object — valid JSON or garbage — is
-	// rejected: a prefix that a front proxy or WAF might parse differently
-	// must not be silently tolerated.
-	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
-		return nil, openai.Invalid("invalid JSON body: unexpected data after the request object")
-	}
-	if raw == nil {
-		return nil, openai.Invalid("request body must be a JSON object")
-	}
-
 	var req webSearchRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, openai.Invalid(fmt.Sprintf("invalid request: %v", err))
@@ -217,31 +182,4 @@ func decodeWebSearch(body []byte) (*webSearchRequest, *openai.RequestError) {
 		}
 	}
 	return &req, nil
-}
-
-// searchError maps search failures onto the chat path's status/code surface.
-// It increments upstream_errors itself only for the failures it classifies;
-// the fallback delegates to upstreamError, which owns that counter, so a
-// single failure is never counted twice.
-func (s *Server) searchError(err error) *openai.RequestError {
-	var se *upstream.SearchError
-	if errors.As(err, &se) {
-		s.upErrors.Add(1)
-		s.logf("upstream: search failed: %s", truncate(se.Message, 300))
-		msg := "upstream search pipeline failed"
-		if m := strings.TrimSpace(se.Message); m != "" {
-			msg = truncate(m, 1000)
-		}
-		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamError, "", msg)
-	}
-	switch {
-	case errors.Is(err, upstream.ErrSearchIncomplete):
-		s.upErrors.Add(1)
-		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamStream, "",
-			"upstream closed the search stream before returning sources")
-	case errors.Is(err, context.Canceled):
-		return openai.New(http.StatusRequestTimeout, "invalid_request_error", openai.CodeInvalidRequest, "",
-			"request canceled by the client")
-	}
-	return s.upstreamError(err)
 }

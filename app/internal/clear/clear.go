@@ -522,7 +522,6 @@ func (c *Clearance) acquireSlot(ctx context.Context, idx int, force bool) error 
 	return err
 }
 
-
 // wait blocks until the owner's acquisition finishes and reports its result.
 func (c *Clearance) wait(ctx context.Context, done chan struct{}) error {
 	select {

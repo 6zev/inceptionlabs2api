@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -10,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -27,10 +25,6 @@ type SearchError struct{ Message string }
 // Error implements error.
 func (e *SearchError) Error() string { return "upstream: search error: " + e.Message }
 
-// maxSearchLineBytes caps one NDJSON line. A docs event carries the whole
-// ranked list, so the buffer is generous.
-const maxSearchLineBytes = 16 << 20
-
 // Collection caps bound what a hostile or buggy upstream can make the
 // gateway retain and echo. They are well above any plausible real run: the
 // upstream's own maximum is fanout 5 × depth 3.
@@ -38,8 +32,6 @@ const (
 	maxCollectedQueries = 32
 	maxCollectedSources = 50
 	maxQueryRunes       = 2000
-	maxTitleRunes       = 512
-	maxURLRunes         = 4096
 )
 
 // absoluteSearchCap bounds a whole run independently of the sliding idle
@@ -105,120 +97,82 @@ func decodedBody(body io.Reader, encoding string) (io.Reader, error) {
 }
 
 // collectSearch consumes NDJSON lines into a SearchResult. Malformed lines
-// and unknown event types are skipped, matching the playground's reader.
-// The scan runs in a helper goroutine so a stalled body can be abandoned; the
-// reader is released when the caller closes the response body.
+// and unknown event types are skipped, matching the playground's reader. It
+// runs on the shared line pump (lines, §6.1) with the search hard cap, so a
+// stalled body is abandoned and a keep-alive trickle cannot pin a request.
 func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*SearchResult, error) {
-	type lineResult struct {
-		line string
-		err  error
-	}
-	lines := make(chan lineResult)
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 64*1024), maxSearchLineBytes)
-		for sc.Scan() {
-			select {
-			case lines <- lineResult{line: sc.Text()}:
-			case <-done:
-				return
-			}
-		}
-		err := sc.Err()
-		if err == nil {
-			err = io.EOF
-		}
-		select {
-		case lines <- lineResult{err: err}:
-		case <-done:
-		}
-	}()
-
-	timer := time.NewTimer(idle)
-	defer timer.Stop()
-	// The deadline starts when collection starts, i.e. after the response
-	// headers; the pre-header phase has its own bound in post().
-	deadline := time.NewTimer(absoluteSearchCap(idle))
-	defer deadline.Stop()
-
 	res := &SearchResult{}
 	seenQuery := make(map[string]bool)
 	haveDocs := false
-	finish := func() (*SearchResult, error) {
+	var stopErr error
+
+	// finish ends the pump; it is what every terminal event returns.
+	finish := func() error {
+		if !haveDocs {
+			return ErrSearchIncomplete
+		}
+		return errStopLines
+	}
+
+	pumpErr := lines(ctx, r, idle, absoluteSearchCap(idle), func(line string) error {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return nil
+		}
+		var ev searchEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			return nil
+		}
+		switch ev.Type {
+		case searchEventQueries:
+			for _, q := range ev.Queries {
+				if len(res.Queries) >= maxCollectedQueries {
+					break
+				}
+				q = strings.TrimSpace(q)
+				if q == "" || len([]rune(q)) > maxQueryRunes || seenQuery[q] {
+					continue
+				}
+				seenQuery[q] = true
+				res.Queries = append(res.Queries, q)
+			}
+		case searchEventDocs:
+			res.Sources = normalizeSources(ev.Sources)
+			haveDocs = true
+		case searchEventRounds:
+			// The last round's docs are in: retrieval is complete and
+			// only follow-up questions or synthesis remain.
+			if haveDocs && ev.Run >= ev.Of {
+				return finish()
+			}
+		case searchEventCallStart:
+			if ev.Kind == searchKindSynthesize {
+				return finish()
+			}
+		case searchEventRunDone:
+			return finish()
+		case searchEventError:
+			stopErr = &SearchError{Message: ev.Message}
+			return errStopLines
+		}
+		return nil
+	})
+	if stopErr != nil {
+		return nil, stopErr
+	}
+	switch {
+	case errors.Is(pumpErr, errStopLines):
+		return res, nil
+	case errors.Is(pumpErr, io.EOF):
+		// A docs event is already the product, so a body that closes after
+		// one is a complete answer; closing before one is truncation and must
+		// not look like an empty result set.
 		if !haveDocs {
 			return nil, ErrSearchIncomplete
 		}
 		return res, nil
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			return nil, ErrIdleTimeout
-		case <-deadline.C:
-			return nil, ErrIdleTimeout
-		case resLine := <-lines:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(idle)
-
-			if resLine.err != nil {
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-				// A docs event is already the product, so a body that closes
-				// after one is a complete answer; closing before one is
-				// truncation and must not look like an empty result set.
-				return finish()
-			}
-			line := strings.TrimSpace(resLine.line)
-			if line == "" {
-				continue
-			}
-			var ev searchEvent
-			if err := json.Unmarshal([]byte(line), &ev); err != nil {
-				continue
-			}
-			switch ev.Type {
-			case searchEventQueries:
-				for _, q := range ev.Queries {
-					if len(res.Queries) >= maxCollectedQueries {
-						break
-					}
-					q = strings.TrimSpace(q)
-					if q == "" || len([]rune(q)) > maxQueryRunes || seenQuery[q] {
-						continue
-					}
-					seenQuery[q] = true
-					res.Queries = append(res.Queries, q)
-				}
-			case searchEventDocs:
-				res.Sources = normalizeSources(ev.Sources)
-				haveDocs = true
-			case searchEventRounds:
-				// The last round's docs are in: retrieval is complete and
-				// only follow-up questions or synthesis remain.
-				if haveDocs && ev.Run >= ev.Of {
-					return finish()
-				}
-			case searchEventCallStart:
-				if ev.Kind == searchKindSynthesize {
-					return finish()
-				}
-			case searchEventRunDone:
-				return finish()
-			case searchEventError:
-				return nil, &SearchError{Message: ev.Message}
-			}
-		}
+	default:
+		return nil, pumpErr
 	}
 }
 
@@ -234,52 +188,16 @@ func normalizeSources(in []SearchSource) []SearchSource {
 			break
 		}
 		url := strings.TrimSpace(s.URL)
-		if !isHTTPURL(url) || len([]rune(url)) > maxURLRunes || hasControl(url) {
+		if !usableSource(url) {
 			continue
 		}
 		out = append(out, SearchSource{
-			Title: truncateRunes(strings.Join(strings.Fields(s.Title), " "), maxTitleRunes),
+			Title: sourceTitle(s.Title),
 			URL:   url,
 			Score: s.Score,
 		})
 	}
 	return out
-}
-
-// isHTTPURL reports whether raw is an absolute http(s) URL with a host.
-func isHTTPURL(raw string) bool {
-	if len(raw) < len("http://")+1 {
-		return false
-	}
-	lower := strings.ToLower(raw)
-	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
-		return false
-	}
-	u, err := url.Parse(raw)
-	return err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https")
-}
-
-// hasControl reports whether s contains ASCII control characters, which
-// could smuggle headers or terminal escapes into downstream consumers.
-func hasControl(s string) bool {
-	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
-			return true
-		}
-	}
-	return false
-}
-
-// truncateRunes returns s cut to at most n runes, preserving valid UTF-8.
-func truncateRunes(s string, n int) string {
-	count := 0
-	for i := range s {
-		if count == n {
-			return s[:i]
-		}
-		count++
-	}
-	return s
 }
 
 // SearchConfig calls GET /api/search-lab/config. The live route is challenged
