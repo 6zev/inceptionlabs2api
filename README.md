@@ -22,11 +22,13 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
 - **标准库 HTTP/2 + `_vcrcs` 通关（轮换环）**：上游的 Vercel 安全网关要求
   「清除凭证 cookie + 求解时同一个 Chrome UA + HTTP/2」三者同时成立。网关在
   **启动时**即后台本地求解 v2 工作量证明（3 轮 SHA-256 前缀链，约 0.1 秒 CPU，
-  无外部依赖），默认一次预热 **3 个** cookie（`IL2API_CLEARANCE_POOL`），
-  `/healthz` 通常在 1 秒内就能看到 `has_cookie:true` 与三个槽位全部就绪；
-  每个 cookie 从获取起算、45 分钟主动更换一次（每次 tick 只换一个槽）；
+  无外部依赖），默认保持 **20 个** cookie 的清关环（`IL2API_CLEARANCE_POOL`）：
+  启动时只同步填**第 1 个**槽位（约 0.1–0.4 秒）就开始服务，其余槽位由**唯一的
+  一个后台 goroutine 顺序**补齐（每次间隔 1–2 秒 + 抖动，约 30–60 秒填满），
+  `/healthz` 的 `clearance.live/pool` 与每槽 `state` 可直接观察填充进度；
+  每个 cookie 从获取起算、45 分钟主动更换一次（循环一次只换一个槽）；
   请求在槽位间**按请求轮询**；某个请求被 429 挑战时只退役它用过的那一个槽位、
-  立即补上一个新 cookie 并重放一次，其它槽位继续服务。全部走标准库
+  **立即换下一个活槽位重放**（请求路径永不等待解题），补位由同一个后台循环完成。全部走标准库
   `crypto/tls` + `ForceAttemptHTTP2`，支持 HTTP CONNECT 代理（`HTTPS_PROXY`
   风格），清关与业务请求共用同一出口。
   （此前的 utls + ALPN `http/1.1` 方案已被证明是反的：强制 h1.1 恰恰会让
@@ -124,8 +126,8 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `IL2API_IDLE_TIMEOUT` | `60s` | 滑动空闲看门狗（每个上游事件都会重置） |
 | `IL2API_CONTEXT_CHARS` | `0` | 已废弃的空操作，仅为配置兼容保留；不再有输入长度守卫 |
 | `IL2API_CLEARANCE_REFRESH` | `45m` | 每个 `_vcrcs` 槽位的主动刷新年龄（cookie 实际有效期 60 分钟） |
-| `IL2API_CLEARANCE_COOLDOWN` | `15s` | 清关**失败**后的最小重试间隔，避免挑战风暴（成功求解不会开启窗口，429 重放与被退役槽位的补位不受阻） |
-| `IL2API_CLEARANCE_POOL` | `3` | 清关 cookie 轮换环大小；`1` 即回到单 cookie 行为 |
+| `IL2API_CLEARANCE_COOLDOWN` | `15s` | 单个槽位清关**失败**后的最小重试间隔，避免挑战风暴（成功求解不会开启窗口，429 重放不影响其它槽位） |
+| `IL2API_CLEARANCE_POOL` | `20` | 清关 cookie 轮换环大小；启动只同步填第 1 槽，其余由后台循环顺序补齐；`1` 即回到单 cookie 行为 |
 | `IL2API_SESSION_TIMEOUT` | `15s` | 单次 `/api/session` 请求超时 |
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` 的滑动空闲看门狗（每个 NDJSON 行都会重置） |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`，是否在启动时后台探测一次 `/api/search-lab/config`；`off` 时 `search.available` 恒为 `null` |
@@ -360,10 +362,11 @@ docker compose up -d --build      # 3000:3000，distroless nonroot (uid 65532)
 curl -s http://localhost:3000/healthz | jq
 # {"ok":true,"pool":{"size":2,"min":2,"max":8,"expired":0},
 #  "search":{"available":true},
-#  "clearance":{"has_cookie":true,"age_seconds":312,"refresh_count":7,
-#               "slots":[{"cookie":true,"age_seconds":312,"refresh_count":3},
-#                        {"cookie":true,"age_seconds":104,"refresh_count":2},
-#                        {"cookie":true,"age_seconds":9,"refresh_count":2}]},
+#  "clearance":{"live":20,"pool":20,"has_cookie":true,"age_seconds":312,
+#               "refresh_count":20,
+#               "slots":[{"cookie":true,"state":"live","age_seconds":312,"refresh_count":1},
+#                        {"cookie":true,"state":"live","age_seconds":104,"refresh_count":1},
+#                        {"cookie":false,"state":"pending","age_seconds":0,"refresh_count":0}]},
 #  "counters":{"requests":12,"streams":9,"errors":0,"upstream_errors":0,"tts":0,"stt":0}}
 ```
 

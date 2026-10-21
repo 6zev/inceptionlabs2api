@@ -1276,5 +1276,5 @@ Because the upstream challenge is keyed to the egress IP and UA, the gateway
 acquires its own clearance from whatever egress it actually uses; set
 `IL2API_PROXY` to route both clearance acquisition and traffic through the same
 proxy. If the edge still refuses (PoW version drift), `/healthz`' `clearance`
-block shows `has_cookie:false` and the last refresh count, and chat serves
-`503 upstream_unavailable` rather than looping.
+block shows `has_cookie:false`, `live:0` and the last refresh count, and chat
+serves `503 upstream_unavailable` rather than looping.
