@@ -15,7 +15,8 @@ OpenAI-compatible Chat Completions API.
 `POST /v1/chat/completions` (stream and non-stream),
 `POST /v1/web_search` (standalone retrieval, §2.3 / §7.1),
 `POST /v1/audio/speech` (TTS, §2.5.1 / §7.2),
-`POST /v1/audio/transcriptions` (STT, §2.5.2 / §7.3), `GET /v1/models`,
+`POST /v1/audio/transcriptions` (STT, §2.5.2 / §7.3),
+`POST /v1/decisions` (Mercury Decide, §2.6 / §7.4), `GET /v1/models`,
 `GET /healthz`, tool calling emulated over the prompt (§4.1), optional
 bearer-key auth, OpenAI-shaped errors, a 60 s sliding idle watchdog, and a
 disconnect-safe pool.
@@ -71,6 +72,7 @@ Explicitly **not** validated (dropped, coerced, or passed through):
 | `/v1/audio/speech` `input` length | **passed through**; no client-side cap | The playground truncates at 5 000 chars client-side; the upstream's own behaviour above that is undefined, so the gateway lets it answer. |
 | `/v1/audio/transcriptions` `language`, `prompt`, `temperature`, unknown fields | **dropped silently** | The upstream accepts only `file`. |
 | `/v1/audio/transcriptions` non-MPEG audio | **passed through unchanged**, part typed by sniffing | The upstream's contract is MP3-only; the gateway does not transcode (no ffmpeg, §2.5.2). |
+| `/v1/decisions` whole request (state, questions, images) | **forwarded as-is** in the web's array shape; the gateway re-validates nothing beyond structural JSON | The route runs its own validator and answers sentences that are already the right 4xx for the client; a second copy is how the two drift (§2.6). |
 
 What is **kept** because it is genuine gateway safety, not second-guessing
 upstream policy:
@@ -714,6 +716,69 @@ the only gateway-generated 4xx: empty/non-string `input`, missing multipart
 documented cap, method not allowed. An unknown `voice` is **not** one of
 them: it is forwarded (§2.5.1).
 
+## 2.6 Mercury Decide — `/api/decide/run`
+
+Probed 2026-10-21 (nine live probes, `docs/PROBE-decide.md`). Decide is a
+purpose-tuned classifier model, not Mercury 3 chat: one POST carries a `state`
+and a list of named questions, and the answer is one JSON object with typed
+probabilities. It does **not** stream.
+
+**The web shape is the array shape.** `questions` is an **array** of
+`{id, name, type, instructions, options}`; the playground bundle converts it
+to a map before sending, but the route rejects a map body with
+`400 {"error":"Add at least one question."}`. The official public API
+(`api.inceptionlabs.ai/v1/decisions`) uses a different map+`criteria` shape and
+a `mercury-decide` model field — the gateway rides the anonymous web transport
+and aligns to the web shape, per the project directive.
+
+Request:
+
+```json
+{"state": "string or [{type:'text',text},{type:'image_url',image_url:{url}}]",
+ "questions": [{"id":"q-1","name":"wants_refund","type":"noul",
+                "instructions":"Is the customer asking for money back?",
+                "options":[]}],
+ "images": ["data:image/png;base64,..."]}
+```
+
+`type` is `noul` (yes/no), `choice` (`options:[{id,name,description}]`), or
+`score` (`options:[{id,name:"",description}]`, ordered levels). Response:
+
+```json
+{"answers": {
+   "wants_refund": {"type":"noul","p":0.999},
+   "team": {"type":"choice","choice":"billing",
+            "probabilities":{"billing":0.99,"technical":0.01},
+            "confidence":0.99},
+   "urgency": {"type":"score","score":0.9858,
+               "levels":[{"label":"Can wait","p":0.064},{"label":"Today","p":0.886}],
+               "confidence":0.829}},
+ "inputTokens": 251, "latencyMs": 163}
+```
+
+* `answers[r].p` is the probability for `noul`; `confidence` exists on
+  `choice`/`score` only.
+* `score` is a **fractional index** into `levels`, not a level number.
+* `inputTokens`/`latencyMs` are top-level; there is no `model`, no `usage`,
+  and no output-token field.
+
+Errors are a **bare string** envelope, `{"error":"Add at least one
+question."}` (400 for validation, 401 for a rejected token). The route's
+sentences mirror the playground's client-side validator, so the gateway
+forwards rather than re-checking (§1.1).
+
+Images: `images` carries base64 data URLs. The web route only accepts its own
+seeded example images; any other image is answered
+`400 {"error":"Only the public example images are available right now."}`.
+That is the upstream's answer and the gateway passes it through.
+
+**Gateway contract.** Non-streaming, because the upstream is: one POST, one
+whole body, one 200. All plumbing goes through the v6 shared pieces
+(`Send`/`postAuthed`, `upstreamError`, `readJSONBody`, `methodNotAllowed`,
+`withCallTimeout`); this family adds a codec and a deadline, never a request
+path (§6.1). Images and the five scenario presets are not modelled: the
+client supplies them, exactly as the wire takes them.
+
 ## 3. Wire format — OpenAI Chat Completions
 
 ### 3.1 Request
@@ -1022,7 +1087,7 @@ never a request path.
 | Challenge retire + one replay | `Client.Send` | — |
 | Sliding idle watchdog (SSE / NDJSON) | `upstream.lines` (`reader.go`) — one scanner goroutine + one sliding timer, parameterised by the "is this a data line" predicate and the per-line parser | chat: `data:` framing; search: NDJSON framing |
 | Absolute run cap | `upstream.lines` caller passes a `hardCap` (search: 10 idle windows; chat: none) | search only |
-| Whole-call timeout (audio) | `upstream.withCallTimeout` | timeout |
+| Whole-call timeout (audio, decisions) | `upstream.withCallTimeout` | timeout |
 | Upstream → envelope mapping (non-stream) | `server.upstreamError` | — |
 | Upstream → SSE error frame | `server.streamError` (same switch, same codes) | — |
 | Text-shape rules (http URL, control chars, whitespace, rune truncation, rune length) | `upstream/text.go`: `isHTTPURL`, `hasControl`, `collapseSpace`, `truncateRunes` | search and citations share them |
@@ -1068,6 +1133,7 @@ helper to prove family behaviour is a sign the helper's seam is wrong.
 | `/v1/web_search` | POST | yes | §7.1 |
 | `/v1/audio/speech` | POST | yes | §7.2 |
 | `/v1/audio/transcriptions` | POST | yes | §7.3 |
+| `/v1/decisions` | POST | yes | §7.4 |
 | `/v1/models` | GET | yes | static list, `{object:"list",data:[{id,object:"model",created,owned_by:"inceptionlabs"}]}` — audio models are **not** listed (OpenAI does not list them either) |
 | `/healthz` | GET/HEAD | no | `{"ok":true,"pool":{"size","min","max"},"clearance":{"live","pool","has_cookie","age_seconds","refresh_count","slots":[{"cookie","state","age_seconds","refresh_count"}]},"search":{"available":bool|null},"counters":{...}}` |
 
@@ -1217,6 +1283,56 @@ accepting 2.5 MB (and taking ~31 s to do it), so the cap is documented as a
 memory/latency bound (§2.5.1), not as a translation of an upstream rule.
 Exceeding it is a `413` before any upstream call.
 
+### 7.4 `POST /v1/decisions`
+
+Mercury Decide (§2.6) in the upstream **web** shape, as-is: the gateway
+translates auth and the error envelope and nothing else.
+
+```
+request  = {"state": …, "questions": [...], "images": [...]}   // web shape
+response = 200, the upstream body verbatim                      // answers/inputTokens/latencyMs
+```
+
+| Field | Behaviour |
+|---|---|
+| `state` | required, passed through (string or chat-style parts array). An absent/empty state is the upstream's own 400 through the envelope; the gateway's structural check only requires a JSON object body. |
+| `questions` | required, passed through as the array the web route takes. The gateway does **not** convert to the public API's map, does not rename `options`, and does not re-run the validator. |
+| `images` | passed through unchanged (data URLs). The web route accepts only its seeded examples; that rejection is the upstream's answer. |
+| other keys | **dropped silently** (unknown-key rule, §1.1) |
+
+The upstream response is relayed verbatim: the gateway does not rename
+`p`→`noul`, does not compute anything, and does not add a `model` field. It
+sets `Cache-Control: no-store` (the answer derives from the caller's input)
+and `Content-Type: application/json`.
+
+Bound: the route is non-streaming and whole-body, so it uses the audio
+family's whole-call deadline (`upstream.withCallTimeout`, `IL2API_DECISIONS_TIMEOUT`,
+default 120 s) rather than the line watchdog; a slow Decide run is bounded by
+the same mechanism as TTS. Body cap is the shared 6 MiB JSON reader; it is far
+above the upstream's advertised 1 MiB `maxRequestBytes`, so it is a memory
+bound, not a translation.
+
+Error mapping (the shared mapper, §6.1):
+
+| Condition | HTTP | code |
+|---|---|---|
+| malformed JSON / trailing data / non-object body | 400 | `invalid_request_error` |
+| body over the 6 MiB cap | 413 | `request_too_large` |
+| method not allowed | 405 | `method_not_allowed` (`Allow: POST`) |
+| upstream 4xx (e.g. empty questions, oversized state, non-example image) | 502 | `upstream_error` (upstream's sentence preserved) |
+| upstream 401 after the token retries | 502 | `upstream_auth_failed` |
+| pool empty / clearance failure | 503 | `upstream_unavailable` / `upstream_clearance_failed` |
+| upstream 200 with an unparseable body | 502 | `upstream_error` |
+| whole-call deadline | 504 | `upstream_idle_timeout` |
+
+Upstream 4xx → 502 is the project-wide rule (SPEC §3.4): the gateway is the
+caller's upstream, and the upstream's own 4xx is *its* client error, not the
+gateway's. The upstream message rides unchanged so the client sees
+"Add at least one question." rather than a status number.
+
+`/healthz` gains `counters.decisions`, incremented once per admitted request
+(method-checked, before the body is read), like `tts`/`stt`.
+
 `/healthz` gains `search.available`: `true` / `false` from the last
 `/api/search-lab/config` probe, `null` before the first one completes or when
 probing is disabled. The probe runs once at startup in a background goroutine
@@ -1259,6 +1375,7 @@ rides a custom header). CORS runs outside auth so preflights are answerable.
 | `IL2API_SEARCH_PROBE_TIMEOUT` | `15s` | bound on the one startup config probe |
 | `IL2API_AUDIO_TIMEOUT` | `120s` | whole-call timeout for `/api/tts` and `/api/stt` (headers and body; TTS took ~1 s live, the window is generous for long inputs) |
 | `IL2API_AUDIO_MAX_BYTES` | `26214400` (25 MiB) | gateway upload cap for `/v1/audio/transcriptions` (memory/latency bound, §2.5.1); larger bodies are a 413 without an upstream call |
+| `IL2API_DECISIONS_TIMEOUT` | `120s` | whole-call timeout for `/api/decide/run` (headers and body); a Decide run answered in ~0.2 s live, the window is generous |
 
 Invalid values are startup errors with an actionable message.
 
