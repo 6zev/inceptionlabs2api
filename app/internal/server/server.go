@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,14 @@ type Chatter interface {
 	Chat(ctx context.Context, req *upstream.ChatRequest, idle time.Duration, onMalformed func(string)) (*upstream.Stream, error)
 }
 
+// Searcher is the standalone retrieval abstraction. SearchConfig is called at
+// most once per process to expose search.available on /healthz; its failure
+// is diagnostic only and never disables the endpoint.
+type Searcher interface {
+	Search(ctx context.Context, req *upstream.SearchRequest, idle time.Duration) (*upstream.SearchResult, error)
+	SearchConfig(ctx context.Context) (*upstream.SearchConfigResponse, error)
+}
+
 // PoolStats reports pool size for /healthz.
 type PoolStats interface {
 	Stats() pool.Stats
@@ -42,6 +51,12 @@ type Config struct {
 	Models       []string
 	ContextChars int
 	IdleTimeout  time.Duration
+	// SearchTimeout bounds /v1/web_search's sliding idle watchdog. Zero means
+	// IdleTimeout.
+	SearchTimeout time.Duration
+	// SearchProbeTimeout bounds the one startup /api/search-lab/config probe.
+	// Zero means 15s.
+	SearchProbeTimeout time.Duration
 	// Logf is optional; nil means log.Printf.
 	Logf func(format string, args ...any)
 }
@@ -58,9 +73,16 @@ type Counters struct {
 type Server struct {
 	cfg  Config
 	up   Chatter
+	se   Searcher
 	pool PoolStats
 	now  func() time.Time
 	logf func(format string, args ...any)
+
+	searchMu sync.Mutex
+	// searchAvailable is nil until the config probe succeeds; false is a
+	// definitive "the deployment disabled retrieval".
+	searchAvailable *bool
+	probeOnce       sync.Once
 
 	requests atomic.Uint64
 	streams  atomic.Uint64
@@ -76,6 +98,12 @@ func New(cfg Config, up Chatter, p PoolStats) *Server {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 60 * time.Second
 	}
+	if cfg.SearchTimeout <= 0 {
+		cfg.SearchTimeout = cfg.IdleTimeout
+	}
+	if cfg.SearchProbeTimeout <= 0 {
+		cfg.SearchProbeTimeout = 15 * time.Second
+	}
 	logf := cfg.Logf
 	if logf == nil {
 		logf = log.Printf
@@ -86,10 +114,66 @@ func New(cfg Config, up Chatter, p PoolStats) *Server {
 // SetClock replaces the clock; tests use it for deterministic created fields.
 func (s *Server) SetClock(now func() time.Time) { s.now = now }
 
+// SetSearcher attaches the standalone retrieval backend. Without one the
+// route answers 503 rather than panicking.
+func (s *Server) SetSearcher(se Searcher) { s.se = se }
+
+// StartSearchProbe launches the one-shot /api/search-lab/config probe in the
+// background. It is a no-op when no searcher is attached, and repeated calls
+// probe only once.
+func (s *Server) StartSearchProbe() {
+	s.probeOnce.Do(func() {
+		if s.se == nil {
+			return
+		}
+		go s.probeSearch(context.Background())
+	})
+}
+
+// probeSearch records the deployment's retrieval capability. A failed probe
+// leaves the value unknown (null) — it never disables the endpoint, because
+// the config route can be challenged independently of the run route.
+func (s *Server) probeSearch(ctx context.Context) {
+	if s.se == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.SearchProbeTimeout)
+	defer cancel()
+	cfg, err := s.se.SearchConfig(ctx)
+	if err != nil {
+		s.logf("search: config probe failed (search stays enabled, availability unknown): %v", err)
+		return
+	}
+	available := cfg.RetrievalAvailable
+	s.searchMu.Lock()
+	s.searchAvailable = &available
+	s.searchMu.Unlock()
+	s.logf("search: retrievalAvailable=%v", available)
+}
+
+// searchDisabled reports a definitive retrievalAvailable:false.
+func (s *Server) searchDisabled() bool {
+	s.searchMu.Lock()
+	defer s.searchMu.Unlock()
+	return s.searchAvailable != nil && !*s.searchAvailable
+}
+
+// SearchAvailable returns the cached probe result, nil when unknown.
+func (s *Server) SearchAvailable() *bool {
+	s.searchMu.Lock()
+	defer s.searchMu.Unlock()
+	if s.searchAvailable == nil {
+		return nil
+	}
+	v := *s.searchAvailable
+	return &v
+}
+
 // Handler returns the routed http.Handler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", s.chatCompletions)
+	mux.HandleFunc("/v1/web_search", s.webSearch)
 	mux.HandleFunc("/v1/models", s.models)
 	mux.HandleFunc("/healthz", s.healthz)
 	return cors(s.authenticate(mux))
@@ -230,6 +314,7 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 			Errors:   s.errors.Load(),
 			Upstream: s.upErrors.Load(),
 		},
+		"search": map[string]any{"available": s.SearchAvailable()},
 	}
 	if s.pool != nil {
 		body["pool"] = s.pool.Stats()

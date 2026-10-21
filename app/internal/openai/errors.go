@@ -22,6 +22,7 @@ const (
 	CodeUpstreamStream      = "upstream_stream_error"
 	CodeUpstreamAuth        = "upstream_auth_failed"
 	CodeRequestTooLarge     = "request_too_large"
+	CodeSearchUnavailable   = "search_unavailable"
 )
 
 // RequestError is a client-facing error with its HTTP status.

@@ -94,6 +94,54 @@ func newTestServer(up Chatter) *Server {
 	return s
 }
 
+// fakeSearcher scripts upstream search runs per call.
+type fakeSearcher struct {
+	mu    sync.Mutex
+	calls int
+	reqs  []*upstream.SearchRequest
+	fn    func(call int) (*upstream.SearchResult, error)
+	cfg   *upstream.SearchConfigResponse
+	cfgFn func(ctx context.Context) (*upstream.SearchConfigResponse, error)
+}
+
+func (f *fakeSearcher) Search(ctx context.Context, req *upstream.SearchRequest, idle time.Duration) (*upstream.SearchResult, error) {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	f.reqs = append(f.reqs, req)
+	fn := f.fn
+	f.mu.Unlock()
+	if fn == nil {
+		return &upstream.SearchResult{}, nil
+	}
+	return fn(call)
+}
+
+func (f *fakeSearcher) SearchConfig(ctx context.Context) (*upstream.SearchConfigResponse, error) {
+	if f.cfgFn != nil {
+		return f.cfgFn(ctx)
+	}
+	if f.cfg == nil {
+		return &upstream.SearchConfigResponse{RetrievalAvailable: true}, nil
+	}
+	return f.cfg, nil
+}
+
+func (f *fakeSearcher) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeSearcher) lastRequest() *upstream.SearchRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.reqs) == 0 {
+		return nil
+	}
+	return f.reqs[len(f.reqs)-1]
+}
+
 func postChat(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
