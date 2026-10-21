@@ -194,7 +194,7 @@ func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*Searc
 						break
 					}
 					q = strings.TrimSpace(q)
-					if q == "" || len(q) > maxQueryRunes || seenQuery[q] {
+					if q == "" || len([]rune(q)) > maxQueryRunes || seenQuery[q] {
 						continue
 					}
 					seenQuery[q] = true
@@ -234,7 +234,7 @@ func normalizeSources(in []SearchSource) []SearchSource {
 			break
 		}
 		url := strings.TrimSpace(s.URL)
-		if !isHTTPURL(url) || len(url) > maxURLRunes || hasControl(url) {
+		if !isHTTPURL(url) || len([]rune(url)) > maxURLRunes || hasControl(url) {
 			continue
 		}
 		out = append(out, SearchSource{

@@ -466,6 +466,41 @@ func TestSearchSanitizesHostileSources(t *testing.T) {
 	}
 }
 
+// The documented bounds are rune counts (SPEC §2.3.2) and the citation
+// collector already uses runes. A multi-byte query or title must not be cut
+// short just because UTF-8 spends more than one byte per rune.
+func TestSearchBoundsCountRunesNotBytes(t *testing.T) {
+	t.Parallel()
+	// 1 500 CJK runes = 4 500 bytes: under the 2 000-rune query bound, over a
+	// byte-count bound.
+	longQuery := strings.Repeat("四", 1500)
+	// A URL of 3 000 ASCII chars plus a host is under 4 096 runes but would
+	// exceed a byte comparison only if the byte count differs; use CJK in the
+	// path to make the distinction observable.
+	longURL := "https://ok.example/" + strings.Repeat("路", 1000)
+	longTitle := strings.Repeat("标", maxTitleRunes+10)
+	m := startUpstream(t)
+	m.searchHandler = func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"t":"queries","queries":["`+longQuery+`"]}`+"\n")
+		io.WriteString(w, `{"t":"docs","sources":[{"title":"`+longTitle+`","url":"`+longURL+`"}]}`+"\n")
+	}
+	c, _ := newTestClient(t, m, 1)
+	res, err := c.Search(context.Background(), &SearchRequest{Query: "q"}, time.Second)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res.Queries) != 1 || len([]rune(res.Queries[0])) != 1500 {
+		t.Fatalf("queries = %d entries, first %d runes; want the 1 500-rune query kept",
+			len(res.Queries), len([]rune(strings.Join(res.Queries, ""))))
+	}
+	if len(res.Sources) != 1 {
+		t.Fatalf("sources = %+v, want the CJK-path URL kept", res.Sources)
+	}
+	if got := len([]rune(res.Sources[0].Title)); got != maxTitleRunes {
+		t.Fatalf("title = %d runes, want %d", got, maxTitleRunes)
+	}
+}
+
 func TestSearchCapsSourceCount(t *testing.T) {
 	t.Parallel()
 	parts := make([]string, 0, maxCollectedSources+20)
