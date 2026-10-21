@@ -36,9 +36,9 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
   `context_length_exceeded`，绝不静默截断。
 - **滑动空闲看门狗**：上游 60 秒没有任何事件才判超时（每行事件都会重置），
   不是按总耗时砍断长回答；流中断后必定补发 error 帧 + `[DONE]`，绝不裸关闭。
-- **可选 API Key**：`IL2API_API_KEY` 为空即开放访问。
+- **可选 API Key**：`IL2API_API_KEY` 为空即开放访问；`OPTIONS` 预检与 CORS 头已处理。
 
-范围之外（刻意不做）：usage/token 统计、工具调用、Web 搜索、管理面板、CORS 浏览器直连。
+范围之外（刻意不做）：usage/token 统计、工具调用、Web 搜索、管理面板。
 设计细节见 [docs/SPEC.md](docs/SPEC.md)。
 
 ## 快速开始
