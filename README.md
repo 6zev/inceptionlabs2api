@@ -20,9 +20,10 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
 - **匿名会话池**：min 2 / max 8，TTL 30 分钟到期销毁重建，401/403 丢弃换新并最多重试 2 次。
   客户端断连、超时、上游 5xx 都**不会**污染 token。
 - **标准库 HTTP/2 + `_vcrcs` 通关**：上游的 Vercel 安全网关要求「清除凭证
-  cookie + 求解时同一个 Chrome UA + HTTP/2」三者同时成立。网关在首次请求时
-  本地求解 v2 工作量证明（3 轮 SHA-256 前缀链，约 0.1 秒 CPU，无外部依赖），
-  拿到 1 小时有效的 `_vcrcs` cookie，并在 45 分钟时主动更换；请求被 429 挑战
+  cookie + 求解时同一个 Chrome UA + HTTP/2」三者同时成立。网关在**启动时**即
+  后台本地求解 v2 工作量证明（3 轮 SHA-256 前缀链，约 0.1 秒 CPU，无外部依赖），
+  拿到 1 小时有效的 `_vcrcs` cookie，`/healthz` 通常在 1 秒内就能看到
+  `has_cookie:true`；此后从启动起算、每 45 分钟主动更换一次；请求被 429 挑战
   时立即重解一次并重放。全部走标准库 `crypto/tls` + `ForceAttemptHTTP2`，
   支持 HTTP CONNECT 代理（`HTTPS_PROXY` 风格），清关与业务请求共用同一出口。
   （此前的 utls + ALPN `http/1.1` 方案已被证明是反的：强制 h1.1 恰恰会让
@@ -57,9 +58,14 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
   （`/api/search-lab/run` 的 NDJSON 流），返回重写后的查询与实际命中的来源，
   响应结构与 [simple-chat](https://github.com/Sliverkiss/simple-chat) 完全一致；
   `/healthz` 用 `search.available` 报告上游是否开放检索。
+- **联网引用注解**：聊天默认开启上游联网搜索，`source-url` 事件会转成 OpenAI
+  `url_citation` 注解——流式随 `finish_reason:"stop"` 帧的 `delta.annotations`
+  下发，非流式放在 `message.annotations`；正文里的 `[13]` 不再是没有出处的孤儿标记。
+  `index` 按来源到达顺序 1..N（上游不提供索引字段），`start_index`/`end_index`
+  在没有偏移信息时按约定为 0；`__searching__` 静默忽略，`__search_error__` 只记日志、
+  不中断回答。
 
-范围之外（刻意不做）：usage/token 统计、工具调用、聊天内联搜索
-（`webSearchEnabled` 固定关闭，`source-url` 一律忽略）、搜索答案正文（只桥接来源）、
+范围之外（刻意不做）：usage/token 统计、工具调用、搜索答案正文（只桥接来源）、
 管理面板。设计细节见 [docs/SPEC.md](docs/SPEC.md)。
 
 ## 快速开始
@@ -155,7 +161,7 @@ data: {"id":"chatcmpl-9f2c1a7d3b40",...,"choices":[{"index":0,"delta":{"reasonin
 
 data: {"id":"chatcmpl-9f2c1a7d3b40",...,"choices":[{"index":0,"delta":{"content":"扩散模型"},"finish_reason":null,"logprobs":null}]}
 
-data: {"id":"chatcmpl-9f2c1a7d3b40",...,"choices":[{"index":0,"delta":{},"finish_reason":"stop","logprobs":null}]}
+data: {"id":"chatcmpl-9f2c1a7d3b40",...,"choices":[{"index":0,"delta":{"annotations":[{"type":"url_citation","index":1,"url":"https://…","title":"…","start_index":0,"end_index":0}]},"finish_reason":"stop","logprobs":null}]}
 
 data: [DONE]
 ```
@@ -170,7 +176,9 @@ data: [DONE]
   "model": "mercury-3",
   "choices": [{
     "index": 0,
-    "message": {"role": "assistant", "content": "……", "reasoning_content": "……"},
+    "message": {"role": "assistant", "content": "……", "reasoning_content": "……",
+                "annotations": [{"type": "url_citation", "index": 1, "url": "https://…",
+                                 "title": "…", "start_index": 0, "end_index": 0}]},
     "finish_reason": "stop",
     "logprobs": null
   }]
