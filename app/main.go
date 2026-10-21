@@ -65,7 +65,6 @@ func run() error {
 		APIKey:             cfg.APIKey,
 		Model:              cfg.Model,
 		Models:             cfg.Models,
-		ContextChars:       cfg.ContextChars,
 		IdleTimeout:        cfg.IdleTimeout,
 		SearchTimeout:      cfg.SearchTimeout,
 		SearchProbeTimeout: cfg.SearchProbeTimeout,

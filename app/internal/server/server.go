@@ -52,13 +52,10 @@ type ClearanceStats interface {
 
 // Config configures the HTTP surface.
 type Config struct {
-	APIKey string
-	Model  string
-	Models []string
-	// ContextChars is accepted for compatibility and unused: there is no
-	// client-side length guard (upstreams truncate at their own limit).
-	ContextChars int
-	IdleTimeout  time.Duration
+	APIKey      string
+	Model       string
+	Models      []string
+	IdleTimeout time.Duration
 	// SearchTimeout bounds /v1/web_search's sliding idle watchdog. Zero means
 	// IdleTimeout.
 	SearchTimeout time.Duration

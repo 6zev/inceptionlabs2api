@@ -238,10 +238,9 @@ func newStack(t *testing.T, idle time.Duration) *stack {
 	c.BindPool(p)
 
 	gs := server.New(server.Config{
-		Model:        "mercury-3",
-		ContextChars: 250_000,
-		IdleTimeout:  idle,
-		Logf:         func(string, ...any) {},
+		Model:       "mercury-3",
+		IdleTimeout: idle,
+		Logf:        func(string, ...any) {},
 	}, c, p)
 	gs.SetSearcher(c)
 	gs.SetSpeech(c)
