@@ -19,7 +19,8 @@ input guard, a 60 s sliding idle watchdog, and a disconnect-safe pool.
 **Out of scope, deliberately:** usage/token accounting (upstream publishes
 none; the field is omitted rather than fabricated), tool calling (no prompt
 injection, no XML reassembler, no tool_choice), web search (`source-url`
-events are ignored), admin UI, persistence, and browser CORS.
+events are ignored), admin UI, and persistence. CORS preflight is answered so
+browser clients can call the keyed API.
 
 The project must remain a single static binary with one non-test external
 dependency (`utls`).
