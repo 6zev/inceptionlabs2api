@@ -225,8 +225,18 @@ func (c *Client) post(ctx context.Context, token string, body []byte, headerTime
 	// diffusion generations. The sliding idle watchdog lives in Reader.
 	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/chat", bytes.NewReader(body))
+	// ResponseHeaderTimeout only starts once the connection is up (Go ignores
+	// TLSHandshakeTimeout when DialTLSContext is set), so dial, CONNECT and
+	// the TLS handshake would otherwise be unbounded. Cancel the whole
+	// pre-response phase from a timer; on success the timer is stopped and
+	// the context stays alive for the body.
+	hctx, cancelHeader := context.WithCancel(ctx)
+	timer := time.AfterFunc(headerTimeout, cancelHeader)
+	defer timer.Stop()
+
+	req, err := http.NewRequestWithContext(hctx, http.MethodPost, c.base+"/api/chat", bytes.NewReader(body))
 	if err != nil {
+		cancelHeader()
 		tr.CloseIdleConnections()
 		return nil, fmt.Errorf("upstream: build chat request: %w", err)
 	}
@@ -237,11 +247,21 @@ func (c *Client) post(ctx context.Context, token string, body []byte, headerTime
 
 	resp, err := hc.Do(req)
 	if err != nil {
+		timedOut := hctx.Err() != nil && ctx.Err() == nil
+		cancelHeader()
 		tr.CloseIdleConnections()
+		if timedOut {
+			return nil, fmt.Errorf("%w: no response headers within %s", ErrIdleTimeout, headerTimeout)
+		}
 		return nil, fmt.Errorf("upstream: chat request: %w", err)
 	}
-	// Release the per-request transport when the body is closed.
-	resp.Body = &closeHook{ReadCloser: resp.Body, hook: tr.CloseIdleConnections}
+	timer.Stop()
+	// Release the per-request transport (and the header context) when the
+	// body is closed.
+	resp.Body = &closeHook{ReadCloser: resp.Body, hook: func() {
+		cancelHeader()
+		tr.CloseIdleConnections()
+	}}
 	return resp, nil
 }
 

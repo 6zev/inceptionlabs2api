@@ -19,10 +19,11 @@ import (
 	"inceptionlabs2api/internal/upstream"
 )
 
-// maxBodyBytes caps request bodies before JSON decoding. The context guard
-// limits inputs to 250k characters (~1 MB of JSON even with heavy escaping),
-// so 2 MiB leaves ample headroom while bounding per-request memory.
-const maxBodyBytes = 2 << 20
+// maxBodyBytes caps request bodies before JSON decoding. The 250k-character
+// guard is the real limit; this is a generous backstop. It is sized for
+// 250k astral-plane characters serialised as \u escapes (12 bytes each,
+// ~3 MB) so compliant input gets the guard's 400, not a 413.
+const maxBodyBytes = 6 << 20
 
 // Chatter is the upstream abstraction the handlers depend on.
 type Chatter interface {

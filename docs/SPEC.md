@@ -263,6 +263,13 @@ Token = `{unix_ts}.{32 hex}.{64 hex}`; shape is validated at acquisition.
   answers. Instead the stream reader owns a **sliding 60 s idle timer**,
   reset on every upstream line (including blank separator lines). Expiry
   cancels the request and returns `upstream_idle_timeout`.
+- The same idle window bounds the whole **pre-response phase** (TCP connect,
+  CONNECT tunnel, TLS handshake, and response headers). Go's
+  `ResponseHeaderTimeout` alone would leave the dial/handshake unbounded,
+  because it is ignored when `DialTLSContext` is set.
+- Upstream redirects are refused when they leave the configured host or
+  downgrade HTTPS, because `x-session-token` is a custom header that Go would
+  otherwise copy to the redirect target.
 - `[DONE]` → `io.EOF`. A clean EOF before `[DONE]` → `upstream_stream_error`
   (never silently successful).
 - A single malformed JSON line or unknown event type is skipped, not fatal.

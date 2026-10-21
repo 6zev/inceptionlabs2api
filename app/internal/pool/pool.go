@@ -160,7 +160,7 @@ func (p *Pool) Get(ctx context.Context) (string, error) {
 	if tok, ok := p.pick(); ok {
 		return tok, nil
 	}
-	if err := p.grow(ctx); err != nil {
+	if err := p.ensure(ctx); err != nil {
 		return "", fmt.Errorf("%w: %w", ErrNoToken, err)
 	}
 	if tok, ok := p.pick(); ok {
@@ -206,6 +206,38 @@ func (p *Pool) pick() (string, bool) {
 	t := p.tokens[0]
 	p.tokens = append(p.tokens[1:], t)
 	return t.Value, true
+}
+
+// ensure fills the pool to Min, and always fetches at least one token when it
+// is empty. That keeps Min=0 a valid lazy mode instead of a permanently empty
+// pool that answers every request with 503.
+func (p *Pool) ensure(ctx context.Context) error {
+	p.fetchMu.Lock()
+	defer p.fetchMu.Unlock()
+
+	for {
+		p.mu.Lock()
+		p.dropExpiredLocked()
+		need := p.cfg.Min - len(p.tokens)
+		if len(p.tokens) == 0 && need < 1 {
+			need = 1
+		}
+		full := len(p.tokens) >= p.cfg.Max
+		p.mu.Unlock()
+		if need <= 0 || full {
+			return nil
+		}
+		tok, err := p.fetch(ctx)
+		if err != nil {
+			return err
+		}
+		created := p.cfg.Now()
+		p.mu.Lock()
+		if len(p.tokens) < p.cfg.Max {
+			p.tokens = append(p.tokens, Token{Value: tok, Created: created})
+		}
+		p.mu.Unlock()
+	}
 }
 
 // grow fetches tokens until Min is reached or Max is hit.

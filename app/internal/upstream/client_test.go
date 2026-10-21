@@ -500,3 +500,62 @@ func TestChatDoesNotFollowCrossHostRedirect(t *testing.T) {
 		t.Fatal("session token leaked to the redirect target")
 	}
 }
+
+// TestChatHeaderPhaseCoversDial blocks TLS handshakes entirely (the listener
+// accepts TCP but never responds) to prove the pre-header phase is bounded
+// even though ResponseHeaderTimeout alone only covers an established conn.
+func TestChatHeaderPhaseCoversDial(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer silent.Close()
+	var held []net.Conn
+	var mu sync.Mutex
+	go func() {
+		for {
+			c, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	defer func() {
+		mu.Lock()
+		for _, c := range held {
+			c.Close()
+		}
+		mu.Unlock()
+	}()
+
+	// Chat's header bound covers the whole pre-response phase, including the
+	// TCP connect and TLS handshake that ResponseHeaderTimeout ignores.
+	c, p := newTestClient(t, m, 1)
+	// Warm the pool against the working mock before pointing the client at
+	// the silent listener (the pool fetcher uses the same base URL).
+	if _, err := p.Get(context.Background()); err != nil {
+		t.Fatalf("warm pool: %v", err)
+	}
+	c.base = "https://" + silent.Addr().String()
+	start := time.Now()
+	_, err = c.post(context.Background(), writeSessionTokenValue(1), []byte(`{}`), 200*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected a pre-header timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("post hung for %s on a silent TLS peer", elapsed)
+	}
+	start = time.Now()
+	_, err = c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), 200*time.Millisecond, nil)
+	if err == nil {
+		t.Fatal("expected a pre-header timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Chat hung for %s on a silent TLS peer", elapsed)
+	}
+}

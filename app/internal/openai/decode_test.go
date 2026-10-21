@@ -274,3 +274,31 @@ func TestRequestErrorMessage(t *testing.T) {
 		t.Fatalf("Error() = %q", got)
 	}
 }
+
+func TestPrettyPrintedEmptyToolCallsAccepted(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{`[]`, `[ ]`, "[\n  ]", `null`, `{}`, `{ }`} {
+		msgs := []Message{{Role: "assistant", Content: "done", ToolCalls: json.RawMessage(raw)}}
+		if _, _, re := NormalizeMessages(msgs, 0); re != nil {
+			t.Errorf("tool_calls %q rejected: %+v", raw, re)
+		}
+	}
+	for _, raw := range []string{`[{"id":"call_1"}]`, `{"name":"f"}`} {
+		msgs := []Message{{Role: "assistant", Content: "done", ToolCalls: json.RawMessage(raw)}}
+		if _, _, re := NormalizeMessages(msgs, 0); re == nil || re.Code != CodeToolUnsupported {
+			t.Errorf("tool_calls %q: err = %+v, want tool_calling_unsupported", raw, re)
+		}
+	}
+}
+
+func TestPerMessageFunctionCallRejected(t *testing.T) {
+	t.Parallel()
+	msgs := []Message{{Role: "assistant", Content: "x", FunctionCall: json.RawMessage(`{"name":"f","arguments":"{}"}`)}}
+	if _, _, re := NormalizeMessages(msgs, 0); re == nil || re.Code != CodeToolUnsupported {
+		t.Fatalf("err = %+v, want function_call rejection", re)
+	}
+	msgs = []Message{{Role: "assistant", Content: "x", FunctionCall: json.RawMessage(`null`)}}
+	if _, _, re := NormalizeMessages(msgs, 0); re != nil {
+		t.Fatalf("null function_call rejected: %+v", re)
+	}
+}

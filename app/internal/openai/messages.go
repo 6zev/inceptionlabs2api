@@ -3,7 +3,6 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 	"unicode/utf8"
 )
 
@@ -28,6 +27,9 @@ func NormalizeMessages(msgs []Message, maxChars int) ([]TextMessage, int, *Reque
 	for i, m := range msgs {
 		if hasToolCalls(m.ToolCalls) {
 			return nil, 0, toolUnsupported(fmt.Sprintf("messages[%d].tool_calls", i), "tool_calls")
+		}
+		if hasToolCalls(m.FunctionCall) {
+			return nil, 0, toolUnsupported(fmt.Sprintf("messages[%d].function_call", i), "function_call")
 		}
 		if m.Role == "tool" || m.Role == "function" {
 			return nil, 0, toolUnsupported(fmt.Sprintf("messages[%d].role", i), fmt.Sprintf("role %q", m.Role))
@@ -84,16 +86,28 @@ func NormalizeMessages(msgs []Message, maxChars int) ([]TextMessage, int, *Reque
 	return out, total, nil
 }
 
-// hasToolCalls reports whether a raw tool_calls value carries anything. Null,
-// empty arrays and empty objects are treated as absent: many clients send
-// "tool_calls": [] on ordinary assistant history.
+// hasToolCalls reports whether a raw tool_calls/function_call value carries
+// anything. Null, empty arrays and empty objects are treated as absent: many
+// clients serialise "tool_calls": [] (sometimes pretty-printed) on ordinary
+// assistant history.
 func hasToolCalls(raw json.RawMessage) bool {
-	trimmed := strings.TrimSpace(string(raw))
-	switch trimmed {
-	case "", "null", "[]", "{}":
+	if len(raw) == 0 {
 		return false
 	}
-	return true
+	var probe any
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return true
+	}
+	switch v := probe.(type) {
+	case nil:
+		return false
+	case []any:
+		return len(v) > 0
+	case map[string]any:
+		return len(v) > 0
+	default:
+		return true
+	}
 }
 
 // normalizeRole maps OpenAI roles onto the three roles the upstream accepts.

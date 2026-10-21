@@ -42,17 +42,15 @@ func NewReader(body io.Reader, idle time.Duration, onMalformed func(string)) *Re
 // cancelled, or the stream ends.
 //
 // The idle watchdog is sliding: every line read, including blank separators,
-// resets it. The watchdog cancels the reads by setting a read deadline on the
-// body when it supports one; otherwise Read falls back to a goroutine-based
-// timeout.
+// resets it. The scan runs in a helper goroutine so Read can abandon a stalled
+// body; that goroutine exits when the caller closes the body.
 func (r *Reader) Read(ctx context.Context, onEvent func(Event) error) error {
 	if r.idle <= 0 {
 		r.idle = 60 * time.Second
 	}
 
-	// Cancel the in-flight read when the watchdog fires. deadlineSetter is
-	// implemented by net.Conn-backed bodies; *http.body does not expose it,
-	// so the cancel path below is the general mechanism.
+	// The watchdog returns from Read; the scanner goroutine is released via
+	// done, and the caller's deferred body Close unblocks any pending read.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 

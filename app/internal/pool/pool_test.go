@@ -323,3 +323,25 @@ func TestCloseIsIdempotent(t *testing.T) {
 	p.Close()
 	p.Close()
 }
+
+func TestMinZeroServesOnDemand(t *testing.T) {
+	t.Parallel()
+	clock := newClock()
+	fc := &fakeCounter{}
+	p := New(Config{Min: 0, Max: 4, TTL: time.Hour, Interval: time.Hour, Now: clock.Now}, fc.Fetch)
+	defer p.Close()
+
+	if st := p.Stats(); st.Size != 0 {
+		t.Fatalf("fresh lazy pool size = %d, want 0", st.Size)
+	}
+	tok, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get on a Min=0 pool: %v", err)
+	}
+	if tok == "" || fc.Count() != 1 {
+		t.Fatalf("tok = %q fetches = %d, want one on-demand token", tok, fc.Count())
+	}
+	if st := p.Stats(); st.Size != 1 {
+		t.Fatalf("size = %d, want 1", st.Size)
+	}
+}

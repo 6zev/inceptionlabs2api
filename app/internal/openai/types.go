@@ -17,11 +17,12 @@ type ChatRequest struct {
 // of content parts; it is kept raw so the decoder can reject media parts with
 // a precise error.
 type Message struct {
-	Role       string          `json:"role"`
-	Content    any             `json:"content"`
-	Name       string          `json:"name"`
-	ToolCalls  json.RawMessage `json:"tool_calls"`
-	ToolCallID string          `json:"tool_call_id"`
+	Role         string          `json:"role"`
+	Content      any             `json:"content"`
+	Name         string          `json:"name"`
+	ToolCalls    json.RawMessage `json:"tool_calls"`
+	FunctionCall json.RawMessage `json:"function_call"`
+	ToolCallID   string          `json:"tool_call_id"`
 }
 
 // ContentPart is a single entry of a multi-part message content array.
