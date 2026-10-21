@@ -1,0 +1,22 @@
+# local build output
+/app/app
+/app/inceptionlabs2api
+/inceptionlabs2api
+
+# env files
+.env
+app/.env
+
+# logs and coverage
+*.log
+*.out
+coverage.*
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Go workspace files
+go.work
+go.work.sum

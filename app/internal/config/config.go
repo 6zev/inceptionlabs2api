@@ -1,0 +1,190 @@
+// Package config parses the gateway's environment-only configuration.
+package config
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Config is the complete runtime configuration. It is built once at startup
+// and is immutable afterwards.
+type Config struct {
+	Addr           string
+	APIKey         string
+	UpstreamBase   string
+	Models         []string
+	Model          string
+	Proxy          string
+	PoolMin        int
+	PoolMax        int
+	PoolTTL        time.Duration
+	IdleTimeout    time.Duration
+	ContextChars   int
+	SessionTimeout time.Duration
+}
+
+// Defaults returns the configuration used when no environment variable is set.
+func Defaults() Config {
+	return Config{
+		Addr:           ":3000",
+		UpstreamBase:   "https://chat.inceptionlabs.ai",
+		Model:          "mercury-3",
+		PoolMin:        2,
+		PoolMax:        8,
+		PoolTTL:        30 * time.Minute,
+		IdleTimeout:    60 * time.Second,
+		ContextChars:   250_000,
+		SessionTimeout: 15 * time.Second,
+	}
+}
+
+// Load reads IL2API_* variables from the process environment.
+func Load() (Config, error) { return FromEnv(os.Getenv) }
+
+// FromEnv parses configuration using getenv, which makes it testable without
+// touching the process environment.
+func FromEnv(getenv func(string) string) (Config, error) {
+	c := Defaults()
+
+	setString := func(key string, dst *string) {
+		if v := strings.TrimSpace(getenv(key)); v != "" {
+			*dst = v
+		}
+	}
+	setString("IL2API_ADDR", &c.Addr)
+	setString("IL2API_API_KEY", &c.APIKey)
+	setString("IL2API_UPSTREAM_BASE", &c.UpstreamBase)
+	setString("IL2API_MODEL", &c.Model)
+
+	if v := strings.TrimSpace(getenv("IL2API_MODELS")); v != "" {
+		for _, part := range strings.Split(v, ",") {
+			if m := strings.TrimSpace(part); m != "" {
+				c.Models = append(c.Models, m)
+			}
+		}
+	}
+	if len(c.Models) == 0 {
+		c.Models = []string{c.Model}
+	}
+
+	proxy := strings.TrimSpace(getenv("IL2API_PROXY"))
+	if proxy == "" {
+		for _, key := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
+			if v := strings.TrimSpace(getenv(key)); v != "" {
+				proxy = v
+				break
+			}
+		}
+	}
+	proxy, err := normalizeProxy(proxy)
+	if err != nil {
+		return Config{}, err
+	}
+	c.Proxy = proxy
+
+	if c.PoolMin, err = envInt(getenv, "IL2API_POOL_MIN", c.PoolMin); err != nil {
+		return Config{}, err
+	}
+	if c.PoolMax, err = envInt(getenv, "IL2API_POOL_MAX", c.PoolMax); err != nil {
+		return Config{}, err
+	}
+	if c.ContextChars, err = envInt(getenv, "IL2API_CONTEXT_CHARS", c.ContextChars); err != nil {
+		return Config{}, err
+	}
+	if c.PoolTTL, err = envDuration(getenv, "IL2API_POOL_TTL", c.PoolTTL); err != nil {
+		return Config{}, err
+	}
+	if c.IdleTimeout, err = envDuration(getenv, "IL2API_IDLE_TIMEOUT", c.IdleTimeout); err != nil {
+		return Config{}, err
+	}
+	if c.SessionTimeout, err = envDuration(getenv, "IL2API_SESSION_TIMEOUT", c.SessionTimeout); err != nil {
+		return Config{}, err
+	}
+
+	if err := c.validate(); err != nil {
+		return Config{}, err
+	}
+	return c, nil
+}
+
+func (c Config) validate() error {
+	if c.PoolMin < 0 {
+		return fmt.Errorf("config: IL2API_POOL_MIN must be >= 0, got %d", c.PoolMin)
+	}
+	if c.PoolMax < 1 {
+		return fmt.Errorf("config: IL2API_POOL_MAX must be >= 1, got %d", c.PoolMax)
+	}
+	if c.PoolMin > c.PoolMax {
+		return fmt.Errorf("config: IL2API_POOL_MIN (%d) must not exceed IL2API_POOL_MAX (%d)", c.PoolMin, c.PoolMax)
+	}
+	if c.PoolTTL <= 0 {
+		return fmt.Errorf("config: IL2API_POOL_TTL must be positive, got %s", c.PoolTTL)
+	}
+	if c.IdleTimeout <= 0 {
+		return fmt.Errorf("config: IL2API_IDLE_TIMEOUT must be positive, got %s", c.IdleTimeout)
+	}
+	if c.SessionTimeout <= 0 {
+		return fmt.Errorf("config: IL2API_SESSION_TIMEOUT must be positive, got %s", c.SessionTimeout)
+	}
+	if c.ContextChars == 0 || c.ContextChars < -1 {
+		return fmt.Errorf("config: IL2API_CONTEXT_CHARS must be positive or -1 to disable, got %d", c.ContextChars)
+	}
+	u, err := url.Parse(c.UpstreamBase)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("config: IL2API_UPSTREAM_BASE must be an http(s) URL, got %q", c.UpstreamBase)
+	}
+	if !strings.HasPrefix(c.Addr, ":") && !strings.Contains(c.Addr, ":") {
+		return fmt.Errorf("config: IL2API_ADDR must be host:port or :port, got %q", c.Addr)
+	}
+	return nil
+}
+
+// normalizeProxy accepts bare host:port, http://, and https:// proxy URLs and
+// returns a canonical http(s) URL string. Empty input stays empty.
+func normalizeProxy(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("config: invalid proxy %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("config: proxy scheme must be http or https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("config: proxy %q has no host", raw)
+	}
+	return u.String(), nil
+}
+
+func envInt(getenv func(string) string, key string, def int) (int, error) {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be an integer, got %q", key, raw)
+	}
+	return n, nil
+}
+
+func envDuration(getenv func(string) string, key string, def time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a duration such as 30m or 60s, got %q", key, raw)
+	}
+	return d, nil
+}
