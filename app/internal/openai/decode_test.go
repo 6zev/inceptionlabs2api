@@ -2,7 +2,6 @@ package openai
 
 import (
 	"encoding/json"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -35,50 +34,72 @@ func TestDecodeDefaultReasoningEffort(t *testing.T) {
 	}
 }
 
-func TestDecodeMinimalMapsToLow(t *testing.T) {
+// Untouched unknown fields are dropped silently: OpenAI SDKs send them on
+// every ordinary call and the upstream assigns them no meaning.
+func TestDecodeDropsUnknownParamsSilently(t *testing.T) {
 	t.Parallel()
-	req, re := decodeStrict(t, `{"model":"m","reasoning_effort":"minimal","messages":[{"role":"user","content":"hi"}]}`)
+	req, re := decodeStrict(t, `{
+		"model":"m",
+		"messages":[{"role":"user","content":"hi"}],
+		"temperature":0.2,"top_p":0.9,"stop":["x"],"n":2,
+		"logprobs":true,"top_logprobs":3,"presence_penalty":0.1,
+		"frequency_penalty":0.2,"seed":42,"user":"u-1",
+		"response_format":{"type":"json_object"},"stream_options":{"include_usage":true},
+		"logit_bias":{"50256":-100},"parallel_tool_calls":true,
+		"some_future_field":{"nested":[1,2,3]}
+	}`)
 	if re != nil {
-		t.Fatalf("Decode: %v", re)
+		t.Fatalf("Decode rejected a request with ignorable fields: %+v", re)
 	}
-	if req.ReasoningEffort != "low" {
-		t.Fatalf("effort = %q, want low", req.ReasoningEffort)
-	}
-}
-
-func TestDecodeRejectsUnknownParamsNamingAll(t *testing.T) {
-	t.Parallel()
-	_, re := decodeStrict(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0.2,"top_p":0.9,"stop":["x"],"n":2}`)
-	if re == nil {
-		t.Fatal("expected error")
-	}
-	if re.Status != http.StatusBadRequest || re.Code != CodeUnsupportedParam {
-		t.Fatalf("err = %+v, want 400 unsupported_parameter", re)
-	}
-	for _, key := range []string{"n", "stop", "temperature", "top_p"} {
-		if !strings.Contains(re.Message, `"`+key+`"`) {
-			t.Errorf("message %q does not name %q", re.Message, key)
-		}
-	}
-	if re.Param != "n" {
-		t.Errorf("param = %q, want first sorted key n", re.Param)
-	}
-	if !strings.Contains(re.Message, `"messages"`) || !strings.Contains(re.Message, `"reasoning_effort"`) {
-		t.Errorf("message %q should list the supported set", re.Message)
+	if req.Model != "m" || len(req.Messages) != 1 {
+		t.Fatalf("req = %+v", req)
 	}
 }
 
-func TestDecodeRejectsToolFields(t *testing.T) {
+// Tool calling is out of scope, but offering tools must not break the call:
+// the fields are dropped and the request proceeds as plain chat.
+func TestDecodeDropsToolFieldsAndProceeds(t *testing.T) {
 	t.Parallel()
 	for _, body := range []string{
-		`{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}`,
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`,
 		`{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":"auto"}`,
-		`{"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[]}`,
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"function","function":{"name":"f"}}}`,
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[{"name":"f"}]}`,
 		`{"model":"m","messages":[{"role":"user","content":"hi"}],"function_call":"auto"}`,
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[],"tool_choice":"none"}`,
 	} {
-		_, re := decodeStrict(t, body)
-		if re == nil || re.Code != CodeToolUnsupported {
-			t.Errorf("%s: err = %+v, want tool_calling_unsupported", body, re)
+		req, re := decodeStrict(t, body)
+		if re != nil {
+			t.Errorf("%s: rejected: %+v", body, re)
+			continue
+		}
+		if len(req.Messages) != 1 || req.Messages[0].Role != "user" {
+			t.Errorf("%s: messages = %+v", body, req.Messages)
+		}
+	}
+}
+
+// reasoning_effort is the upstream's enum. "minimal" has a documented mapping;
+// anything else is passed through for the upstream to accept or reject.
+func TestDecodeReasoningEffortPassThrough(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"minimal": "low",
+		"low":     "low",
+		"medium":  "medium",
+		"high":    "high",
+		"extreme": "extreme",
+		"":        "medium",
+	}
+	for in, want := range cases {
+		body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"` + in + `"}`
+		req, re := decodeStrict(t, body)
+		if re != nil {
+			t.Errorf("%q: rejected: %+v", in, re)
+			continue
+		}
+		if req.ReasoningEffort != want {
+			t.Errorf("%q: effort = %q, want %q", in, req.ReasoningEffort, want)
 		}
 	}
 }
@@ -86,19 +107,20 @@ func TestDecodeRejectsToolFields(t *testing.T) {
 func TestDecodeRejectsMalformedBodies(t *testing.T) {
 	t.Parallel()
 	cases := []string{
-		``,
-		`{`,
-		`[]`,
-		`null`,
-		`{"model":"m","messages":[]}`,
-		`{"messages":[{"role":"user","content":"hi"}]}`,
-		`{"model":"m"}`,
-		`{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"maximum"}`,
-		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":"yes"}`,
+		``,                            // empty body
+		`{`,                           // truncated JSON
+		`[]`,                          // not an object
+		`null`,                        // not an object
+		`{"model":"m","messages":[]}`, // no messages
+		`{"messages":[{"role":"user","content":"hi"}]}`, // no model
+		`{"model":"m"}`,                 // no messages key
+		`{"model":"m","messages":"hi"}`, // wrong type
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":"yes"}`, // wrong type
+		`{"model":"m","messages":[{"role":"user","content":"hi"}]}{"x":1}`,         // trailing data
 	}
 	for _, body := range cases {
 		if _, re := decodeStrict(t, body); re == nil {
-			t.Errorf("%q: expected error", body)
+			t.Errorf("%q: expected a structural error", body)
 		}
 	}
 }
@@ -111,7 +133,7 @@ func TestNormalizeRoles(t *testing.T) {
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: []any{map[string]any{"type": "text", "text": "answer"}}},
 	}
-	out, total, re := NormalizeMessages(msgs, 0)
+	out, total, re := NormalizeMessages(msgs)
 	if re != nil {
 		t.Fatalf("NormalizeMessages: %v", re)
 	}
@@ -134,56 +156,55 @@ func TestNormalizeRoles(t *testing.T) {
 	}
 }
 
-func TestNormalizeRejectsMedia(t *testing.T) {
+// Media parts are not rejected: the caller's attachment is rendered as a short
+// text placeholder so the model still sees that something was sent.
+func TestNormalizeRendersMediaAsPlaceholder(t *testing.T) {
 	t.Parallel()
-	for _, typ := range []string{"image_url", "input_audio", "file", "video_url"} {
-		msgs := []Message{{Role: "user", Content: []any{
-			map[string]any{"type": "text", "text": "describe"},
-			map[string]any{"type": typ},
-		}}}
-		_, _, re := NormalizeMessages(msgs, 0)
-		if re == nil || re.Code != CodeContentUnsupported {
-			t.Errorf("type %s: err = %+v, want content_part_unsupported", typ, re)
-		}
-		if !strings.Contains(re.Message, typ) {
-			t.Errorf("type %s: message %q does not name the part", typ, re.Message)
+	msgs := []Message{{Role: "user", Content: []any{
+		map[string]any{"type": "text", "text": "describe"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AAAA"}},
+		map[string]any{"type": "input_audio"},
+		map[string]any{"type": "file"},
+		map[string]any{"type": "video_url"},
+	}}}
+	out, _, re := NormalizeMessages(msgs)
+	if re != nil {
+		t.Fatalf("media rejected: %+v", re)
+	}
+	got := strings.Join(out[0].Texts, "|")
+	for _, want := range []string{"describe", "[image]", "[audio]", "[file]", "[video_url]"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("texts = %q, want %q", got, want)
 		}
 	}
 }
 
-func TestNormalizeRejectsToolMessages(t *testing.T) {
+func TestNormalizeCoercesToolRolesAndDropsToolCalls(t *testing.T) {
 	t.Parallel()
 	msgs := []Message{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "call", ToolCalls: json.RawMessage(`[{"id":"call_1"}]`)},
+		{Role: "tool", Content: "tool result", ToolCallID: "call_1"},
+		{Role: "function", Content: "fn result"},
+		{Role: "assistant", Content: "x", FunctionCall: json.RawMessage(`{"name":"f"}`)},
+		{Role: "weird", Content: "unknown role"},
 	}
-	_, _, re := NormalizeMessages(msgs, 0)
-	if re == nil || re.Code != CodeToolUnsupported {
-		t.Fatalf("err = %+v, want tool_calling_unsupported", re)
+	out, _, re := NormalizeMessages(msgs)
+	if re != nil {
+		t.Fatalf("tool history rejected: %+v", re)
 	}
-
-	msgs = []Message{{Role: "tool", Content: "result", ToolCallID: "call_1"}}
-	_, _, re = NormalizeMessages(msgs, 0)
-	if re == nil || re.Code != CodeToolUnsupported {
-		t.Fatalf("err = %+v, want tool_calling_unsupported", re)
+	wantRoles := []string{"user", "assistant", "user", "user", "assistant", "user"}
+	for i, want := range wantRoles {
+		if out[i].Role != want {
+			t.Errorf("message %d role = %q, want %q", i, out[i].Role, want)
+		}
 	}
-
-	// Empty tool_calls arrays are ordinary history, not a tool request.
-	msgs = []Message{
-		{Role: "assistant", Content: "done", ToolCalls: json.RawMessage(`[]`)},
-		{Role: "assistant", Content: "done", ToolCalls: json.RawMessage(`null`)},
-	}
-	if _, _, re := NormalizeMessages(msgs, 0); re != nil {
-		t.Fatalf("empty tool_calls should be accepted, got %+v", re)
-	}
-
-	msgs = []Message{{Role: "bogus", Content: "x"}}
-	if _, _, re := NormalizeMessages(msgs, 0); re == nil || !strings.Contains(re.Message, "unsupported role") {
-		t.Fatalf("err = %+v, want unsupported role", re)
+	if len(out[1].Texts) != 1 || out[1].Texts[0] != "call" {
+		t.Errorf("assistant tool_calls message texts = %v", out[1].Texts)
 	}
 }
 
-func TestNormalizeRejectsEmptyContent(t *testing.T) {
+func TestNormalizeRejectsMessagesWithoutText(t *testing.T) {
 	t.Parallel()
 	cases := []Message{
 		{Role: "user", Content: ""},
@@ -191,47 +212,38 @@ func TestNormalizeRejectsEmptyContent(t *testing.T) {
 		{Role: "assistant", Content: nil},
 		{Role: "user", Content: 42},
 		{Role: "user", Content: []any{map[string]any{"type": "text"}}},
+		{Role: "user", Content: []any{map[string]any{"type": "text", "text": ""}}},
 		{Role: "user", Content: []any{"bare"}},
 	}
 	for i, m := range cases {
-		if _, _, re := NormalizeMessages([]Message{m}, 0); re == nil {
-			t.Errorf("case %d: expected error", i)
+		if _, _, re := NormalizeMessages([]Message{m}); re == nil {
+			t.Errorf("case %d: expected a structural error", i)
 		}
 	}
 }
 
-func TestContextGuardCountsRunes(t *testing.T) {
+// There is no client-side length guard: the upstream owns its context limit.
+func TestNormalizeHasNoLengthGuard(t *testing.T) {
 	t.Parallel()
-	// 10 CJK characters count as 10, not 30 bytes.
-	msgs := []Message{{Role: "user", Content: strings.Repeat("你", 10)}}
-	_, total, re := NormalizeMessages(msgs, 10)
+	huge := strings.Repeat("x", 1_000_000)
+	out, total, re := NormalizeMessages([]Message{{Role: "user", Content: huge}})
 	if re != nil {
-		t.Fatalf("re = %v", re)
+		t.Fatalf("long input rejected: %+v", re)
 	}
-	if total != 10 {
-		t.Fatalf("total = %d, want 10", total)
-	}
-	_, _, re = NormalizeMessages(msgs, 9)
-	if re == nil || re.Code != CodeContextLength || re.Status != 400 {
-		t.Fatalf("err = %+v, want context_length_exceeded", re)
-	}
-	if _, _, re := NormalizeMessages(msgs, -1); re != nil {
-		t.Fatalf("disabled guard rejected input: %v", re)
+	if total != len(huge) || len(out) != 1 {
+		t.Fatalf("total = %d, out = %d", total, len(out))
 	}
 }
 
-func TestNormalizeSumsAcrossMessages(t *testing.T) {
+// A flood of tiny text parts is forwarded too: there is no invented part cap.
+func TestNormalizeHasNoPartCap(t *testing.T) {
 	t.Parallel()
-	msgs := []Message{
-		{Role: "system", Content: strings.Repeat("s", 5000)},
-		{Role: "user", Content: strings.Repeat("u", 5000)},
+	parts := make([]any, 0, 5000)
+	for i := 0; i < 5000; i++ {
+		parts = append(parts, map[string]any{"type": "text", "text": "x"})
 	}
-	_, total, re := NormalizeMessages(msgs, 9_000)
-	if re == nil || re.Code != CodeContextLength {
-		t.Fatalf("err = %+v, want context_length_exceeded", re)
-	}
-	if total != 10_000 {
-		t.Fatalf("total = %d, want 10000", total)
+	if _, _, re := NormalizeMessages([]Message{{Role: "user", Content: parts}}); re != nil {
+		t.Fatalf("part flood rejected: %+v", re)
 	}
 }
 
@@ -272,33 +284,5 @@ func TestRequestErrorMessage(t *testing.T) {
 	t.Parallel()
 	if got := Invalid("boom").Error(); got != "boom" {
 		t.Fatalf("Error() = %q", got)
-	}
-}
-
-func TestPrettyPrintedEmptyToolCallsAccepted(t *testing.T) {
-	t.Parallel()
-	for _, raw := range []string{`[]`, `[ ]`, "[\n  ]", `null`, `{}`, `{ }`} {
-		msgs := []Message{{Role: "assistant", Content: "done", ToolCalls: json.RawMessage(raw)}}
-		if _, _, re := NormalizeMessages(msgs, 0); re != nil {
-			t.Errorf("tool_calls %q rejected: %+v", raw, re)
-		}
-	}
-	for _, raw := range []string{`[{"id":"call_1"}]`, `{"name":"f"}`} {
-		msgs := []Message{{Role: "assistant", Content: "done", ToolCalls: json.RawMessage(raw)}}
-		if _, _, re := NormalizeMessages(msgs, 0); re == nil || re.Code != CodeToolUnsupported {
-			t.Errorf("tool_calls %q: err = %+v, want tool_calling_unsupported", raw, re)
-		}
-	}
-}
-
-func TestPerMessageFunctionCallRejected(t *testing.T) {
-	t.Parallel()
-	msgs := []Message{{Role: "assistant", Content: "x", FunctionCall: json.RawMessage(`{"name":"f","arguments":"{}"}`)}}
-	if _, _, re := NormalizeMessages(msgs, 0); re == nil || re.Code != CodeToolUnsupported {
-		t.Fatalf("err = %+v, want function_call rejection", re)
-	}
-	msgs = []Message{{Role: "assistant", Content: "x", FunctionCall: json.RawMessage(`null`)}}
-	if _, _, re := NormalizeMessages(msgs, 0); re != nil {
-		t.Fatalf("null function_call rejected: %+v", re)
 	}
 }

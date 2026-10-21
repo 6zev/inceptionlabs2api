@@ -18,10 +18,9 @@ import (
 func newSearchServer(t *testing.T, se Searcher) *Server {
 	t.Helper()
 	s := New(Config{
-		Model:        "mercury-3",
-		ContextChars: 250_000,
-		IdleTimeout:  time.Second,
-		Logf:         func(string, ...any) {},
+		Model:       "mercury-3",
+		IdleTimeout: time.Second,
+		Logf:        func(string, ...any) {},
 	}, nil, fakePool{stats: pool.Stats{Size: 2, Min: 2, Max: 8}})
 	s.SetSearcher(se)
 	return s
@@ -128,9 +127,9 @@ func TestWebSearchRejectsBadRequests(t *testing.T) {
 		{"whitespace query", `{"query":"   "}`, openai.CodeInvalidRequest},
 		{"non-string query", `{"query":123}`, openai.CodeInvalidRequest},
 		{"not json", `not json`, openai.CodeInvalidRequest},
-		{"bad effort", `{"query":"q","config":{"effort":"turbo"}}`, openai.CodeInvalidRequest},
-		{"unknown key", `{"query":"q","top_k":3}`, openai.CodeUnsupportedParam},
-		{"unknown config key", `{"query":"q","config":{"nope":1}}`, openai.CodeUnsupportedParam},
+		{"config not object", `{"query":"q","config":"x"}`, openai.CodeInvalidRequest},
+		{"config array", `{"query":"q","config":[1]}`, openai.CodeInvalidRequest},
+		{"trailing data", `{"query":"q"}{"x":1}`, openai.CodeInvalidRequest},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -155,15 +154,38 @@ func TestWebSearchRejectsBadRequests(t *testing.T) {
 	}
 }
 
-func TestWebSearchQueryTooLong(t *testing.T) {
+// Pass-through policy: an unknown key, an unknown effort, and a very long
+// query are all forwarded rather than rejected. Unknown keys are dropped;
+// effort is the upstream's enum to judge.
+func TestWebSearchPassesThroughUndeclaredInput(t *testing.T) {
 	t.Parallel()
 	se := &fakeSearcher{}
-	body := `{"query":"` + strings.Repeat("x", maxSearchQuery+1) + `"}`
-	if rec := postSearch(t, newSearchServer(t, se), body); rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+	long := strings.Repeat("x", 5000)
+	body := `{"query":"` + long + `","top_k":3,"config":{"effort":"turbo","nope":1}}`
+	rec := postSearch(t, newSearchServer(t, se), body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
 	}
-	if se.count() != 0 {
-		t.Fatal("over-long query reached upstream")
+	got := se.lastRequest()
+	if got.Query != long {
+		t.Fatalf("query forwarded = %d chars, want %d", len(got.Query), len(long))
+	}
+	if got.Config.Effort != "turbo" {
+		t.Fatalf("effort = %q, want pass-through", got.Config.Effort)
+	}
+}
+
+// Duplicate keys keep encoding/json's last-wins behaviour: the request is
+// parseable, so it is not the gateway's business to reject it.
+func TestWebSearchDuplicateKeysLastWins(t *testing.T) {
+	t.Parallel()
+	se := &fakeSearcher{}
+	rec := postSearch(t, newSearchServer(t, se), `{"query":"first","query":"second"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if got := se.lastRequest(); got.Query != "second" {
+		t.Fatalf("query = %q, want the last value", got.Query)
 	}
 }
 
@@ -233,8 +255,20 @@ func TestWebSearchUpstreamErrorMapping(t *testing.T) {
 			if env.Error.Code != tc.code {
 				t.Fatalf("code = %q, want %q", env.Error.Code, tc.code)
 			}
-			if strings.Contains(rec.Body.String(), "backend down") {
-				t.Fatal("upstream message leaked to the client")
+			// Upstream prose is translated, not hidden, but an HTML
+			// challenge page must never be echoed.
+			if strings.Contains(rec.Body.String(), "<html") {
+				t.Fatalf("upstream HTML leaked: %s", rec.Body)
+			}
+			switch tc.name {
+			case "search error event":
+				if !strings.Contains(rec.Body.String(), "backend down") {
+					t.Fatalf("upstream message not translated: %s", rec.Body)
+				}
+			case "pool empty", "idle", "incomplete", "transport":
+				if strings.Contains(rec.Body.String(), "backend down") {
+					t.Fatal("unrelated error leaked a message")
+				}
 			}
 		})
 	}
@@ -440,19 +474,15 @@ func TestWebSearchUpstreamBodyShape(t *testing.T) {
 	}
 }
 
-// Duplicate keys and trailing garbage are rejected: a body that a front proxy
-// might parse differently must not be silently accepted.
-func TestWebSearchRejectsDuplicatesAndTrailingData(t *testing.T) {
+// Trailing data is unparseable and rejected. Duplicate keys keep
+// encoding/json's last-wins meaning and are forwarded: the JSON parser's
+// contract is the upstream's contract too.
+func TestWebSearchRejectsTrailingDataOnly(t *testing.T) {
 	t.Parallel()
-	cases := []string{
+	for _, body := range []string{
 		`{"query":"q"} garbage`,
 		`{"query":"q"}{"query":"q2"}`,
-		`{"query":"q","query":"q2"}`,
-		`{"query":"q","config":{"effort":"instant"},"config":null}`,
-		`{"query":"q","config":{"effort":"instant","effort":"deep"}}`,
-		`{"query":"q","config":[]}`,
-	}
-	for _, body := range cases {
+	} {
 		se := &fakeSearcher{}
 		rec := postSearch(t, newSearchServer(t, se), body)
 		if rec.Code != http.StatusBadRequest {
@@ -461,6 +491,11 @@ func TestWebSearchRejectsDuplicatesAndTrailingData(t *testing.T) {
 		if se.count() != 0 {
 			t.Errorf("body %s reached upstream", body)
 		}
+	}
+	// A config array is structurally wrong (an object is required).
+	se := &fakeSearcher{}
+	if rec := postSearch(t, newSearchServer(t, se), `{"query":"q","config":[]}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("config array: status = %d, want 400", rec.Code)
 	}
 }
 

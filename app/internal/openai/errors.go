@@ -9,10 +9,6 @@ import (
 // exists and stay stable for clients that branch on them.
 const (
 	CodeInvalidRequest      = "invalid_request_error"
-	CodeUnsupportedParam    = "unsupported_parameter"
-	CodeContentUnsupported  = "content_part_unsupported"
-	CodeToolUnsupported     = "tool_calling_unsupported"
-	CodeContextLength       = "context_length_exceeded"
 	CodeModelNotFound       = "model_not_found"
 	CodeMethodNotAllowed    = "method_not_allowed"
 	CodeInvalidAPIKey       = "invalid_api_key"

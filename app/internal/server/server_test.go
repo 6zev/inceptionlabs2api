@@ -84,12 +84,11 @@ func (f fakePool) Stats() pool.Stats { return f.stats }
 
 func newTestServer(up Chatter) *Server {
 	s := New(Config{
-		APIKey:       "",
-		Model:        "mercury-3",
-		Models:       []string{"mercury-3", "mercury-2"},
-		ContextChars: 250_000,
-		IdleTimeout:  60 * time.Second,
-		Logf:         func(string, ...any) {},
+		APIKey:      "",
+		Model:       "mercury-3",
+		Models:      []string{"mercury-3", "mercury-2"},
+		IdleTimeout: 60 * time.Second,
+		Logf:        func(string, ...any) {},
 	}, up, fakePool{stats: pool.Stats{Size: 2, Min: 2, Max: 8}})
 	s.SetClock(func() time.Time { return time.Unix(1_792_553_057, 0) })
 	return s
@@ -481,6 +480,26 @@ func TestUpstreamUnavailableBeforeHeaders(t *testing.T) {
 	}
 }
 
+// The upstream's own error prose is translated into the envelope, but an HTML
+// challenge page is never echoed.
+func TestUpstreamStatusErrorTranslatesProse(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) {
+		return nil, &upstream.StatusError{Status: 400, Body: `{"error":{"message":"context window exceeded"}}`}
+	}}
+	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","messages":[{"role":"user","content":"q"}]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	var env openai.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	if env.Error.Message != "context window exceeded" {
+		t.Fatalf("message = %q, want the upstream message", env.Error.Message)
+	}
+}
+
 func TestUpstreamStatusErrorDoesNotLeakBody(t *testing.T) {
 	t.Parallel()
 	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) {
@@ -567,7 +586,9 @@ func TestMethodAndModelErrors(t *testing.T) {
 	}
 }
 
-func TestValidationNeverReachesUpstream(t *testing.T) {
+// Only structural problems are rejected. Everything else is forwarded with
+// the upstream left to judge it (SPEC §1.1).
+func TestStructuralValidationNeverReachesUpstream(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name   string
@@ -575,13 +596,12 @@ func TestValidationNeverReachesUpstream(t *testing.T) {
 		status int
 		code   string
 	}{
-		{"unknown param", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"temperature":0.5}`, 400, openai.CodeUnsupportedParam},
-		{"tools", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"tools":[]}`, 400, openai.CodeToolUnsupported},
-		{"image", `{"model":"mercury-3","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`, 400, openai.CodeContentUnsupported},
-		{"tool message", `{"model":"mercury-3","messages":[{"role":"tool","content":"x","tool_call_id":"c"}]}`, 400, openai.CodeToolUnsupported},
 		{"malformed", `{`, 400, openai.CodeInvalidRequest},
+		{"not an object", `[]`, 400, openai.CodeInvalidRequest},
 		{"empty messages", `{"model":"mercury-3","messages":[]}`, 400, openai.CodeInvalidRequest},
-		{"bad effort", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"reasoning_effort":"max"}`, 400, openai.CodeInvalidRequest},
+		{"no model", `{"messages":[{"role":"user","content":"q"}]}`, 400, openai.CodeInvalidRequest},
+		{"no text", `{"model":"mercury-3","messages":[{"role":"user","content":""}]}`, 400, openai.CodeInvalidRequest},
+		{"messages wrong type", `{"model":"mercury-3","messages":"q"}`, 400, openai.CodeInvalidRequest},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -604,24 +624,48 @@ func TestValidationNeverReachesUpstream(t *testing.T) {
 	}
 }
 
-func TestContextGuardRejectsBeforeUpstream(t *testing.T) {
+// The former 400s for unknown params, tools, media, tool roles, and unknown
+// effort modes are gone: those requests now reach the upstream as plain chat.
+func TestPresumptuousRejectionsAreGone(t *testing.T) {
 	t.Parallel()
-	up := &fakeChatter{}
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"unknown param", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"temperature":0.5}`},
+		{"tools", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"tools":[{"type":"function"}]}`},
+		{"tool_choice", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"tool_choice":"auto"}`},
+		{"image", `{"model":"mercury-3","messages":[{"role":"user","content":[{"type":"text","text":"see"},{"type":"image_url","image_url":{"url":"x"}}]}]}`},
+		{"tool message", `{"model":"mercury-3","messages":[{"role":"tool","content":"x","tool_call_id":"c"}]}`},
+		{"bad effort", `{"model":"mercury-3","messages":[{"role":"user","content":"q"}],"reasoning_effort":"max"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return streamOf(hardStream), nil }}
+			rec := postChat(t, newTestServer(up), tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body)
+			}
+			if up.count() != 1 {
+				t.Fatalf("upstream calls = %d, want 1", up.count())
+			}
+		})
+	}
+}
+
+// There is no client-side context guard: oversized input is forwarded and the
+// upstream truncates at its own limit.
+func TestLongInputPassesThrough(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return streamOf(hardStream), nil }}
 	big := strings.Repeat("x", 250_001)
 	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","messages":[{"role":"user","content":"`+big+`"}]}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body)
 	}
-	var env openai.ErrorResponse
-	json.Unmarshal(rec.Body.Bytes(), &env)
-	if env.Error.Code != openai.CodeContextLength {
-		t.Fatalf("code = %q", env.Error.Code)
-	}
-	if !strings.Contains(env.Error.Message, "250001") {
-		t.Fatalf("message = %q", env.Error.Message)
-	}
-	if up.count() != 0 {
-		t.Fatal("oversized request reached upstream")
+	got := up.lastRequest().Messages[0].Parts[0].Text
+	if len(got) != len(big) {
+		t.Fatalf("forwarded text = %d chars, want %d", len(got), len(big))
 	}
 }
 
@@ -945,7 +989,9 @@ func TestBodyTooLarge(t *testing.T) {
 	}
 }
 
-func TestEmptyTextPartsRejected(t *testing.T) {
+// A message whose only part is empty has no renderable text: that is the one
+// content rejection, because the upstream parts format cannot express it.
+func TestEmptyOnlyContentRejected(t *testing.T) {
 	t.Parallel()
 	up := &fakeChatter{}
 	body := `{"model":"mercury-3","messages":[{"role":"user","content":[{"type":"text","text":""}]}]}`
@@ -954,32 +1000,27 @@ func TestEmptyTextPartsRejected(t *testing.T) {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 	if up.count() != 0 {
-		t.Fatal("empty part reached upstream")
+		t.Fatal("empty message reached upstream")
 	}
 }
 
-func TestTooManyTextPartsRejected(t *testing.T) {
+// An empty part alongside real text is simply ignored; a large part count is
+// forwarded, not capped by an invented policy.
+func TestTextPartFloodPassesThrough(t *testing.T) {
 	t.Parallel()
-	up := &fakeChatter{}
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return streamOf(hardStream), nil }}
 	var parts strings.Builder
+	parts.WriteString(`{"type":"text","text":""}`)
 	for i := 0; i < 5000; i++ {
-		if i > 0 {
-			parts.WriteString(",")
-		}
-		parts.WriteString(`{"type":"text","text":"x"}`)
+		parts.WriteString(`,{"type":"text","text":"x"}`)
 	}
 	body := `{"model":"mercury-3","messages":[{"role":"user","content":[` + parts.String() + `]}]}`
 	rec := postChat(t, newTestServer(up), body)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body)
 	}
-	var env openai.ErrorResponse
-	json.Unmarshal(rec.Body.Bytes(), &env)
-	if !strings.Contains(env.Error.Message, "text parts") {
-		t.Fatalf("message = %q", env.Error.Message)
-	}
-	if up.count() != 0 {
-		t.Fatal("part-flood reached upstream")
+	if got := len(up.lastRequest().Messages[0].Parts); got != 5000 {
+		t.Fatalf("forwarded parts = %d, want 5000", got)
 	}
 }
 

@@ -36,8 +36,8 @@ func TestDefaults(t *testing.T) {
 	if cfg.IdleTimeout != 60*time.Second {
 		t.Errorf("IdleTimeout = %s, want 60s", cfg.IdleTimeout)
 	}
-	if cfg.ContextChars != 250_000 {
-		t.Errorf("ContextChars = %d, want 250000", cfg.ContextChars)
+	if cfg.ContextChars != 0 {
+		t.Errorf("ContextChars = %d, want the deprecated no-op default 0", cfg.ContextChars)
 	}
 	if cfg.Proxy != "" {
 		t.Errorf("Proxy = %q, want empty", cfg.Proxy)

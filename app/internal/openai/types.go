@@ -4,8 +4,10 @@ package openai
 
 import "encoding/json"
 
-// ChatRequest is the accepted subset of an OpenAI chat completion request.
-// Every other top-level field is rejected before decoding reaches this type.
+// ChatRequest is the subset of an OpenAI chat completion request that maps
+// onto the upstream. Unknown top-level fields (temperature, tools, response
+// format, ...) are intentionally absent: they are dropped during decoding,
+// not rejected (SPEC §1.1).
 type ChatRequest struct {
 	Model           string    `json:"model"`
 	Messages        []Message `json:"messages"`
@@ -14,8 +16,8 @@ type ChatRequest struct {
 }
 
 // Message is one OpenAI chat message. Content is either a string or an array
-// of content parts; it is kept raw so the decoder can reject media parts with
-// a precise error.
+// of content parts; it is kept raw so media parts can be rendered as text
+// placeholders instead of being rejected.
 type Message struct {
 	Role         string          `json:"role"`
 	Content      any             `json:"content"`
@@ -23,12 +25,6 @@ type Message struct {
 	ToolCalls    json.RawMessage `json:"tool_calls"`
 	FunctionCall json.RawMessage `json:"function_call"`
 	ToolCallID   string          `json:"tool_call_id"`
-}
-
-// ContentPart is a single entry of a multi-part message content array.
-type ContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
 }
 
 // Model is one entry of GET /v1/models.

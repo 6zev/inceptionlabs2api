@@ -8,25 +8,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 
 	"inceptionlabs2api/internal/openai"
 	"inceptionlabs2api/internal/upstream"
 )
 
-// Search request bounds. The query cap is far above any real question and
-// keeps one request from fanning out into an unbounded plan prompt.
+// Search request bounds are the upstream's published ranges. Out-of-range
+// numbers are clamped, which is a translation; they are never a 400.
 const (
-	maxSearchQuery = 2000
-	maxFanout      = 5
-	maxDepth       = 3
-	maxKeepTopK    = 50
+	maxFanout   = 5
+	maxDepth    = 3
+	maxKeepTopK = 50
 )
-
-// searchEfforts are the accepted effort values. Only "instant" is exercised
-// by the first-party playground; fast/deep are documented pass-throughs.
-var searchEfforts = map[string]bool{"instant": true, "fast": true, "deep": true}
 
 // webSearchRequest is the POST /v1/web_search body. Config is optional, so
 // it stays a pointer to distinguish "absent" from all-zero.
@@ -56,9 +50,6 @@ type webSearchResult struct {
 	Snippet   string `json:"snippet"`
 	CiteIndex int    `json:"cite_index"`
 }
-
-var searchTopLevelKeys = []string{"query", "config"}
-var searchConfigKeys = []string{"fanout", "depth", "keep_top_k", "effort"}
 
 // webSearch bridges the upstream retrieval pipeline into a stateless search
 // response. It never streams: the whole NDJSON run is consumed under one
@@ -129,6 +120,7 @@ func searchRequest(req *webSearchRequest) *upstream.SearchRequest {
 	if effort == "" {
 		effort = "instant"
 	}
+	// effort is the upstream's enum: pass it through unchanged.
 	return &upstream.SearchRequest{
 		Query: req.Query,
 		Config: upstream.SearchConfig{
@@ -178,9 +170,10 @@ func nonNil(in []string) []string {
 	return in
 }
 
-// decodeWebSearch validates the body with the same no-silent-drops policy as
-// the chat path: unknown keys, bad types, an empty query, and out-of-enum
-// values are all 400s that name the offending field.
+// decodeWebSearch rejects only what the upstream call cannot express:
+// malformed JSON, a body that is not an object, a missing/non-string/empty
+// query, and a config that is not an object. Unknown keys are dropped and
+// numeric bounds are clamped; effort is passed through (SPEC §1.1).
 func decodeWebSearch(body []byte) (*webSearchRequest, *openai.RequestError) {
 	var raw map[string]json.RawMessage
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -196,19 +189,6 @@ func decodeWebSearch(body []byte) (*webSearchRequest, *openai.RequestError) {
 	if raw == nil {
 		return nil, openai.Invalid("request body must be a JSON object")
 	}
-	if len(raw) != countTopLevelKeys(body) {
-		return nil, openai.Invalid("invalid JSON body: duplicate top-level keys are not allowed")
-	}
-	var unknown []string
-	for key := range raw {
-		if !contains(searchTopLevelKeys, key) {
-			unknown = append(unknown, key)
-		}
-	}
-	if len(unknown) > 0 {
-		sort.Strings(unknown)
-		return nil, unsupported(unknown[0], unknown, searchTopLevelKeys)
-	}
 
 	var req webSearchRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -219,90 +199,19 @@ func decodeWebSearch(body []byte) (*webSearchRequest, *openai.RequestError) {
 		return nil, &openai.RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error",
 			Code: openai.CodeInvalidRequest, Param: "query", Message: `field "query" must be a non-empty string`}
 	}
-	if len([]rune(req.Query)) > maxSearchQuery {
-		return nil, &openai.RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error",
-			Code: openai.CodeInvalidRequest, Param: "query",
-			Message: fmt.Sprintf("query exceeds %d characters", maxSearchQuery)}
-	}
-
 	if req.Config != nil {
-		// Re-decode the config object alone so unknown keys can be named.
 		var cfgRaw map[string]json.RawMessage
-		if err := json.Unmarshal(raw["config"], &cfgRaw); err != nil {
-			return nil, openai.Invalid("config must be an object")
-		}
-		if cfgRaw == nil {
-			return nil, openai.Invalid("config must be an object")
-		}
-		if len(cfgRaw) != countTopLevelKeys(raw["config"]) {
-			return nil, openai.Invalid("invalid JSON body: duplicate config keys are not allowed")
-		}
-		var cfgUnknown []string
-		for key := range cfgRaw {
-			if !contains(searchConfigKeys, key) {
-				cfgUnknown = append(cfgUnknown, key)
+		if err := json.Unmarshal(raw["config"], &cfgRaw); err != nil || cfgRaw == nil {
+			// null is treated as an absent config.
+			if string(bytes.TrimSpace(raw["config"])) == "null" {
+				req.Config = nil
+			} else {
+				return nil, &openai.RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error",
+					Code: openai.CodeInvalidRequest, Param: "config", Message: "config must be an object"}
 			}
-		}
-		if len(cfgUnknown) > 0 {
-			sort.Strings(cfgUnknown)
-			return nil, unsupported(cfgUnknown[0], cfgUnknown, searchConfigKeys)
-		}
-		if req.Config.Effort == "" {
-			req.Config.Effort = "instant"
-		}
-		if !searchEfforts[req.Config.Effort] {
-			return nil, &openai.RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error",
-				Code: openai.CodeInvalidRequest, Param: "config.effort",
-				Message: fmt.Sprintf("config.effort must be one of instant, fast, deep; got %q", req.Config.Effort)}
 		}
 	}
 	return &req, nil
-}
-
-// countTopLevelKeys counts the members of a JSON object, including duplicates
-// (encoding/json keeps only the last, so a length mismatch detects them).
-func countTopLevelKeys(raw []byte) int {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	tok, err := dec.Token()
-	if err != nil || tok != json.Delim('{') {
-		return -1
-	}
-	n := 0
-	for dec.More() {
-		if _, err := dec.Token(); err != nil {
-			return -1
-		}
-		var skip json.RawMessage
-		if err := dec.Decode(&skip); err != nil {
-			return -1
-		}
-		n++
-	}
-	return n
-}
-
-func unsupported(param string, offenders, allowed []string) *openai.RequestError {
-	quoted := make([]string, len(offenders))
-	for i, o := range offenders {
-		quoted[i] = fmt.Sprintf("%q", o)
-	}
-	allowedQ := make([]string, len(allowed))
-	for i, a := range allowed {
-		allowedQ[i] = fmt.Sprintf("%q", a)
-	}
-	return &openai.RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error",
-		Code: openai.CodeUnsupportedParam, Param: param,
-		Message: fmt.Sprintf("unsupported parameter(s): %s; this endpoint accepts only: %s",
-			strings.Join(quoted, ", "), strings.Join(allowedQ, ", "))}
-}
-
-func contains(list []string, key string) bool {
-	for _, k := range list {
-		if k == key {
-			return true
-		}
-	}
-	return false
 }
 
 // searchError maps search failures onto the chat path's status/code surface.
@@ -314,8 +223,11 @@ func (s *Server) searchError(err error) *openai.RequestError {
 	if errors.As(err, &se) {
 		s.upErrors.Add(1)
 		s.logf("upstream: search failed: %s", truncate(se.Message, 300))
-		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamError, "",
-			"upstream search pipeline failed")
+		msg := "upstream search pipeline failed"
+		if m := strings.TrimSpace(se.Message); m != "" {
+			msg = truncate(m, 1000)
+		}
+		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamError, "", msg)
 	}
 	switch {
 	case errors.Is(err, upstream.ErrSearchIncomplete):

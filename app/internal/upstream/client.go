@@ -25,6 +25,9 @@ const ChromeUA = clear.UserAgent
 // maxErrorBody caps how much of a non-200 upstream body is read (and logged).
 const maxErrorBody = 4096
 
+// maxClientMessage bounds the upstream text echoed to clients.
+const maxClientMessage = 1000
+
 // maxAuthRetries is the number of additional attempts after the first when
 // the upstream rejects a session token with 401/403.
 const maxAuthRetries = 2
@@ -39,6 +42,34 @@ type StatusError struct {
 // Error implements error.
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("upstream: status %d: %s", e.Status, truncate(e.Body, 200))
+}
+
+// Message returns the upstream's own error text for a client-facing envelope.
+// The upstream speaks for itself; the gateway only strips HTML (a challenge
+// page is not an error message) and bounds the length. It returns "" when
+// there is nothing worth repeating.
+func (e *StatusError) Message() string {
+	body := strings.TrimSpace(e.Body)
+	if body == "" || strings.HasPrefix(body, "<") || strings.Contains(body, "<html") {
+		return ""
+	}
+	// Some upstream errors are JSON envelopes; surface their message field so
+	// the client sees prose rather than raw JSON inside a JSON string.
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal([]byte(body), &env) == nil {
+		if msg := strings.TrimSpace(env.Error.Message); msg != "" {
+			return truncate(msg, maxClientMessage)
+		}
+		if msg := strings.TrimSpace(env.Message); msg != "" {
+			return truncate(msg, maxClientMessage)
+		}
+	}
+	return truncate(body, maxClientMessage)
 }
 
 // ErrUnavailable means no session token could be obtained.

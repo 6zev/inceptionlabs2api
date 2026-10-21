@@ -14,16 +14,18 @@ import (
 // Config is the complete runtime configuration. It is built once at startup
 // and is immutable afterwards.
 type Config struct {
-	Addr           string
-	APIKey         string
-	UpstreamBase   string
-	Models         []string
-	Model          string
-	Proxy          string
-	PoolMin        int
-	PoolMax        int
-	PoolTTL        time.Duration
-	IdleTimeout    time.Duration
+	Addr         string
+	APIKey       string
+	UpstreamBase string
+	Models       []string
+	Model        string
+	Proxy        string
+	PoolMin      int
+	PoolMax      int
+	PoolTTL      time.Duration
+	IdleTimeout  time.Duration
+	// ContextChars is a deprecated no-op, retained so existing deployments do
+	// not fail to boot. There is no client-side length guard (SPEC §1.1).
 	ContextChars   int
 	SessionTimeout time.Duration
 	// SearchTimeout is the /v1/web_search sliding idle watchdog.
@@ -48,7 +50,7 @@ func Defaults() Config {
 		PoolMax:        8,
 		PoolTTL:        30 * time.Minute,
 		IdleTimeout:    60 * time.Second,
-		ContextChars:   250_000,
+		ContextChars:   0,
 		SessionTimeout: 15 * time.Second,
 
 		SearchTimeout:      60 * time.Second,

@@ -42,8 +42,13 @@ func (s *Server) upstreamError(err error) *openai.RequestError {
 	var se *upstream.StatusError
 	if errors.As(err, &se) {
 		s.logf("upstream: chat failed: status %d body %q", se.Status, truncate(se.Body, 300))
-		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamError, "",
-			fmt.Sprintf("upstream returned HTTP %d", se.Status))
+		// Translate, do not second-guess: the upstream's own message rides in
+		// the OpenAI envelope unchanged (minus HTML challenge pages).
+		msg := fmt.Sprintf("upstream returned HTTP %d", se.Status)
+		if m := se.Message(); m != "" {
+			msg = m
+		}
+		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamError, "", msg)
 	}
 	s.logf("upstream: chat failed: %v", err)
 	if errors.Is(err, context.DeadlineExceeded) {

@@ -788,3 +788,32 @@ func TestEveryRequestCarriesUAAndCookie(t *testing.T) {
 		t.Fatalf("cookie = %q, want the clearance cookie", cookies[0])
 	}
 }
+
+func TestStatusErrorMessage(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"json envelope", `{"error":{"message":"model overloaded"}}`, "model overloaded"},
+		{"flat json", `{"message":"bad input"}`, "bad input"},
+		{"plain text", "upstream said no", "upstream said no"},
+		{"html challenge", "<!DOCTYPE html><title>Vercel Security Checkpoint</title>", ""},
+		{"empty", "   ", ""},
+		{"unparsed json", `{"error":`, `{"error":`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := (&StatusError{Status: 500, Body: tc.body}).Message(); got != tc.want {
+				t.Fatalf("Message() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	long := strings.Repeat("x", 5000)
+	got := (&StatusError{Status: 500, Body: long}).Message()
+	if !strings.HasPrefix(got, long[:maxClientMessage]) || len(got) > maxClientMessage+3 {
+		t.Fatalf("long message len = %d, want a bounded prefix of %d", len(got), maxClientMessage)
+	}
+}

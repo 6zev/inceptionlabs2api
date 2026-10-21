@@ -52,9 +52,11 @@ type ClearanceStats interface {
 
 // Config configures the HTTP surface.
 type Config struct {
-	APIKey       string
-	Model        string
-	Models       []string
+	APIKey string
+	Model  string
+	Models []string
+	// ContextChars is accepted for compatibility and unused: there is no
+	// client-side length guard (upstreams truncate at their own limit).
 	ContextChars int
 	IdleTimeout  time.Duration
 	// SearchTimeout bounds /v1/web_search's sliding idle watchdog. Zero means
@@ -267,7 +269,7 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("model %q does not exist; available models: %s", req.Model, strings.Join(s.cfg.Models, ", "))))
 		return
 	}
-	msgs, _, re := openai.NormalizeMessages(req.Messages, s.cfg.ContextChars)
+	msgs, _, re := openai.NormalizeMessages(req.Messages)
 	if re != nil {
 		s.fail(w, re)
 		return
