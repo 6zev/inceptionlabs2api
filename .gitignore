@@ -20,3 +20,6 @@ coverage.*
 # Go workspace files
 go.work
 go.work.sum
+
+# local task brief
+TASK.md
