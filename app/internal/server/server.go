@@ -251,6 +251,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
 			"method not allowed; use POST"))
 		return

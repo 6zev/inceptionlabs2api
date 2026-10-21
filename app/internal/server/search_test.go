@@ -202,6 +202,37 @@ func TestWebSearchMethodNotAllowed(t *testing.T) {
 	}
 }
 
+// The three POST JSON routes must answer a wrong method the same way: 405,
+// the same envelope, and an Allow header. They were written in different
+// passes and chat's handler used to omit Allow (SPEC §3.4, §7.1, §7.2).
+func TestMethodNotAllowedIsUniform(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{}
+	sp := &fakeSpeech{}
+	s := newTestServer(up)
+	s.SetSpeech(sp)
+	s.SetSearcher(&fakeSearcher{})
+	for _, path := range []string{"/v1/chat/completions", "/v1/web_search", "/v1/audio/speech", "/v1/audio/transcriptions"} {
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s: status = %d, want 405", path, rec.Code)
+			continue
+		}
+		if got := rec.Header().Get("Allow"); got != http.MethodPost {
+			t.Errorf("%s: Allow = %q, want POST", path, got)
+		}
+		var env openai.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Errorf("%s: envelope: %v", path, err)
+			continue
+		}
+		if env.Error.Code != openai.CodeMethodNotAllowed || env.Error.Type != "invalid_request_error" {
+			t.Errorf("%s: envelope = %+v", path, env.Error)
+		}
+	}
+}
+
 func TestWebSearchEmptyResults(t *testing.T) {
 	t.Parallel()
 	se := &fakeSearcher{fn: func(int) (*upstream.SearchResult, error) {
