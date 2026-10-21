@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andybalholm/brotli"
+
 	"inceptionlabs2api/internal/pool"
 	"inceptionlabs2api/internal/server"
 	"inceptionlabs2api/internal/upstream"
@@ -31,10 +33,11 @@ import (
 
 // stack is the full gateway wired to a TLS mock upstream.
 type stack struct {
-	srv    *httptest.Server
-	pool   *pool.Pool
-	client *upstream.Client
-	mock   *tlsUpstream
+	srv       *httptest.Server
+	pool      *pool.Pool
+	client    *upstream.Client
+	mock      *tlsUpstream
+	srvSearch *server.Server
 }
 
 type tlsUpstream struct {
@@ -44,12 +47,26 @@ type tlsUpstream struct {
 	mu     sync.Mutex
 	tokens []string
 	chat   func(w http.ResponseWriter, r *http.Request)
+	search func(w http.ResponseWriter, r *http.Request)
+	config func(w http.ResponseWriter, r *http.Request)
 	status atomic.Int32
 }
 
 func (m *tlsUpstream) setChat(fn func(http.ResponseWriter, *http.Request)) {
 	m.mu.Lock()
 	m.chat = fn
+	m.mu.Unlock()
+}
+
+func (m *tlsUpstream) setSearch(fn func(http.ResponseWriter, *http.Request)) {
+	m.mu.Lock()
+	m.search = fn
+	m.mu.Unlock()
+}
+
+func (m *tlsUpstream) setConfig(fn func(http.ResponseWriter, *http.Request)) {
+	m.mu.Lock()
+	m.config = fn
 	m.mu.Unlock()
 }
 
@@ -116,6 +133,26 @@ func newTLSUpstream(t *testing.T) *tlsUpstream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, "data: [DONE]\n\n")
 	})
+	mux.HandleFunc("/api/search-lab/run", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		fn := m.search
+		m.mu.Unlock()
+		if fn == nil {
+			http.NotFound(w, r)
+			return
+		}
+		fn(w, r)
+	})
+	mux.HandleFunc("/api/search-lab/config", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		fn := m.config
+		m.mu.Unlock()
+		if fn == nil {
+			http.NotFound(w, r)
+			return
+		}
+		fn(w, r)
+	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
@@ -141,15 +178,16 @@ func newStack(t *testing.T, idle time.Duration) *stack {
 	t.Cleanup(p.Close)
 	c.BindPool(p)
 
-	h := server.New(server.Config{
+	gs := server.New(server.Config{
 		Model:        "mercury-3",
 		ContextChars: 250_000,
 		IdleTimeout:  idle,
 		Logf:         func(string, ...any) {},
-	}, c, p).Handler()
-	srv := httptest.NewServer(h)
+	}, c, p)
+	gs.SetSearcher(c)
+	srv := httptest.NewServer(gs.Handler())
 	t.Cleanup(srv.Close)
-	return &stack{srv: srv, pool: p, client: c, mock: m}
+	return &stack{srv: srv, pool: p, client: c, mock: m, srvSearch: gs}
 }
 
 const realisticStream = `data: {"type":"reasoning-start","id":"reasoning-0"}
@@ -454,6 +492,117 @@ func TestEndToEndAuthAndModels(t *testing.T) {
 	health.Body.Close()
 	if health.StatusCode != http.StatusOK {
 		t.Fatalf("healthz: %d", health.StatusCode)
+	}
+}
+
+// searchNDJSON is a complete depth-1 run, one JSON object per line.
+const searchNDJSON = `{"t":"run_start","config":{"fanout":1,"depth":1,"keepTopK":3,"effort":"instant"},"ms":0}
+{"t":"call_start","id":"c62","kind":"plan","label":"Plan 1 query","round":1,"llm":true,"ms":0.629}
+{"t":"queries","queries":["four-day workweek trial results countries"]}
+{"t":"round_start","round":1,"of":1,"queries":["four-day workweek trial results countries"],"ms":180.07}
+{"t":"call_start","id":"c63","kind":"retrieve","label":"Retrieve","round":1,"llm":false,"ms":180.08}
+{"t":"candidates","count":4,"fresh":4,"round":1}
+{"t":"call_start","id":"c64","kind":"rerank","label":"Rank 4 documents","round":1,"llm":true,"ms":2175.53}
+{"t":"docs","retrieved":4,"kept":3,"sources":[{"title":"\n\tFour-day work week\n        \n     – Parliament of Australia\n","url":"https://www.aph.gov.au/four-day","score":0.6},{"title":"4 Day Week Research Reports — 4 Day Week Global","url":"https://www.4dayweek.com/research","score":0.6}]}
+{"t":"rounds","run":1,"of":1,"stoppedEarly":false}
+{"t":"call_start","id":"c65","kind":"synthesize","label":"Synthesise answer","round":1,"llm":true,"ms":2402.81}
+{"t":"answer_delta","d":"The sources describe [1][2]."}
+{"t":"run_done","ms":2923.47,"answer":"The sources describe [1][2]."}
+`
+
+// TestEndToEndWebSearch drives /v1/web_search through the real utls stack
+// against an upstream that answers Brotli-compressed NDJSON — the live wire
+// format. It also proves the startup probe flips healthz to true.
+func TestEndToEndWebSearch(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, 5*time.Second)
+	st.mock.setConfig(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"modelLabel":"Mercury","retrievalAvailable":true,
+		 "limits":{"minFanout":1,"maxFanout":5,"minDepth":1,"maxDepth":3}}`)
+	})
+	st.mock.setSearch(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+		w.Header().Set("Content-Encoding", "br")
+		bw := brotli.NewWriter(w)
+		io.WriteString(bw, searchNDJSON)
+		bw.Close()
+	})
+	st.srvSearch.StartSearchProbe()
+
+	resp, err := http.Post(st.srv.URL+"/v1/web_search", "application/json",
+		strings.NewReader(`{"query":"four-day workweek","config":{"fanout":1,"depth":1,"keep_top_k":3}}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body %s", resp.StatusCode, raw)
+	}
+	var body struct {
+		Object  string   `json:"object"`
+		Queries []string `json:"queries"`
+		Results []struct {
+			URL       string `json:"url"`
+			Title     string `json:"title"`
+			Snippet   string `json:"snippet"`
+			CiteIndex int    `json:"cite_index"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if body.Object != "web_search" || len(body.Queries) != 1 {
+		t.Fatalf("body = %s", raw)
+	}
+	if len(body.Results) != 2 {
+		t.Fatalf("results = %s", raw)
+	}
+	if body.Results[0].Title != "Four-day work week – Parliament of Australia" {
+		t.Fatalf("title not cleaned: %q", body.Results[0].Title)
+	}
+	if body.Results[1].CiteIndex != 2 || body.Results[1].Snippet != "" {
+		t.Fatalf("results[1] = %+v", body.Results[1])
+	}
+
+	// The probe runs in the background; give it a moment to record true.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		h, err := http.Get(st.srv.URL + "/healthz")
+		if err != nil {
+			t.Fatalf("healthz: %v", err)
+		}
+		hb, _ := io.ReadAll(h.Body)
+		h.Body.Close()
+		if strings.Contains(string(hb), `"available":true`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("healthz never reported search availability: %s", hb)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestEndToEndWebSearchUpstream500(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, 5*time.Second)
+	st.mock.setSearch(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, "<html>challenge secret</html>")
+	})
+	resp, err := http.Post(st.srv.URL+"/v1/web_search", "application/json",
+		strings.NewReader(`{"query":"q"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if strings.Contains(string(raw), "secret") {
+		t.Fatalf("upstream body leaked: %s", raw)
 	}
 }
 

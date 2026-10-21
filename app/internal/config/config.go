@@ -26,6 +26,12 @@ type Config struct {
 	IdleTimeout    time.Duration
 	ContextChars   int
 	SessionTimeout time.Duration
+	// SearchTimeout is the /v1/web_search sliding idle watchdog.
+	SearchTimeout time.Duration
+	// SearchConfigCheck enables the one startup /api/search-lab/config probe.
+	SearchConfigCheck bool
+	// SearchProbeTimeout bounds that probe.
+	SearchProbeTimeout time.Duration
 }
 
 // Defaults returns the configuration used when no environment variable is set.
@@ -40,6 +46,10 @@ func Defaults() Config {
 		IdleTimeout:    60 * time.Second,
 		ContextChars:   250_000,
 		SessionTimeout: 15 * time.Second,
+
+		SearchTimeout:      60 * time.Second,
+		SearchConfigCheck:  true,
+		SearchProbeTimeout: 15 * time.Second,
 	}
 }
 
@@ -105,6 +115,22 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if c.SessionTimeout, err = envDuration(getenv, "IL2API_SESSION_TIMEOUT", c.SessionTimeout); err != nil {
 		return Config{}, err
 	}
+	if c.SearchTimeout, err = envDuration(getenv, "IL2API_SEARCH_TIMEOUT", c.SearchTimeout); err != nil {
+		return Config{}, err
+	}
+	if c.SearchProbeTimeout, err = envDuration(getenv, "IL2API_SEARCH_PROBE_TIMEOUT", c.SearchProbeTimeout); err != nil {
+		return Config{}, err
+	}
+	if v := strings.TrimSpace(strings.ToLower(getenv("IL2API_SEARCH_CONFIG_CHECK"))); v != "" {
+		switch v {
+		case "on", "1", "true", "yes":
+			c.SearchConfigCheck = true
+		case "off", "0", "false", "no":
+			c.SearchConfigCheck = false
+		default:
+			return Config{}, fmt.Errorf("config: IL2API_SEARCH_CONFIG_CHECK must be on or off, got %q", v)
+		}
+	}
 
 	if err := c.validate(); err != nil {
 		return Config{}, err
@@ -130,6 +156,12 @@ func (c Config) validate() error {
 	}
 	if c.SessionTimeout <= 0 {
 		return fmt.Errorf("config: IL2API_SESSION_TIMEOUT must be positive, got %s", c.SessionTimeout)
+	}
+	if c.SearchTimeout <= 0 {
+		return fmt.Errorf("config: IL2API_SEARCH_TIMEOUT must be positive, got %s", c.SearchTimeout)
+	}
+	if c.SearchProbeTimeout <= 0 {
+		return fmt.Errorf("config: IL2API_SEARCH_PROBE_TIMEOUT must be positive, got %s", c.SearchProbeTimeout)
 	}
 	if c.ContextChars == 0 || c.ContextChars < -1 {
 		return fmt.Errorf("config: IL2API_CONTEXT_CHARS must be positive or -1 to disable, got %d", c.ContextChars)

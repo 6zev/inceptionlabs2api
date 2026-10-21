@@ -166,3 +166,60 @@ func TestProxyCredentialsDoNotAppearInErrors(t *testing.T) {
 		t.Fatalf("error leaks proxy password: %v", err)
 	}
 }
+
+func TestSearchDefaults(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(envMap(nil))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.SearchTimeout != 60*time.Second {
+		t.Errorf("SearchTimeout = %s, want 60s", cfg.SearchTimeout)
+	}
+	if !cfg.SearchConfigCheck {
+		t.Error("SearchConfigCheck = false, want true by default")
+	}
+	if cfg.SearchProbeTimeout != 15*time.Second {
+		t.Errorf("SearchProbeTimeout = %s, want 15s", cfg.SearchProbeTimeout)
+	}
+}
+
+func TestSearchOverrides(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(envMap(map[string]string{
+		"IL2API_SEARCH_TIMEOUT":       "30s",
+		"IL2API_SEARCH_PROBE_TIMEOUT": "5s",
+		"IL2API_SEARCH_CONFIG_CHECK":  "OFF",
+	}))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.SearchTimeout != 30*time.Second || cfg.SearchProbeTimeout != 5*time.Second {
+		t.Errorf("search durations not applied: %+v", cfg)
+	}
+	if cfg.SearchConfigCheck {
+		t.Error("SearchConfigCheck = true, want false for OFF")
+	}
+}
+
+func TestSearchConfigValidation(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"bad toggle", map[string]string{"IL2API_SEARCH_CONFIG_CHECK": "maybe"}, "on or off"},
+		{"zero search timeout", map[string]string{"IL2API_SEARCH_TIMEOUT": "0s"}, "SEARCH_TIMEOUT"},
+		{"zero probe timeout", map[string]string{"IL2API_SEARCH_PROBE_TIMEOUT": "-1s"}, "SEARCH_PROBE_TIMEOUT"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := FromEnv(envMap(tc.env))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}

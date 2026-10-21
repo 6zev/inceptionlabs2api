@@ -53,13 +53,21 @@ func run() error {
 	up.BindPool(p)
 
 	srv := server.New(server.Config{
-		APIKey:       cfg.APIKey,
-		Model:        cfg.Model,
-		Models:       cfg.Models,
-		ContextChars: cfg.ContextChars,
-		IdleTimeout:  cfg.IdleTimeout,
-		Logf:         logf,
+		APIKey:             cfg.APIKey,
+		Model:              cfg.Model,
+		Models:             cfg.Models,
+		ContextChars:       cfg.ContextChars,
+		IdleTimeout:        cfg.IdleTimeout,
+		SearchTimeout:      cfg.SearchTimeout,
+		SearchProbeTimeout: cfg.SearchProbeTimeout,
+		Logf:               logf,
 	}, up, p)
+	srv.SetSearcher(up)
+	if cfg.SearchConfigCheck {
+		// Background and bounded: a challenged config route must never delay
+		// or fail boot.
+		srv.StartSearchProbe()
+	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr,
