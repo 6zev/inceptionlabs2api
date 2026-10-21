@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -171,6 +172,29 @@ func TestProxyCredentialsDoNotAppearInErrors(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "supersecret") {
 		t.Fatalf("error leaks proxy password: %v", err)
+	}
+}
+
+// The deprecated knob is accepted for deployment compatibility but must not
+// be described anywhere as doing something. The deployment files are part of
+// the contract: shipping a non-zero default in docker-compose would tell an
+// operator a 250 000-character guard exists (SPEC §1.1 says it does not).
+func TestDeploymentFilesDoNotSetTheDeprecatedContextKnob(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"../../../docker-compose.yml", "../../.env.example"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if strings.Contains(trimmed, "IL2API_CONTEXT_CHARS") && !strings.Contains(trimmed, ":-0}") {
+				t.Errorf("%s:%d sets IL2API_CONTEXT_CHARS to a non-zero value: %s", path, i+1, trimmed)
+			}
+		}
 	}
 }
 
