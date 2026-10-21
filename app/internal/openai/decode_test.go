@@ -253,3 +253,10 @@ func TestErrorEnvelopeOmitsEmptyParam(t *testing.T) {
 		t.Error("param should be omitted when empty")
 	}
 }
+
+func TestRequestErrorMessage(t *testing.T) {
+	t.Parallel()
+	if got := Invalid("boom").Error(); got != "boom" {
+		t.Fatalf("Error() = %q", got)
+	}
+}

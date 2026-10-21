@@ -90,6 +90,10 @@ func NewClient(cfg Config) (*Client, pool.Fetcher) {
 	return c, c.FetchSession
 }
 
+// BindPool attaches the token pool the client draws from. It is called once
+// at startup because the pool itself depends on the client's Fetcher.
+func (c *Client) BindPool(p *pool.Pool) { c.pool = p }
+
 // Logf returns the client's logger, used by the server for upstream diagnosis.
 func (c *Client) Logf() func(format string, args ...any) { return c.logf }
 

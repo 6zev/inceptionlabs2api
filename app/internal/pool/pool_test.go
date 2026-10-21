@@ -5,7 +5,6 @@ import (
 	"errors"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -253,13 +252,11 @@ func TestMaintainerRefills(t *testing.T) {
 	t.Parallel()
 	clock := newClock()
 	fc := &fakeCounter{}
-	var errs atomic.Int32
-	ch := make(chan time.Time, 1)
 	cfg := Config{
 		Min: 2, Max: 2, TTL: time.Hour, Interval: time.Hour,
 		Now:          clock.Now,
 		NewTicker:    func(time.Duration) *time.Ticker { return time.NewTicker(time.Hour) },
-		OnFetchError: func(error) { errs.Add(1) },
+		OnFetchError: func(error) {},
 	}
 	p := New(cfg, fc.Fetch)
 	defer p.Close()
@@ -271,8 +268,6 @@ func TestMaintainerRefills(t *testing.T) {
 	if st := p.Stats(); st.Size != 2 {
 		t.Fatalf("size = %d, want 2", st.Size)
 	}
-	_ = ch
-	_ = errs
 }
 
 func TestMaintainerReportsErrors(t *testing.T) {

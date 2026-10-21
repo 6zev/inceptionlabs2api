@@ -124,9 +124,12 @@ func (m *mockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeSessionToken(w http.ResponseWriter, n int) {
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "token": writeSessionTokenValue(n)})
+}
+
+func writeSessionTokenValue(n int) string {
 	sign := strings.Repeat(string(rune('a'+(n%26))), 64)
-	tok := "1792553057." + strings.Repeat("0", 31) + string(rune('a'+(n%26))) + "." + sign
-	json.NewEncoder(w).Encode(map[string]any{"ok": true, "token": tok})
+	return "1792553057." + strings.Repeat("0", 31) + string(rune('a'+(n%26))) + "." + sign
 }
 
 func (m *mockUpstream) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -394,4 +397,32 @@ func TestChatClientCancelKeepsToken(t *testing.T) {
 // openaiText builds a minimal text message.
 func openaiText(text string) openai.TextMessage {
 	return openai.TextMessage{Role: "user", Texts: []string{text}}
+}
+
+func TestStatusErrorString(t *testing.T) {
+	t.Parallel()
+	err := &StatusError{Status: 429, Body: "  challenge  "}
+	if got := err.Error(); !strings.Contains(got, "429") || !strings.Contains(got, "challenge") {
+		t.Fatalf("Error() = %q", got)
+	}
+	long := &StatusError{Status: 500, Body: strings.Repeat("x", 500)}
+	if got := long.Error(); len(got) > 300 {
+		t.Fatalf("Error() should truncate, len = %d", len(got))
+	}
+}
+
+func TestClientLogfAndBindPool(t *testing.T) {
+	t.Parallel()
+	c, _ := NewClient(Config{BaseURL: "https://x"})
+	if c.Logf() == nil {
+		t.Fatal("Logf() = nil")
+	}
+	p := pool.New(pool.Config{Min: 0, Max: 1, TTL: time.Minute}, func(context.Context) (string, error) {
+		return writeSessionTokenValue(1), nil
+	})
+	defer p.Close()
+	c.BindPool(p)
+	if c.pool != p {
+		t.Fatal("BindPool did not attach the pool")
+	}
 }
