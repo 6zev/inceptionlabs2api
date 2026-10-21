@@ -126,6 +126,8 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` 的滑动空闲看门狗（每个 NDJSON 行都会重置） |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`，是否在启动时后台探测一次 `/api/search-lab/config`；`off` 时 `search.available` 恒为 `null` |
 | `IL2API_SEARCH_PROBE_TIMEOUT` | `15s` | 单次启动探测的超时上限 |
+| `IL2API_AUDIO_TIMEOUT` | `120s` | `/api/tts`、`/api/stt` 单次调用的响应头超时 |
+| `IL2API_AUDIO_MAX_BYTES` | `26214400`（25 MiB） | `/v1/audio/transcriptions` 上传上限，超出直接 413，不调用上游 |
 
 完整注释版示例见 [`app/.env.example`](app/.env.example)。
 
@@ -135,6 +137,8 @@ curl -N http://localhost:3000/v1/chat/completions \
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI 兼容，`stream` 可选 |
 | `POST` | `/v1/web_search` | 独立联网搜索，返回查询与来源（见下） |
+| `POST` | `/v1/audio/speech` | OpenAI 语音合成，返回 `audio/mpeg`（见下） |
+| `POST` | `/v1/audio/transcriptions` | OpenAI 语音转写，multipart 上传（见下） |
 | `GET` | `/v1/models` | 返回配置的模型列表 |
 | `OPTIONS` | `/v1/*` | CORS 预检（返回 204） |
 | `GET` | `/healthz` | 存活探针 + 会话池大小 + 清关状态 + 请求计数 |
@@ -238,6 +242,55 @@ JSON——`search.available` 会保持 `null`，绝不会被误读成 `false`）
 > 并用标准库解码 `gzip`；本项目零第三方依赖，没有 Brotli 解码器，因此若中间层
 > 仍强行返回 `br`，会得到一个**明确指出编码**的错误，而不是乱码或静默空结果。
 
+### 语音合成 `POST /v1/audio/speech`
+
+```bash
+curl http://localhost:3000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"model":"tts-1","input":"你好，这是一段语音测试。","voice":"alloy"}' \
+  -o speech.mp3
+```
+
+| 字段 | 行为 |
+|---|---|
+| `input` | **必填**：缺失、非字符串或全空白 → 400（`param:"input"`）。**没有长度上限**，原样交给上游（上游网页端自己截到 5 000 字符） |
+| `voice` | 大小写不敏感。`alloy→sarah`、`echo→chris`、`fable→charlie`、`onyx→chris`、`nova→jessica`、`shimmer→jessica`；上游名 `sarah`/`chris`/`charlie`/`jessica` 原样通过；留空则用上游默认。**其它值 400**，错误信息里列出可用音色 |
+| `response_format` | 接受但忽略：上游只产 MP3，响应**永远是** `audio/mpeg`。要 wav 请客户端自己转 |
+| `speed` | 静默丢弃（上游没有语速参数） |
+| `model` | 接受但忽略（上游只有一个语音引擎） |
+
+响应是**完整**的 MP3（不是分块伪流），带 `Cache-Control: no-store`。网关会把上游
+音频读完再提交响应头，因此上游失败时客户端收到的是标准的 JSON 错误信封，而不是
+半截音频。
+
+音色清单来自 bundle 考古（网页端从不下发音色数组，只有场景配置里的
+`sarah`/`chris`/`charlie`/`jessica`）加上 3 次实测确认：同样文本下三种音色的音频
+字节与时长各不相同（chris 2.09 s / charlie 2.22 s / sarah 2.27 s）。
+
+### 语音转写 `POST /v1/audio/transcriptions`
+
+```bash
+curl http://localhost:3000/v1/audio/transcriptions \
+  -F file=@speech.mp3 -F model=whisper-1
+# {"object":"transcription","text":"你好，这是一段语音测试。"}
+```
+
+> **MP3 专用合约。** 上游 `/api/stt` 只解码真正的 MPEG 音频；WAV（8/16/48 kHz）、
+> WebM 等一律返回 `200 {"text":""}`（静默空结果，不是报错）。网关**不做转码**、
+> 不引入 ffmpeg —— 零第三方依赖优先。上传的字节按原样转发；网关只做一件事：
+> 嗅探开头是不是 `ID3` 或合法 MPEG 帧头，据此把 multipart 分片的
+> `Content-Type` 标成 `audio/mpeg`，否则标成 `application/octet-stream`。
+> 因此**需要转写 WAV/WebM/M4A 的客户端，请在本网关之前自行转成 MP3**。
+> 空文本会原样返回（`{"text":""}`），不会被网关改写成一个错误。
+
+- `file` 必填；缺失、为空或无法解析 → 400（`param:"file"`）。
+- `model` / `language` / `prompt` / `temperature` / `response_format` 等字段静默丢弃
+  （上游不接受这些参数）；响应恒为 OpenAI `json` 形状。
+- 上传上限 `IL2API_AUDIO_MAX_BYTES`（默认 25 MiB），超出 413 且不触达上游。
+- 上游的 `Invalid file type` 等错误会原样翻译为 `502 upstream_error`。
+
+`/healthz` 的 `counters` 新增 `tts` 与 `stt`，分别统计两个音频路由承接的请求数。
+
 ### 错误码
 
 | HTTP | code | 场景 |
@@ -250,6 +303,7 @@ JSON——`search.available` 会保持 `null`，绝不会被误读成 `false`）
 | 503 | `upstream_unavailable` | 会话池为空且不是清关问题 |
 | 503 | `search_unavailable` | 上游 `/api/search-lab/config` 明确报告 `retrievalAvailable:false` |
 | 504 | `upstream_idle_timeout` | 上游超过空闲窗口没有任何事件 |
+| 413 | `request_too_large` | `/v1/audio/transcriptions` 上传超过 `IL2API_AUDIO_MAX_BYTES` |
 
 流式响应一旦发出头部就无法改状态码：中途失败会改为发送一个
 `{"error":{...}}` SSE 帧，随后补 `data: [DONE]`。
