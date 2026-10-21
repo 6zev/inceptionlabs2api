@@ -1084,3 +1084,27 @@ func TestHealthzOmitsClearanceWithoutSource(t *testing.T) {
 		t.Fatal("clearance must be omitted when no source is attached")
 	}
 }
+
+// The mid-stream error frame is the same table as the pre-header envelope
+// (SPEC §3.2): each upstream class maps to its stable code.
+func TestStreamErrorCodes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"idle", upstream.ErrIdleTimeout, openai.CodeUpstreamIdle},
+		{"truncated", upstream.ErrStreamTruncated, openai.CodeUpstreamStream},
+		{"cancel", context.Canceled, openai.CodeUpstreamStream},
+		{"other", errors.New("boom"), openai.CodeUpstreamStream},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := streamError(tc.err).Code; got != tc.code {
+				t.Fatalf("code = %q, want %q", got, tc.code)
+			}
+		})
+	}
+}

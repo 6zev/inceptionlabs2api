@@ -447,23 +447,13 @@ func (c *Clearance) Invalidate() {
 	c.mu.Unlock()
 }
 
-// acquire runs at most one refresh at a time, no matter how many callers, and
-// honours the lazy shortcut: inside a success-cooldown window (a live cookie
-// is held) it is a no-op. It backs Ensure, the request path, where reusing a
-// live cookie beats solving again.
-func (c *Clearance) acquire(ctx context.Context) error {
-	c.mu.Lock()
-	idx := c.emptyLocked()
-	c.mu.Unlock()
-	return c.acquireSlot(ctx, idx, false)
-}
-
-// acquireForce runs the same single-flight acquisition but never takes the
-// lazy shortcut: filling an empty slot or replacing a retired/stale one is an
-// explicit instruction, and the only thing that may stop it is a recorded
-// *failure* inside the cooldown. idx < 0 means "choose a slot".
+// acquireForce runs one single-flight acquisition into a chosen slot. It is
+// the only entry below "replace something": every caller (a challenge replay,
+// a stale slot, a retired slot, the boot fill) is an explicit instruction, and
+// the only thing that may stop it is a recorded *failure* inside the
+// cooldown. idx < 0 means "choose a slot".
 func (c *Clearance) acquireForce(ctx context.Context, idx int) error {
-	return c.acquireSlot(ctx, idx, true)
+	return c.acquireSlot(ctx, idx)
 }
 
 // Refill acquires one cookie into an empty slot, or replaces the oldest slot
@@ -472,7 +462,7 @@ func (c *Clearance) Refill(ctx context.Context) error {
 	c.mu.Lock()
 	idx := c.emptyLocked()
 	c.mu.Unlock()
-	return c.acquireSlot(ctx, idx, true)
+	return c.acquireSlot(ctx, idx)
 }
 
 // emptyLocked returns the index of the first empty slot, or the index of the
@@ -491,9 +481,9 @@ func (c *Clearance) emptyLocked() int {
 	return oldestIdx
 }
 
-// acquireIntoSlot runs at most one acquisition at a time, writing the result
-// into slot idx. force skips the lazy success-cooldown shortcut.
-func (c *Clearance) acquireSlot(ctx context.Context, idx int, force bool) error {
+// acquireSlot runs at most one acquisition at a time, writing the result into
+// slot idx.
+func (c *Clearance) acquireSlot(ctx context.Context, idx int) error {
 	c.mu.Lock()
 	if c.inflight {
 		done := c.inflightDone
@@ -505,7 +495,7 @@ func (c *Clearance) acquireSlot(ctx context.Context, idx int, force bool) error 
 	done := c.inflightDone
 	c.mu.Unlock()
 
-	err := c.refresh(ctx, idx, force)
+	err := c.refresh(ctx, idx)
 
 	c.mu.Lock()
 	c.inflight = false
@@ -545,11 +535,10 @@ func (c *Clearance) wait(ctx context.Context, done chan struct{}) error {
 // than a silent success that would send an unprotected request. A window never
 // follows a successful acquisition, so recovery — a 429 challenge right after
 // a solve — is never blocked.
-func (c *Clearance) refresh(ctx context.Context, idx int, force bool) error {
+func (c *Clearance) refresh(ctx context.Context, idx int) error {
 	now := c.now()
 	c.mu.Lock()
 	last := c.lastAttempt
-	has := c.liveLocked() > 0
 	lastErr := c.lastErr
 	openedByFailure := c.lastFailed
 	c.mu.Unlock()
@@ -560,13 +549,10 @@ func (c *Clearance) refresh(ctx context.Context, idx int, force bool) error {
 		if lastErr != nil && openedByFailure {
 			return fmt.Errorf("%w (retrying in %s)", lastErr, c.cfg.Cooldown-now.Sub(last))
 		}
-		// A server-ordered replacement (a challenge, a half-filled ring) is a
-		// recovery path and is never blocked, exactly like the old single
-		// cookie's 429 replay. A lazy caller inside a window it did not earn
-		// reuses a held cookie rather than solving again.
-		if !force && has {
-			return nil
-		}
+		// The window was opened by a success. Every caller that got here is an
+		// explicit replacement (the lazy "reuse a held cookie" decision lives
+		// in staleLocked), so it proceeds; otherwise a challenge replay inside
+		// the window would be silently skipped.
 	}
 
 	c.mu.Lock()

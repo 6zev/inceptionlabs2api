@@ -82,3 +82,18 @@ func TestTruncateRunesPreservesUTF8(t *testing.T) {
 		}
 	}
 }
+
+func TestClampInt(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ v, want int }{
+		{0, 3},  // unset takes the default
+		{-2, 1}, // below the floor
+		{9, 5},  // above the ceiling
+		{4, 4},  // in range
+	}
+	for _, tc := range cases {
+		if got := ClampInt(tc.v, 1, 5, 3); got != tc.want {
+			t.Errorf("ClampInt(%d, 1, 5, 3) = %d, want %d", tc.v, got, tc.want)
+		}
+	}
+}

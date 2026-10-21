@@ -309,7 +309,7 @@ func (m *mockUpstream) sessions() int {
 func newTestClient(t *testing.T, m *mockUpstream, min int) (*Client, *pool.Pool) {
 	t.Helper()
 	c, fetch := NewClient(Config{
-		BaseURL:        m.baseURL,
+		BaseURL: m.baseURL,
 		// The production default. Acquisition (solve + POST) runs inside this
 		// context, so a short test value turns a slow CI solve into an
 		// unrelated "clearance unavailable" failure.
