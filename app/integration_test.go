@@ -220,6 +220,7 @@ func newStack(t *testing.T, idle time.Duration) *stack {
 		Logf:         func(string, ...any) {},
 	}, c, p)
 	gs.SetSearcher(c)
+	gs.SetClearance(c.Clearance())
 	srv := httptest.NewServer(gs.Handler())
 	t.Cleanup(srv.Close)
 	return &stack{srv: srv, pool: p, client: c, mock: m, srvSearch: gs}
@@ -703,5 +704,81 @@ func TestRunRejectsBadConfig(t *testing.T) {
 	t.Setenv("IL2API_POOL_MAX", "8")
 	if err := run(); err == nil || !strings.Contains(err.Error(), "POOL_MIN") {
 		t.Fatalf("run = %v, want pool config error", err)
+	}
+}
+
+// Boot prewarm: starting the clearance prewarm is immediate, and /healthz
+// reports has_cookie within a second without any chat traffic.
+func TestEndToEndClearancePrewarmAtBoot(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, 5*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	start := time.Now()
+	st.client.StartClearancePrewarm(ctx)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("StartClearancePrewarm blocked for %s", elapsed)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(st.srv.URL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var body struct {
+			Clearance struct {
+				HasCookie    *bool `json:"has_cookie"`
+				RefreshCount int64 `json:"refresh_count"`
+			} `json:"clearance"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode healthz %s: %v", raw, err)
+		}
+		if body.Clearance.HasCookie != nil && *body.Clearance.HasCookie {
+			if body.Clearance.RefreshCount < 1 {
+				t.Fatalf("refresh_count = %d after a cookie appeared", body.Clearance.RefreshCount)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("healthz did not report has_cookie:true within a second of prewarm: %+v", st.client.Clearance().State())
+}
+
+// A refused checkpoint must not make boot or prewarm fail; healthz keeps
+// reporting no cookie.
+func TestEndToEndClearancePrewarmFailureIsTolerated(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, 5*time.Second)
+	st.mock.refuseSubmit.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st.client.StartClearancePrewarm(ctx)
+
+	time.Sleep(300 * time.Millisecond)
+	resp, err := http.Get(st.srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d", resp.StatusCode)
+	}
+	var body struct {
+		OK        bool `json:"ok"`
+		Clearance struct {
+			HasCookie bool `json:"has_cookie"`
+		} `json:"clearance"`
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.OK || body.Clearance.HasCookie {
+		t.Fatalf("healthz after a refused prewarm = %s", raw)
 	}
 }

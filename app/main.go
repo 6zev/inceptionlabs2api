@@ -54,6 +54,13 @@ func run() error {
 	defer p.Close()
 	up.BindPool(p)
 
+	// Prewarm clearance and keep it fresh from boot, so the first chat request
+	// does not pay the PoW + round trip and /healthz reports a cookie within
+	// about a second (SPEC §2.1.1). Non-blocking; failures are logged.
+	bootCtx, stopBoot := context.WithCancel(context.Background())
+	defer stopBoot()
+	up.StartClearancePrewarm(bootCtx)
+
 	srv := server.New(server.Config{
 		APIKey:             cfg.APIKey,
 		Model:              cfg.Model,

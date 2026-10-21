@@ -153,6 +153,20 @@ func (c *Client) Logf() func(format string, args ...any) { return c.logf }
 // Clearance exposes the clearance state for /healthz.
 func (c *Client) Clearance() *clear.Clearance { return c.clear }
 
+// clearanceLoopInterval is how often the refresh loop checks cookie age. It
+// is short relative to the 60-minute TTL, so the proactive refresh happens
+// close to the configured margin without needing a precise timer.
+const clearanceLoopInterval = time.Minute
+
+// StartClearancePrewarm acquires the clearance cookie in the background at
+// boot and keeps it fresh from then on (SPEC §2.1.1). It never blocks and
+// never fails boot: an acquisition error is logged and the ordinary lazy
+// request paths retry. The loop stops when ctx is cancelled.
+func (c *Client) StartClearancePrewarm(ctx context.Context) {
+	c.clear.Prewarm(ctx)
+	go c.clear.RunRefreshLoop(ctx, clearanceLoopInterval)
+}
+
 // applyClearance sets the shared UA and the clearance cookie on req.
 func (c *Client) applyClearance(req *http.Request) {
 	ua, cookie := c.clear.Header()

@@ -201,6 +201,50 @@ func (c *Clearance) Refresh(ctx context.Context) error {
 	return c.acquire(ctx)
 }
 
+// Prewarm starts one clearance acquisition in the background and returns
+// immediately. Boot calls it so the first request does not pay the solve and
+// network round trip (SPEC §2.1.1); a failure is logged and left to the
+// ordinary lazy path (Ensure on the next request, Refresh on a challenge).
+// The goroutine is bounded by the acquisition timeout it inherits.
+func (c *Clearance) Prewarm(ctx context.Context) {
+	go func() {
+		if err := c.Ensure(ctx); err != nil {
+			c.logf("clear: prewarm failed (requests will retry lazily): %v", err)
+		}
+	}()
+}
+
+// RunRefreshLoop keeps a held cookie fresh from boot, checking at every tick
+// whether it has reached the configured refresh age and replacing it if so.
+// It only maintains a cookie it already holds: when none exists (an egress
+// that is never challenged, or a failed prewarm) it does nothing, because
+// Ensure is the path that retries acquisition and prewarm already ran once.
+//
+// It blocks until ctx is cancelled. Callers run it in a goroutine next to
+// Prewarm.
+func (c *Clearance) RunRefreshLoop(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		every = time.Minute
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// Ensure is a no-op while the cookie is fresh; it refreshes
+			// exactly when the age reaches the margin, from boot onwards.
+			if c.Cookie() == "" {
+				continue
+			}
+			if err := c.Ensure(ctx); err != nil {
+				c.logf("clear: proactive refresh failed: %v", err)
+			}
+		}
+	}
+}
+
 // Invalidate forgets the cookie so the next Ensure acquires a fresh one.
 func (c *Clearance) Invalidate() {
 	c.mu.Lock()
