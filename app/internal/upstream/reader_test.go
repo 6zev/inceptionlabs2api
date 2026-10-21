@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -238,4 +239,46 @@ func TestEventAccessors(t *testing.T) {
 	if (Event{Type: EventReasoningStart}).Reasoning() != "" {
 		t.Fatal("reasoning-start should contribute nothing")
 	}
+}
+
+// TestReaderOnCapturedHardStream replays the 18 events of the real hard
+// reasoning stream captured in the audit (testdata/hard_stream.sse).
+func TestReaderOnCapturedHardStream(t *testing.T) {
+	t.Parallel()
+	f, err := os.Open("testdata/hard_stream.sse")
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	defer f.Close()
+
+	var reasoning, content strings.Builder
+	var types []string
+	err = NewReader(f, 5*time.Second, nil).Read(context.Background(), func(ev Event) error {
+		types = append(types, ev.Type)
+		reasoning.WriteString(ev.Reasoning())
+		content.WriteString(ev.ContentText())
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !strings.HasPrefix(reasoning.String(), "Analyzing prime congruences to determine possible p values.\n") {
+		t.Fatalf("reasoning = %q", reasoning.String())
+	}
+	if strings.Count(reasoning.String(), "Analyzing") != 4 {
+		t.Fatalf("expected 4 reasoning deltas, got %q", reasoning.String())
+	}
+	if !strings.Contains(content.String(), "Twin Prime Conjecture") {
+		t.Fatalf("content missing: %q", truncateForTest(content.String(), 80))
+	}
+	if types[0] != EventReasoningStart || types[len(types)-1] != EventTextEnd {
+		t.Fatalf("event order = %v", types)
+	}
+}
+
+func truncateForTest(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -815,5 +816,52 @@ func TestModelsMethodNotAllowed(t *testing.T) {
 	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/models", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+// TestStreamOnCapturedHardStream replays the real 18-event hard reasoning
+// stream (audit capture) through the HTTP handler and asserts the ordering
+// that fixes the 17.5 s zero-byte TTFT: reasoning frames arrive before any
+// content frame, and no frame is lost.
+func TestStreamOnCapturedHardStream(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("../upstream/testdata/hard_stream.sse")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return streamOf(string(raw)), nil }}
+	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","stream":true,"reasoning_effort":"high","messages":[{"role":"user","content":"prove it"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	frames := sseFrames(t, rec.Body.String())
+
+	var reasoningFrames, contentFrames int
+	firstContent := -1
+	lastReasoning := -1
+	for i, f := range frames {
+		if f == "[DONE]" {
+			continue
+		}
+		c := decodeChunk(t, f)
+		if c.Choices[0].Delta.ReasoningContent != "" {
+			reasoningFrames++
+			lastReasoning = i
+		}
+		if c.Choices[0].Delta.Content != "" {
+			contentFrames++
+			if firstContent < 0 {
+				firstContent = i
+			}
+		}
+	}
+	if reasoningFrames != 4 {
+		t.Fatalf("reasoning frames = %d, want 4", reasoningFrames)
+	}
+	if contentFrames != 10 {
+		t.Fatalf("content frames = %d, want 10 text deltas", contentFrames)
+	}
+	if lastReasoning > firstContent {
+		t.Fatalf("reasoning frame %d arrived after content frame %d", lastReasoning, firstContent)
 	}
 }
