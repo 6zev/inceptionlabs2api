@@ -12,18 +12,25 @@ A minimal Go gateway that exposes the anonymous Inception Chat web endpoint
 OpenAI-compatible Chat Completions API.
 
 **In scope:** anonymous session acquisition, a small token pool,
-`POST /v1/chat/completions` (stream and non-stream), `GET /v1/models`,
+`POST /v1/chat/completions` (stream and non-stream),
+`POST /v1/web_search` (standalone retrieval, §2.3 / §7.1), `GET /v1/models`,
 `GET /healthz`, optional bearer-key auth, OpenAI-shaped errors, a 250k-character
 input guard, a 60 s sliding idle watchdog, and a disconnect-safe pool.
 
 **Out of scope, deliberately:** usage/token accounting (upstream publishes
 none; the field is omitted rather than fabricated), tool calling (no prompt
-injection, no XML reassembler, no tool_choice), web search (`source-url`
-events are ignored), admin UI, and persistence. CORS preflight is answered so
-browser clients can call the keyed API.
+injection, no XML reassembler, no tool_choice), inline web search inside
+`/api/chat` (`webSearchEnabled` is pinned off and `source-url` events are
+ignored; the standalone endpoint is the supported search surface; the
+`__searching__` / `__search_error__` sentinel titles are never reproduced),
+the synthesized answer from `/api/search-lab/run` (only its sources are
+bridged), admin UI, and persistence. CORS preflight is answered so browser
+clients can call the keyed API.
 
 The project must remain a single static binary with one non-test external
-dependency (`utls`).
+dependency (`utls`). Brotli decoding (defensive, §2.3.2) uses the
+`andybalholm/brotli` module already present transitively via `utls`; it is
+promoted to a direct dependency but adds no new module to the build.
 
 ## 2. Upstream protocol (ground truth from the audit)
 
@@ -83,7 +90,7 @@ Observed event vocabulary (the complete set):
 | `text-start` | `id`, optional `text` | a text block opens; `text` is a full snapshot |
 | `text-delta` | `id`, `delta` | incremental answer text |
 | `text-end` | `id` | block closes |
-| `source-url` | `sourceId`, `url`, `title` | web search citation (ignored) |
+| `source-url` | `sourceId`, `url`, `title` | web search citation or sentinel (ignored) |
 | `[DONE]` | — | normal end |
 
 There are no `usage`, `finish-*`, `tool-*`, or `error` events. Multiple
@@ -95,6 +102,79 @@ forwarded.
 
 Unknown event types and malformed `data:` lines are skipped and logged, never
 fatal.
+
+## 2.3 Standalone web search — `/api/search-lab/run`
+
+The `/search` playground is backed by a standalone retrieval pipeline that is
+callable without `/api/chat` (research: `docs/RESEARCH-websearch.md` §4).
+
+### 2.3.1 Discovery
+
+```
+GET /api/search-lab/config
+-> 200 {"modelLabel":"Mercury","retrievalAvailable":true,
+        "defaults":{"fanout":4,"depth":2,"keepTopK":5,"effort":"instant"},
+        "limits":{"minFanout":1,"maxFanout":5,"minDepth":1,"maxDepth":3}}
+```
+
+`retrievalAvailable:false` is the deployment kill-switch. `limits` publishes
+ranges for `fanout` and `depth` only; `keepTopK` has no documented range and
+`effort` is verified only for `instant`.
+
+### 2.3.2 Run
+
+```
+POST /api/search-lab/run
+x-session-token: <token>            (recommended, not proven required)
+Accept-Encoding: identity           (MUST — see below)
+Content-Type: application/json
+
+{"query":"...","config":{"fanout":3,"depth":1,"keepTopK":10,"effort":"instant"},
+ "timezone":"UTC","language":"en-US"}
+```
+
+`effort: "instant"` is the only value the playground exercises and the only
+one verified live; `fast` / `deep` are accepted pass-throughs.
+
+Response: `application/x-ndjson; charset=utf-8`, one JSON object per line.
+Observed event vocabulary (`t` discriminator; unknown fields ignored):
+
+| `t` | Fields used | Meaning |
+|---|---|---|
+| `run_start` | `config` | run accepted |
+| `call_start` | `kind`, `round`, `llm` | a pipeline stage begins (`plan`, `retrieve`, `rerank`, `followup`, `synthesize`) |
+| `call_end` | `failed?`, `reason?` | stage ends (token counts are deliberately ignored) |
+| `queries` | `queries: string[]` | plan / follow-up rewritten queries |
+| `round_start` | `round`, `of`, `queries` | retrieval round begins |
+| `candidates` | `count`, `fresh?` | documents retrieved before rerank |
+| `docs` | `retrieved`, `kept`, `sources:[{title,url,score}]` | ranked, deduped sources |
+| `rounds` | `run`, `of`, `stoppedEarly` | round accounting |
+| `answer_first_token` | `ms` | synthesis TTFT |
+| `answer_delta` | `d` | incremental synthesized answer |
+| `run_done` | `ms`, `answer` | terminal success |
+| `error` | `message` | terminal failure |
+
+Terminal semantics: `run_done` or `error`. The body ending without either is a
+truncation, never a success.
+
+**Brotli trap.** The upstream returns `content-encoding: br` unless the client
+advertises `identity`. Go's `net/http` does not decompress Brotli, so the
+client sends `Accept-Encoding: identity` and *additionally* decodes a `br`
+body defensively (some intermediaries re-compress). A `Content-Encoding`
+other than `identity`/`br` is a typed error rather than mojibake.
+
+**Snippets.** `docs.sources[]` carries only `title`, `url`, `score`; there is
+no per-source snippet anywhere in the NDJSON — neither `docs` nor the
+synthesis stage adds one. The gateway therefore returns `snippet: ""` and
+does **not** wait for `run_done`: the run is done as soon as `docs` arrives
+(latency and several LLM calls saved). This is an honest empty field, not a
+truncation. The SYNTHESIZE answer is discarded.
+
+**Titles** are raw upstream text with newlines and tab runs
+(`"\n\tFour-day work week\n \n – …"`); they are whitespace-collapsed and
+trimmed. Entries with an empty `url` are dropped. `cite_index` is assigned
+`1..N` in `docs` rank order, matching the bracket citations `[1][2][3]` in the
+upstream's synthesized answer.
 
 ## 3. Wire format — OpenAI Chat Completions
 
@@ -143,7 +223,10 @@ Every frame carries `id` (`chatcmpl-<12 hex>`, stable per request), `object:
 `choices:[{index:0,delta:...,finish_reason:null|"stop",logprobs:null}]`.
 
 `finish_reason` is `"stop"` when the upstream stream ends normally and is
-never `"length"` (there is no output cap). `source-url` events are ignored.
+never `"length"` (there is no output cap). `source-url` events are ignored,
+including the reserved `__searching__` / `__search_error__` sentinel titles
+(the chat request pins `webSearchEnabled:false`, so they should never appear;
+if the upstream emits them anyway, they are dropped like any other source).
 `reasoning-start` / `reasoning-end` / `text-end` produce no frame of their
 own.
 
@@ -282,8 +365,66 @@ Token = `{unix_ts}.{32 hex}.{64 hex}`; shape is validated at acquisition.
 | Route | Method | Auth | Behaviour |
 |---|---|---|---|
 | `/v1/chat/completions` | POST | yes | §3 |
+| `/v1/web_search` | POST | yes | §7.1 |
 | `/v1/models` | GET | yes | static list, `{object:"list",data:[{id,object:"model",created,owned_by:"inceptionlabs"}]}` |
-| `/healthz` | GET/HEAD | no | `{"ok":true,"pool":{"size","min","max"},"counters":{...}}` |
+| `/healthz` | GET/HEAD | no | `{"ok":true,"pool":{"size","min","max"},"search":{"available":bool|null},"counters":{...}}` |
+
+### 7.1 `POST /v1/web_search`
+
+Bridges §2.3 into the response contract used by Sliverkiss/simple-chat
+(`app/internal/server/websearch_endpoint_test.go`), so a client written for
+that gateway can switch base URL without changing its parser:
+
+```json
+// request
+{"query": "latest tech news",
+ "config": {"fanout": 1, "depth": 1, "keep_top_k": 3, "effort": "instant"}}
+```
+
+`config` is optional. `fanout` defaults to `3`, `depth` to `1`, `keep_top_k`
+to `10`, `effort` to `instant`; `fanout`/`depth` are clamped to the upstream's
+published 1–5 / 1–3 ranges, `keep_top_k` to 1–50, and `effort` must be
+`instant` / `fast` / `deep` (unknown values are a 400 naming the field).
+Unknown top-level keys are a 400 (`unsupported_parameter`), matching the chat
+path's no-silent-drops policy. An empty or whitespace-only `query`, or a
+`query` longer than 2000 characters, is a 400.
+
+Response (200):
+
+```json
+{"object": "web_search",
+ "queries": ["four-day workweek trial results countries"],
+ "results": [{"url": "https://…", "title": "…", "snippet": "", "cite_index": 1}]}
+```
+
+- `queries` is every query from every `queries` event, in arrival order and
+  deduplicated; empty arrays are `[]`, never `null`.
+- `results` is the `docs` source list in rank order; `snippet` is always `""`
+  (§2.3.2) and `cite_index` is `1..N`.
+- No results is `200` with `"results":[]` — an honest empty list, not an
+  error and not a retry.
+- The endpoint is stateless and never streams; the whole NDJSON run is
+  consumed under one request.
+
+Error mapping (same envelope and codes as chat):
+
+| Condition | HTTP | code |
+|---|---|---|
+| malformed JSON / missing / empty / over-long `query` / bad `config` | 400 | `invalid_request_error` (`unsupported_parameter` for unknown keys) |
+| method not allowed | 405 | `method_not_allowed` |
+| pool empty | 503 | `upstream_unavailable` |
+| `retrievalAvailable:false` (cached config probe) | 503 | `search_unavailable` |
+| upstream non-200 | 502 | `upstream_error` |
+| terminal NDJSON `error` event | 502 | `upstream_error` (upstream message logged, generic text returned) |
+| NDJSON body ends without `docs`/`error` | 502 | `upstream_stream_error` |
+| sliding 60 s idle watchdog (any line resets it) | 504 | `upstream_idle_timeout` |
+
+`/healthz` gains `search.available`: `true` / `false` from the last
+`/api/search-lab/config` probe, `null` before the first one completes or when
+probing is disabled. The probe runs once at startup in a background goroutine
+(bounded by `IL2API_SEARCH_PROBE_TIMEOUT`, default 15 s) and therefore never
+blocks boot; a failed probe leaves the value `null` and does not disable the
+endpoint. `IL2API_SEARCH_CONFIG_CHECK=off` skips the probe entirely.
 
 Auth: when `IL2API_API_KEY` is non-empty, require
 `Authorization: Bearer <key>` or `X-Api-Key: <key>`; comparison is
@@ -310,6 +451,9 @@ rides a custom header). CORS runs outside auth so preflights are answerable.
 | `IL2API_IDLE_TIMEOUT` | `60s` | stream idle watchdog |
 | `IL2API_CONTEXT_CHARS` | `250000` | input character guard; `-1` disables |
 | `IL2API_SESSION_TIMEOUT` | `15s` | single `/api/session` fetch timeout |
+| `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` sliding idle watchdog (the same window the chat path uses for `IL2API_IDLE_TIMEOUT`) |
+| `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`; `off` skips the startup `/api/search-lab/config` probe (`search.available` stays `null`) |
+| `IL2API_SEARCH_PROBE_TIMEOUT` | `15s` | bound on the one startup config probe |
 
 Invalid values are startup errors with an actionable message.
 
@@ -324,6 +468,13 @@ Invalid values are startup errors with an actionable message.
   upstream, covering streaming framing, reasoning ordering, multi-block
   streams, snapshot text, mid-stream failure, idle timeout, auth, the context
   guard, and client disconnect.
+- Web search is tested entirely against an `httptest` NDJSON mock: the full
+  plan → retrieve → rerank → docs pipeline, a Brotli-encoded body, a missing
+  `docs` event, a terminal `error` event, truncation, upstream non-200,
+  `retrievalAvailable:false`, the sliding idle watchdog, and the startup
+  config probe (success, failure, disabled). No live probing is performed
+  from this host: the plain transport is Vercel-challenged (see §1.2 of the
+  research doc), so live verification is out of scope by design.
 - Target: ≥80 % statement coverage over `app/internal/...` and `app/main.go`
   helpers. Every commit passes `go build ./... && go vet ./... && go test ./...`.
 
