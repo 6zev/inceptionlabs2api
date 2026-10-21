@@ -501,6 +501,11 @@ func TestSearchBoundsCountRunesNotBytes(t *testing.T) {
 	}
 }
 
+// The source cap is a resource bound on the gateway's own response, not a
+// request-side policy (§1.1, §2.3.2): a hostile upstream must not be able to
+// grow the retained list without limit, but a real run is never near 50.
+// The cap is set so far above any plausible run that it is invisible; the
+// previous 50 is kept as the documented bound.
 func TestSearchCapsSourceCount(t *testing.T) {
 	t.Parallel()
 	parts := make([]string, 0, maxCollectedSources+20)
@@ -517,7 +522,33 @@ func TestSearchCapsSourceCount(t *testing.T) {
 		t.Fatalf("Search: %v", err)
 	}
 	if len(res.Sources) != maxCollectedSources {
-		t.Fatalf("sources = %d, want capped at %d", len(res.Sources), maxCollectedSources)
+		t.Fatalf("sources = %d, want bounded at %d", len(res.Sources), maxCollectedSources)
+	}
+}
+
+// Under the bound nothing is dropped: the upstream's list is passed through in
+// rank order, however long it is within the documented retention limit.
+func TestSearchKeepsEverySourceUnderTheBound(t *testing.T) {
+	t.Parallel()
+	const n = 40
+	parts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		parts = append(parts, `{"title":"t`+strconv.Itoa(i)+`","url":"https://x.example/`+strconv.Itoa(i)+`"}`)
+	}
+	m := startUpstream(t)
+	m.searchHandler = func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"t":"docs","sources":[`+strings.Join(parts, ",")+`]}`+"\n")
+	}
+	c, _ := newTestClient(t, m, 1)
+	res, err := c.Search(context.Background(), &SearchRequest{Query: "q"}, time.Second)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res.Sources) != n {
+		t.Fatalf("sources = %d, want all %d passed through", len(res.Sources), n)
+	}
+	if res.Sources[n-1].URL != "https://x.example/"+strconv.Itoa(n-1) {
+		t.Fatalf("rank order changed: last = %q", res.Sources[n-1].URL)
 	}
 }
 
