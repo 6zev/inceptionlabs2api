@@ -14,8 +14,8 @@ OpenAI-compatible Chat Completions API.
 **In scope:** anonymous session acquisition, a small token pool,
 `POST /v1/chat/completions` (stream and non-stream),
 `POST /v1/web_search` (standalone retrieval, §2.3 / §7.1), `GET /v1/models`,
-`GET /healthz`, optional bearer-key auth, OpenAI-shaped errors, a 250k-character
-input guard, a 60 s sliding idle watchdog, and a disconnect-safe pool.
+`GET /healthz`, optional bearer-key auth, OpenAI-shaped errors, a 60 s sliding
+idle watchdog, and a disconnect-safe pool.
 
 **Out of scope, deliberately:** usage/token accounting (upstream publishes
 none; the field is omitted rather than fabricated), tool calling (no prompt
@@ -27,10 +27,58 @@ the synthesized answer from `/api/search-lab/run` (only its sources are
 bridged), admin UI, and persistence. CORS preflight is answered so browser
 clients can call the keyed API.
 
-The project must remain a single static binary with one non-test external
-dependency (`utls`). Brotli decoding (defensive, §2.3.2) uses the
-`andybalholm/brotli` module already present transitively via `utls`; it is
-promoted to a direct dependency but adds no new module to the build.
+The project is a single static binary with **zero non-stdlib dependencies**
+(`go.mod` has no `require` block). See §1.1 for the pass-through philosophy
+that constrains how much the gateway is allowed to validate.
+
+## 1.1 Pass-through philosophy
+
+The gateway is a **translator**, not a second product owner. The upstream is the
+authority on what a Mercury request may contain: its limits, its parameter
+semantics, and its error messages. Whenever the gateway rejects a request the
+upstream could have answered, the gateway has invented a policy the user did not
+ask for and broken clients that were previously innocent.
+
+The gateway therefore rejects **only** these three classes:
+
+1. **Unparseable transport payloads** — malformed JSON, trailing data after the
+   request object, a body that is not a JSON object. There is nothing to
+   translate, so there is nothing to forward.
+2. **Structurally invalid requests** — a missing/empty `model`, missing/empty
+   `messages`, a message with no renderable text at all, or a JSON value of the
+   wrong type where the wire format requires one (e.g. `messages` not an array).
+3. **Auth failures** — a missing or wrong API key when one is configured.
+
+Everything else **flows upstream**, and the upstream's answer is translated
+unchanged in message and content into the OpenAI error envelope.
+
+Explicitly **not** validated (dropped, coerced, or passed through):
+
+| Input | Behaviour | Rationale |
+|---|---|---|
+| `temperature`, `top_p`, `n`, `logprobs`, `top_logprobs`, `stop`, `presence_penalty`, `frequency_penalty`, `seed`, `user`, `response_format`, `stream_options`, `logit_bias`, `parallel_tool_calls`, any other unknown top-level key | **silently dropped** | The upstream has no equivalent field. OpenAI SDKs send these on every ordinary call; a 400 would break them over a field that changes nothing. |
+| `tools`, `tool_choice`, `functions`, `function_call` | **dropped**; the request proceeds as plain chat | Tool calling is out of scope, but a caller that offers tools can still get an answer without them. |
+| `messages[].tool_calls` / `function_call` | **dropped** | Assistant history produced by another tool-using agent is just text here. |
+| `role:"tool"` / `role:"function"` | **coerced to `user`** | The tool result is text the model may find useful; erroring discards context the caller explicitly supplied. |
+| Unknown roles | **coerced to `user`** | Same reasoning; the upstream would reject anything it truly cannot use. |
+| `reasoning_effort` outside `low|medium|high` (incl. `minimal`) | **passed through** to the upstream after mapping `minimal→low` | The upstream owns its enum. |
+| `content` parts other than `text` (`image_url`, `input_audio`, `file`, …) | text parts are kept; media parts are **rendered as a short text placeholder** so they are visible to the model, never a 400 | The upstream is text-only; the caller's intent survives as text. |
+| Input length | **passed through**; no client-side 400 | The upstream truncates at its own context limit. That is the upstream's contract. |
+| `/v1/web_search` unknown keys, out-of-range `fanout`/`depth`/`keep_top_k`, unknown `effort` | unknown keys **dropped**; numeric values **clamped** to the upstream's published ranges; `effort` **passed through** | The upstream answers what it can. |
+
+What is **kept** because it is genuine gateway safety, not second-guessing
+upstream policy:
+
+- API-key auth (constant-time compare), CORS preflight, method routing.
+- A generous request-body cap (`6 MiB`) that exists only to stop unbounded
+  memory use, and is far above any request the upstream itself accepts.
+- Request timeouts, the sliding idle watchdog, the disconnect-safe pool, the
+  redirect policy that keeps `x-session-token` on-origin.
+- Structural message checks: a message whose content yields **no** text at all
+  is a 400, because the upstream wire format cannot represent it meaningfully.
+- Upstream → OpenAI error mapping. A non-200 from `/api/chat` is surfaced as a
+  502 with the upstream's message preserved (truncated for logs, but the client
+  message names the upstream status); HTML challenge bodies are never echoed.
 
 ## 2. Upstream protocol (ground truth from the audit)
 
@@ -41,15 +89,89 @@ GET https://chat.inceptionlabs.ai/api/session
 -> 200 {"ok":true,"token":"<unix_ts>.<32 hex>.<64 hex>"}
 ```
 
-The transport is a `utls` Chrome client hello with ALPN forced to `http/1.1`
-only: Vercel's bot challenge rejects the HTTP/2 JA4 on some networks. Tokens
-are free, IP-unbound, and carry an embedded issue timestamp. They are sent on
-chat requests as `x-session-token`.
+Tokens are free, IP-unbound, and carry an embedded issue timestamp. They are
+sent on chat requests as `x-session-token`.
 
-The audit's P0 caveat applies: from some egress IPs `/api/session` answers
-`429` with a Vercel HTML challenge even with the fingerprint transport. The
-gateway must therefore **not** fail to boot when the pool cannot be filled; it
-serves `503 upstream_unavailable` until a token can be acquired.
+Every request (session fetch, chat, search, and clearance acquisition) goes
+through **one stdlib `http.Transport`** with `ForceAttemptHTTP2: true`, the
+shared Chrome UA, and the `_vcrcs` clearance cookie when one is held. See §2.1.1
+for the Vercel checkpoint bypass and §6 for the transport construction.
+
+The gateway must **not** fail to boot when the pool cannot be filled; it serves
+`503 upstream_unavailable` until a token can be acquired.
+
+### 2.1.1 Vercel Security Checkpoint — `_vcrcs` clearance (proven design)
+
+Ground truth: `/root/vercel-bypass/REPORT.md` and its working PoC
+(`/root/vercel-bypass/poc/main.go`). The live edge answers
+`429 + x-vercel-mitigated: challenge` unless **all** of the following hold:
+
+| Condition | Notes |
+|---|---|
+| `_vcrcs` clearance cookie | `HttpOnly; Secure; SameSite=None; Max-Age=3600`; bound to (egress IP, UA, HTTP/2) |
+| Chrome UA matching the one that solved | UA is part of the cookie binding |
+| **HTTP/2** | h1.1 with a valid cookie is still answered `429`; this is protocol-level, not TLS-stack-level |
+
+Not required (verified in 19 probes): `sec-ch-ua*`, `sec-fetch-*`, `referer`,
+`accept-language`, header order, any other cookie, the telemetry body, a
+warm-up GET of `/`, or any particular TLS fingerprint. Plain `crypto/tls` with
+ALPN `h2` — i.e. a stock Go transport — is sufficient.
+
+**The earlier design was wrong and is deleted.** The project used a `utls`
+Chrome ClientHello with ALPN forced to `http/1.1` because the challenge was
+believed to reject HTTP/2. The opposite is true: forcing h1.1 is precisely what
+makes the edge re-issue a challenge on every request, so the gateway could
+never hold a successful clearance. `utls`, `internal/fp`, the ALPN override,
+and `DisableKeepAlives` are gone; `go.mod` has zero dependencies.
+
+**Acquisition** (`internal/clear`), run lazily the first time a request needs
+it, and again when the cookie is old:
+
+```
+GET  <base>/api/session                                  -> 429 + x-vercel-challenge-token
+solve token locally (v2 PoW, below)                      ~70–100 ms CPU, no network
+POST <base>/.well-known/vercel/security/request-challenge -> 204 + Set-Cookie: _vcrcs=… (3600 s)
+```
+
+The token format is
+`<version>.<seed>.<ttl>.<base64(payload)>.<signature>`, where
+`payload = <id>;<prefix>;<target>;<rounds>;<binary>`. For round `i`:
+
+```
+h_i      = 16 lowercase hex chars (any value; a counter nonce is fine)
+digest_i = sha256(prefix || h_i) as 64 lowercase hex
+require  digest_i starts with target[offset_i : offset_i+4]
+next     target = digest_i[offset_{i+1} : offset_{i+1}+4]
+
+offset_0   = (seed * M[seed mod 5]) mod 36
+offset_i+1 = (seed * M[i mod 5])     mod 60
+M = [498787, 533737, 619763, 708403, 828071]
+```
+
+The solution is `h_0;h_1;…;h_{n-1}` and is submitted with
+`x-vercel-challenge-token`, `x-vercel-challenge-solution`,
+`x-vercel-challenge-version: 2`. The solver is ported verbatim from the PoC
+together with its captured-fixture tests (a real Chromium token/solution pair
+must verify offline).
+
+**Lifecycle.** One `Clearance` value per client, mutex-guarded, single-flight:
+
+- `Header() (ua, cookie)` is consulted on every upstream request; empty cookie
+  means "none held yet".
+- `Refresh(ctx)` runs `GET → solve → POST` and stores the cookie with its
+  issue time. It refuses to start another refresh within a 15 s cooldown per
+  client, so a challenged burst cannot become a solve storm.
+- The cookie is refreshed **proactively at 45 min of its 60 min TTL**.
+- On a `429` carrying `x-vercel-mitigated: challenge` (or a challenge token
+  header) the request is retried **once** after a forced refresh. A `403`
+  challenge is surfaced, not retried: that means the PoW itself was rejected
+  (version drift) and looping cannot fix it.
+- Acquisition shares the client's `*http.Transport`, so it egresses through the
+  configured proxy exactly like ordinary requests; the cookie is IP-bound, so
+  this is mandatory, not an optimisation.
+
+**Observability.** `/healthz` reports
+`clearance: {has_cookie, age_seconds, refresh_count}`.
 
 ### 2.2 Chat
 
@@ -158,10 +280,12 @@ Terminal semantics: `run_done` or `error`. The body ending without either is a
 truncation, never a success.
 
 **Brotli trap.** The upstream returns `content-encoding: br` unless the client
-advertises `identity`. Go's `net/http` does not decompress Brotli, so the
-client sends `Accept-Encoding: identity` and *additionally* decodes a `br`
-body defensively (some intermediaries re-compress). A `Content-Encoding`
-other than `identity`/`br` is a typed error rather than mojibake.
+advertises `identity`. The stdlib has no Brotli decoder and the project has no
+third-party dependencies, so the client sends `Accept-Encoding: identity` and
+decodes `gzip` (stdlib, defensive against intermediaries) normally. A `br`
+body is a typed error naming the encoding rather than mojibake — this is the
+one case where a documented upstream capability falls outside a zero-dependency
+build; `identity` has been sufficient on every observed run.
 
 **Snippets.** `docs.sources[]` carries only `title`, `url`, `score`; there is
 no per-source snippet anywhere in the NDJSON — neither `docs` nor the
@@ -196,26 +320,26 @@ keep-alive line per window cannot pin a request forever.
 
 ### 3.1 Request
 
-Decoded fields (the only accepted keys):
+Decoded fields:
 
 | Key | Handling |
 |---|---|
 | `model` | required; must be in the configured model list, else `404 model_not_found` |
 | `messages` | required, non-empty; see §4 |
 | `stream` | optional bool, default false |
-| `reasoning_effort` | optional `low` / `medium` / `high`, default `medium`; mapped to upstream `reasoningEffort` |
+| `reasoning_effort` | optional; `minimal` maps to `low`; anything else is passed through; default `medium` |
 
-Every other top-level key is rejected with HTTP 400, `type:
-invalid_request_error`, `code: unsupported_parameter`, and a message that
-lists **all** offending keys plus the supported set. This is the explicit,
-honest behaviour requested by the task (the audit found silent drops are
-worse). `tools`, `tool_choice`, `functions`, and `function_call` get an
-additional clause naming tool calling as unsupported.
+Every other top-level key is **silently dropped** (§1.1). That includes
+`temperature`, `top_p`, `n`, `stop`, `logprobs`, `response_format`,
+`presence_penalty`, `frequency_penalty`, `seed`, `user`, `stream_options`,
+`tools`, `tool_choice`, `functions`, and `function_call`. A `tools` request is
+answered as plain chat: tool calling is out of scope, so the tools are not
+forwarded and no tool call is ever emitted.
 
-The request body is capped at 2 MiB (`http.MaxBytesReader`); the 250k-character
-guard means real requests stay far below it. Text parts are capped at 4096 per
-request and empty text parts are rejected, so a part flood cannot bypass the
-guard.
+The request body is capped at 6 MiB (`http.MaxBytesReader`). The cap exists
+only to bound memory; it is far above any request the upstream accepts and is
+not a substitute for the upstream's context limit. There is no client-side
+length guard and no text-part count limit.
 
 ### 3.2 Response — streaming
 
@@ -286,11 +410,8 @@ All non-streaming errors use OpenAI's envelope:
 
 | Condition | HTTP | type | code |
 |---|---|---|---|
-| malformed JSON / bad field value | 400 | `invalid_request_error` | `invalid_request_error` |
-| unsupported parameter | 400 | `invalid_request_error` | `unsupported_parameter` |
-| image/audio/file content part | 400 | `invalid_request_error` | `content_part_unsupported` |
-| tool role / tool_calls / tools | 400 | `invalid_request_error` | `tool_calling_unsupported` |
-| input > 250k characters | 400 | `invalid_request_error` | `context_length_exceeded` |
+| malformed JSON / trailing data / body not an object | 400 | `invalid_request_error` | `invalid_request_error` |
+| missing model or messages, wrong JSON types, message with no text | 400 | `invalid_request_error` | `invalid_request_error` |
 | unknown model | 404 | `invalid_request_error` | `model_not_found` |
 | method not allowed | 405 | `invalid_request_error` | `method_not_allowed` |
 | missing/bad API key | 401 | `invalid_request_error` | `invalid_api_key` |
@@ -300,8 +421,11 @@ All non-streaming errors use OpenAI's envelope:
 | stream truncated / lost | 502 | `upstream_error` | `upstream_stream_error` |
 | all auth retries rejected (401/403) | 502 | `upstream_error` | `upstream_auth_failed` |
 
-Upstream HTML/challenge bodies are never returned to clients; they are logged
-server-side (truncated).
+Upstream non-200 responses are translated, never second-guessed: the client
+receives `502 upstream_error` with a message that names the upstream status and,
+when the upstream supplied one, its error text (sanitised, truncated at 4 KiB,
+and never an HTML challenge page). Upstream HTML/challenge bodies are never
+returned verbatim; they are logged server-side (truncated).
 
 ## 4. Message conversion
 
@@ -317,19 +441,23 @@ For each OpenAI message, emit one upstream message with `parts`, a fresh
 
 Rules:
 
-- `content` may be a string or an array of `{type:"text",text}` parts. Only
-  text parts are supported. `image_url`, `input_audio`, `file`, and any other
-  part type produce the `content_part_unsupported` 400. An empty parts array
-  is a 400.
-- `role:"tool"`, a non-empty `tool_calls` on an assistant message, and
-  top-level `tools` / `tool_choice` are rejected with
-  `tool_calling_unsupported`; tool calling is out of scope.
+- `content` may be a string or an array of parts. Parts with
+  `type:"text"` and a non-empty `text` become text parts. `image_url`,
+  `input_audio`, `file`, and any other part type are **rendered as a short
+  text placeholder** (`[image]`, `[audio]`, `[file]`, `[<type>]`) so the model
+  sees that something was attached, and the request proceeds. Nothing is
+  rejected for being media.
+- A part that is not a JSON object, or a text part with a missing/empty
+  string `text`, contributes no text. A message that ends up with **no**
+  renderable text at all is the only content 400 (§1.1, class 2).
+- `role:"tool"` and `role:"function"` messages are coerced to `user`;
+  `tool_calls` / `function_call` on a message are dropped. Top-level `tools` /
+  `tool_choice` are dropped and the request proceeds as plain chat.
 - `name` is accepted and ignored.
-- Unknown roles are a 400.
-- The input guard counts Unicode code points over all text parts (not bytes,
-  so CJK is counted honestly). More than 250,000 → `context_length_exceeded`
-  before any upstream call. The limit is configurable
-  (`IL2API_CONTEXT_CHARS`), and `-1` disables the guard.
+- Unknown roles are coerced to `user`.
+- There is no input length guard. The upstream truncates at its own limit;
+  that is the upstream's contract (§1.1). The total text length is still
+  counted and returned for logging.
 
 ## 5. Session pool
 
@@ -352,20 +480,27 @@ Token = `{unix_ts}.{32 hex}.{64 hex}`; shape is validated at acquisition.
 
 ## 6. Upstream client and stream reader
 
-- One fresh fingerprint transport per chat request (`DisableKeepAlives`,
-  ALPN `http/1.1`); this is required by the fingerprint trick and costs a
-  TLS handshake per request — accepted and documented.
+- **One** `*http.Transport` per client process, constructed from stdlib only:
+  `ForceAttemptHTTP2: true`, `TLSHandshakeTimeout`, `ResponseHeaderTimeout`,
+  `Proxy` when configured, and `TLSClientConfig.RootCAs` for tests. Keep-alives
+  are enabled: h2 multiplexing is the healthy path, and the clearance cookie
+  lives on the connection's requests, not on a per-request handshake.
+- Every request carries the shared Chrome UA constant and, once acquired, the
+  `_vcrcs` cookie (§2.1.1). The UA is never caller-controlled, so acquisition
+  and use can never diverge.
 - `Open(ctx, req)` acquires a token and POSTs. On HTTP 401/403 it discards
   that token and retries with a new one, at most **2 retries** (3 attempts
-  total). Other non-200 statuses return a typed error; the token is kept.
+  total). On a `429`/`403` challenge it refreshes clearance once and replays
+  the request (§2.1.1). Other non-200 statuses return a typed error; the token
+  is kept.
 - No `http.Client.Timeout`: a whole-generation wall clock would kill long
   answers. Instead the stream reader owns a **sliding 60 s idle timer**,
   reset on every upstream line (including blank separator lines). Expiry
   cancels the request and returns `upstream_idle_timeout`.
 - The same idle window bounds the whole **pre-response phase** (TCP connect,
-  CONNECT tunnel, TLS handshake, and response headers). Go's
-  `ResponseHeaderTimeout` alone would leave the dial/handshake unbounded,
-  because it is ignored when `DialTLSContext` is set.
+  proxy tunnel, TLS handshake, and response headers). The dial and handshake
+  are additionally bounded by `DialContext`/`TLSHandshakeTimeout`; the
+  pre-header phase is cancelled from a timer so no phase is unbounded.
 - Upstream redirects are refused when they leave the configured host or
   downgrade HTTPS, because `x-session-token` is a custom header that Go would
   otherwise copy to the redirect target.
@@ -399,11 +534,12 @@ that gateway can switch base URL without changing its parser:
 
 `config` is optional. `fanout` defaults to `3`, `depth` to `1`, `keep_top_k`
 to `10`, `effort` to `instant`; `fanout`/`depth` are clamped to the upstream's
-published 1–5 / 1–3 ranges, `keep_top_k` to 1–50, and `effort` must be
-`instant` / `fast` / `deep` (unknown values are a 400 naming the field).
-Unknown top-level keys are a 400 (`unsupported_parameter`), matching the chat
-path's no-silent-drops policy. An empty or whitespace-only `query`, or a
-`query` longer than 2000 characters, is a 400.
+published 1–5 / 1–3 ranges and `keep_top_k` to 1–50 — clamping is a translation,
+not a rejection. `effort` is passed through unchanged: the upstream owns its
+enum. Unknown top-level and `config` keys are **silently dropped** (§1.1).
+A missing or non-string `query` is a structural 400; an empty or
+whitespace-only `query` is a 400. There is no query-length limit beyond the
+body cap.
 
 Response (200):
 
@@ -427,7 +563,7 @@ Error mapping (same envelope and codes as chat):
 
 | Condition | HTTP | code |
 |---|---|---|
-| malformed JSON / missing / empty / over-long `query` / bad `config` / duplicate or trailing JSON | 400 | `invalid_request_error` (`unsupported_parameter` for unknown keys) |
+| malformed JSON / missing or empty `query` / `query` not a string / `config` not an object / trailing JSON | 400 | `invalid_request_error` |
 | method not allowed | 405 | `method_not_allowed` (`Allow: POST`) |
 | pool empty | 503 | `upstream_unavailable` |
 | `retrievalAvailable:false` (cached config probe) | 503 | `search_unavailable` |
@@ -447,7 +583,7 @@ Auth: when `IL2API_API_KEY` is non-empty, require
 `Authorization: Bearer <key>` or `X-Api-Key: <key>`; comparison is
 constant-time. An empty key disables auth.
 
-Server hardening: `ReadHeaderTimeout` 10 s, request body cap 2 MiB, optional
+Server hardening: `ReadHeaderTimeout` 10 s, request body cap 6 MiB, optional
 proxy credentials redacted from logs, upstream redirects restricted to the
 configured origin (no cross-host or HTTPS→HTTP hops, since the session token
 rides a custom header). CORS runs outside auth so preflights are answerable.
@@ -466,7 +602,9 @@ rides a custom header). CORS runs outside auth so preflights are answerable.
 | `IL2API_POOL_MAX` | `8` | maximum live tokens |
 | `IL2API_POOL_TTL` | `30m` | token lifetime |
 | `IL2API_IDLE_TIMEOUT` | `60s` | stream idle watchdog |
-| `IL2API_CONTEXT_CHARS` | `250000` | input character guard; `-1` disables |
+| `IL2API_CONTEXT_CHARS` | `0` | deprecated no-op, retained for config compatibility; there is no input guard |
+| `IL2API_CLEARANCE_REFRESH` | `45m` | proactive clearance refresh age (cookie TTL is 60m) |
+| `IL2API_CLEARANCE_COOLDOWN` | `15s` | minimum spacing between clearance refreshes |
 | `IL2API_SESSION_TIMEOUT` | `15s` | single `/api/session` fetch timeout |
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` sliding idle watchdog (the same window the chat path uses for `IL2API_IDLE_TIMEOUT`) |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`; `off` skips the startup `/api/search-lab/config` probe (`search.available` stays `null`) |
@@ -476,22 +614,26 @@ Invalid values are startup errors with an actionable message.
 
 ## 9. Testing strategy
 
-- Unit tests per package: config parsing, fingerprint ALPN spec, token shape,
-  pool lifecycle with a fake fetcher and fake clock, request validation and
-  conversion, SSE event mapping, error envelopes, chunk shapes.
-- The utls dialer is exercised against a **local TLS listener** only (plus a
-  local CONNECT proxy), never against Vercel.
+- Unit tests per package: config parsing, the PoW solver against the captured
+  Chromium fixture, clearance lifecycle (acquire, cookie storage, proactive
+  refresh, cooldown, 429 re-acquire, 403 surfaced) against a mock challenge
+  endpoint, token shape, pool lifecycle with a fake fetcher and fake clock,
+  request validation/drop behaviour, conversion, SSE event mapping, error
+  envelopes, chunk shapes.
+- The transport is exercised against a **local TLS listener** only (plus a
+  local CONNECT proxy), never against Vercel. No live probing: the bypass is
+  proven, and the only live check is the one final deployment smoke
+  (`/healthz` + one chat + one search) described in the task.
 - Integration tests run the real HTTP handlers against an `httptest` mock
   upstream, covering streaming framing, reasoning ordering, multi-block
-  streams, snapshot text, mid-stream failure, idle timeout, auth, the context
-  guard, and client disconnect.
+  streams, snapshot text, mid-stream failure, idle timeout, auth, oversized
+  input pass-through, dropped params, tools-as-plain-chat, media placeholder,
+  and client disconnect.
 - Web search is tested entirely against an `httptest` NDJSON mock: the full
-  plan → retrieve → rerank → docs pipeline, a Brotli-encoded body, a missing
-  `docs` event, a terminal `error` event, truncation, upstream non-200,
-  `retrievalAvailable:false`, the sliding idle watchdog, and the startup
-  config probe (success, failure, disabled). No live probing is performed
-  from this host: the plain transport is Vercel-challenged (see §1.2 of the
-  research doc), so live verification is out of scope by design.
+  plan → retrieve → rerank → docs pipeline, a gzip-encoded body, a `br` body
+  typed error, a missing `docs` event, a terminal `error` event, truncation,
+  upstream non-200, `retrievalAvailable:false`, the sliding idle watchdog, and
+  the startup config probe (success, failure, disabled).
 - Target: ≥80 % statement coverage over `app/internal/...` and `app/main.go`
   helpers. Every commit passes `go build ./... && go vet ./... && go test ./...`.
 
@@ -503,6 +645,9 @@ with `golang:1.24-alpine` and runs as non-root on
 `docker-compose.yml` maps `3000:3000` and passes `IL2API_*` through.
 `app/nixpacks.toml` pins `go build -o app .` / `./app`.
 
-Because the upstream challenge is IP-sensitive, a deployment whose egress is
-challenged will start and serve `503 upstream_unavailable`; set
-`IL2API_PROXY` to route through a non-challenged egress.
+Because the upstream challenge is keyed to the egress IP and UA, the gateway
+acquires its own clearance from whatever egress it actually uses; set
+`IL2API_PROXY` to route both clearance acquisition and traffic through the same
+proxy. If the edge still refuses (PoW version drift), `/healthz`' `clearance`
+block shows `has_cookie:false` and the last refresh count, and chat serves
+`503 upstream_unavailable` rather than looping.
