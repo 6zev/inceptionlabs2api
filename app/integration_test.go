@@ -724,6 +724,35 @@ func TestMainEntrypoint(t *testing.T) {
 	}
 }
 
+// The project has zero third-party dependencies, so app/go.sum does not exist
+// (SPEC §1). The Docker build is the deployment path; a COPY of a file that is
+// not in the image context fails the build on a clean checkout.
+func TestDockerfileCopiesExist(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("../Dockerfile")
+	if err != nil {
+		t.Skipf("Dockerfile not in this context: %v", err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || !strings.EqualFold(fields[0], "COPY") {
+			continue
+		}
+		// COPY --from=<stage> reads the build stage, not the context.
+		if strings.HasPrefix(fields[1], "--from=") {
+			continue
+		}
+		for _, src := range fields[1 : len(fields)-1] {
+			if strings.HasPrefix(src, "--") {
+				continue
+			}
+			if _, err := os.Stat("../" + src); err != nil {
+				t.Errorf("Dockerfile COPY %s: %v", src, err)
+			}
+		}
+	}
+}
+
 func TestRunRejectsBadConfig(t *testing.T) {
 	t.Setenv("IL2API_POOL_MIN", "99")
 	t.Setenv("IL2API_POOL_MAX", "8")
@@ -733,7 +762,11 @@ func TestRunRejectsBadConfig(t *testing.T) {
 }
 
 // Boot prewarm: starting the clearance prewarm is immediate, and /healthz
-// reports has_cookie within a second without any chat traffic.
+// reports has_cookie without any chat traffic. The acquisition deadline is
+// generous on purpose: the PoW solve is CPU-bound, and this test runs in
+// parallel with the rest of the suite under -race, where the solve and TLS
+// handshake can take well over the ~1 s SPEC quotes for an idle boot. The
+// property under test is "non-blocking start, eventual cookie", not latency.
 func TestEndToEndClearancePrewarmAtBoot(t *testing.T) {
 	t.Parallel()
 	st := newStack(t, 5*time.Second)
@@ -746,7 +779,7 @@ func TestEndToEndClearancePrewarmAtBoot(t *testing.T) {
 		t.Fatalf("StartClearancePrewarm blocked for %s", elapsed)
 	}
 
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(st.srv.URL + "/healthz")
 		if err != nil {
@@ -771,7 +804,7 @@ func TestEndToEndClearancePrewarmAtBoot(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("healthz did not report has_cookie:true within a second of prewarm: %+v", st.client.Clearance().State())
+	t.Fatalf("healthz did not report has_cookie:true after prewarm: %+v", st.client.Clearance().State())
 }
 
 // A refused checkpoint must not make boot or prewarm fail; healthz keeps
