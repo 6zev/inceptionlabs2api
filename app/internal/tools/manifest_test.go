@@ -83,6 +83,11 @@ func TestManifestIsCompact(t *testing.T) {
 	if strings.Contains(m.Preamble, "\n  ") {
 		t.Fatalf("preamble is indented:\n%s", m.Preamble)
 	}
+	// One tool: the example must use its real name and first parameter; the
+	// placeholder form returned empty upstream answers in probes.
+	if !strings.Contains(m.Preamble, `{"name": "get_weather", "arguments": {"city": "…"}}`) {
+		t.Fatalf("single-tool example is not concrete:\n%s", m.Preamble)
+	}
 }
 
 // T12: a named choice lists only that tool, and only it is declared.
@@ -102,7 +107,7 @@ func TestManifestNamedChoice(t *testing.T) {
 	if len(m.Declared) != 1 || m.Declared[0] != "send_email" {
 		t.Fatalf("declared = %v", m.Declared)
 	}
-	if !strings.Contains(m.Preamble, "must call") {
+	if !strings.Contains(m.Preamble, "must use") {
 		t.Fatalf("named choice did not instruct the model:\n%s", m.Preamble)
 	}
 }
@@ -113,7 +118,7 @@ func TestManifestRequiredInstruction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildManifest: %v", err)
 	}
-	if !strings.Contains(strings.ToLower(m.Preamble), "must call") {
+	if !strings.Contains(strings.ToLower(m.Preamble), "must use") {
 		t.Fatalf("required instruction missing:\n%s", m.Preamble)
 	}
 }
@@ -156,6 +161,19 @@ func TestManifestBadParametersBecomeEmptyObject(t *testing.T) {
 	}
 	if !strings.Contains(m.Preamble, `"name":"x","description":"","parameters":{}`) {
 		t.Fatalf("preamble:\n%s", m.Preamble)
+	}
+}
+
+// Several tools keep a placeholder example, but never one fabricated from an
+// arbitrary tool's schema.
+func TestManifestMultiToolExampleStaysGeneric(t *testing.T) {
+	t.Parallel()
+	m, err := BuildManifest([]Tool{weatherTool(), {Name: "send_email", Parameters: json.RawMessage(`{"properties":{"to":{}}}`)}}, Choice{Auto: true}, false)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if !strings.Contains(m.Preamble, `{"name": "<operation>", "arguments": {"<arg>": "…"}}`) {
+		t.Fatalf("multi-tool example:\n%s", m.Preamble)
 	}
 }
 

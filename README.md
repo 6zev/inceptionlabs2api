@@ -153,10 +153,11 @@ curl -N http://localhost:3000/v1/chat/completions \
 
 真正被使用的字段是 `model`、`messages`、`stream`、`reasoning_effort`；**其余顶层字段
 （`temperature`、`top_p`、`n`、`stop`、`response_format`、`logprobs`、`stream_options`、
-`user`、`seed`……）一律静默丢弃，不报错**。`tools` / `tool_choice` / `functions` /
-`function_call` 同样丢弃，请求按普通聊天继续。消息里的 `image_url`、`input_audio`、
+`user`、`seed`……）一律静默丢弃，不报错**。`tools` 非空时按上面的工具调用处理；
+`functions` / `function_call`（已废弃的旧协议）与空的 `tools` 仍按普通聊天继续。消息里的 `image_url`、`input_audio`、
 `file` 等非文本块会被渲染成简短的文本占位符。`role: "developer"` 映射为 `system`，
-`role: "tool"` 与未知 role 按 `user` 处理。
+`role: "tool"` 与未知 role 按 `user` 处理（`tools` 非空时，`role: "tool"` 会渲染成
+`<tool_response>` 信封，见下文工具调用一节）。
 
 网关只在以下情况返回 400/401：JSON 无法解析或尾部有多余内容、`model`/`messages`
 缺失或为空、某条消息没有任何可渲染文本、字段 JSON 类型错误、API Key 错误。
@@ -194,6 +195,50 @@ data: [DONE]
   }]
 }
 ```
+
+### 工具调用（tools / tool_calls）
+
+上游网页端 `/api/chat` **没有**工具调用字段（见 `TOOLCALL-PATH.md`），所以工具调用
+是本网关自己实现的：把 OpenAI 的 `tools` 编译成一段系统提示，再把模型输出解析回
+OpenAI 的 `tool_calls`。
+
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mercury-3","messages":[{"role":"user","content":"巴黎天气如何？"}],
+       "tools":[{"type":"function","function":{"name":"get_weather",
+         "description":"查询某城市当前天气。",
+         "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}'
+```
+
+```jsonc
+{"choices":[{"message":{"role":"assistant","content":"",
+  "tool_calls":[{"id":"call_GARkNOVbXelwMmhRhoC9BUem","type":"function",
+    "function":{"name":"get_weather","arguments":"{\"city\": \"Paris\"}"}}]},
+  "finish_reason":"tool_calls"}]}
+```
+
+要点：
+
+- **按需注入。** 只有 `tools` 非空的请求才会带提示词；没有工具的请求走原来的代码
+  路径，**逐字节不变**（有 golden 测试和上线前的实机抓包对照
+  `testdata/no-tools-baseline.sse`）。工具定义按紧凑 JSON 输出，不做缩进。
+- **超过 30 个工具时自动分层。** 提示词只给名称和描述，参数 schema 由模型按需调用
+  内置的 `tool_schema` 索取；网关内部最多再发两轮，客户端始终只看到一次正常响应。
+  阈值和分层形状来自厂商文档（30–50 个工具后选择质量下降）与实测，见
+  `DESIGN-TOOLS.md` §6。
+- **`tool_choice`** 支持 `none`（完全不走工具路径）、`auto`、`required`（提示"必须
+  调用"）和 `{"type":"function","function":{"name":…}}`（只注入并只接受该工具）。
+- **多轮**：把带 `tool_calls` 的 assistant 消息和 `role:"tool"` 结果原样回传即可，
+  网关会重放 `<tool_call>` 块与 `<tool_response call_id=…>` 信封（连续的多个结果
+  合并成一条 user 消息）。
+- **解析容错 = 直通哲学。** 模型输出格式不对、JSON 坏了、调用了未声明的函数、块没
+  写完——这些一律作为**普通文本**返回，绝不报错。流式响应在块完整后才发出
+  `tool_calls` 增量，并以 `finish_reason:"tool_calls"` 结束；同步响应形状相同。
+- **一个上游特性要知道：** 系统提示里的工具脚手架有时会让上游返回**空回答**
+  （只有 reasoning 事件、没有正文）。网关会把空回答如实返回为 `content:""` +
+  `finish_reason:"stop"`，不重试、不伪造调用。具体措辞与命中率见
+  `DESIGN-TOOLS.md` §1.1。
 
 ### 独立联网搜索 `POST /v1/web_search`
 

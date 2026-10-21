@@ -1159,7 +1159,7 @@ func TestE2EToolCallRoundTrip(t *testing.T) {
 	// The first upstream body carries the preamble; the second carries the
 	// tool result envelope and the replayed call id.
 	firstBody, _ := json.Marshal(bodies[0])
-	if !strings.Contains(string(firstBody), "# Tool calling") {
+	if !strings.Contains(string(firstBody), "You have access to") {
 		t.Fatalf("preamble missing: %s", firstBody)
 	}
 	secondBody, _ := json.Marshal(bodies[1])

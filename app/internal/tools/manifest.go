@@ -52,22 +52,86 @@ type Manifest struct {
 	// loaded is the subset of tools whose full schemas the current preamble
 	// carries instead of the tier-1 index entry.
 	loaded []Tool
+	// opening is the prose clause after "You have access to", naming the
+	// operations without the words "function"/"functions".
+	opening string
 }
 
-// tierNote explains why schemas are absent and how to ask for them.
-const tierNote = "\nParameter schemas are omitted to save context. Before calling a function, if you do not know its parameters, call `" + toolSchemaName + "` once with {\"names\": [\"…\"]} or {\"query\": \"…\"} to load them.\n"
+// openingClause names the catalogue for the preamble. It deliberately avoids
+// the word "function", which the probes tied to empty answers.
+func openingClause(n int) string {
+	if n == 1 {
+		return "one operation, described below"
+	}
+	return fmt.Sprintf("%d operations, described below", n)
+}
 
-// header is the fixed part of every preamble: the output contract followed by
+// openingFor names a single operation concretely in the prose; multi-tool
+// requests keep the generic count.
+
+// definitionHeader introduces the catalogue. Definitions are plain JSON lines:
+// wrapping them in <tools>…</tools> made the upstream return an empty answer
+// in 10/10 probes (DESIGN-TOOLS.md §1.1).
+const definitionHeader = "\nOperation definitions, one JSON object per line:\n"
+
+// tierNote explains why schemas are absent and how to ask for them.
+const tierNote = "\nSome argument details are omitted to save context. If you need them, reply with a `" + toolSchemaName + "` block once: " + `{"name": "` + toolSchemaName + `", "arguments": {"names": ["…"]}}` + ".\n"
+
+// header is the fixed part of every preamble: the call contract followed by
 // the choice-specific instructions.
+//
+// The wording is not free-form: the upstream web backend intermittently
+// returns an empty answer (reasoning-start/end only, no text-delta) when a
+// system message looks like tool-calling scaffolding. The one reproducible
+// trigger found in ~20 probes was a "<tools>…</tools>" catalogue block, which
+// produced no text in 10/10 attempts; with the definitions as plain JSON lines
+// the same text answered in 5/7. Headings and the word "function" were
+// suspected first and later disproved as deterministic triggers. The exact
+// phrasing is therefore part of the protocol, not copy: re-probe before
+// rewording (DESIGN-TOOLS.md §1.1).
 func (m *Manifest) header() string {
-	return "# Tool calling\n\n" +
-		"You can call the functions listed below. To call a function, emit exactly:\n\n" +
+	example := m.example()
+	return "You have access to " + m.opening + ". " +
+		"When the user's request needs one, reply with exactly:\n\n" +
 		callStart + "\n" +
-		`{"name": "function_name", "arguments": {"arg": "value"}}` + "\n" +
+		example + "\n" +
 		callEnd + "\n\n" +
-		"Emit one block per call, with a complete JSON object. Do not wrap the block in a code fence. " +
-		"Only use the function names below; never invent one. If no function is needed, answer normally.\n" +
+		"Use only the operation names listed below; never invent one. " +
+		"Otherwise answer normally.\n" +
 		m.instructions
+}
+
+// example renders the call block's example. With one operation it uses that
+// operation's real name and first parameter, because the concrete form
+// answered where a placeholder form returned an empty answer repeatedly
+// (DESIGN-TOOLS.md §1.1). With several, a placeholder is the only truthful
+// example.
+func (m *Manifest) example() string {
+	if len(m.tools) == 1 {
+		t := m.tools[0]
+		arg := "value"
+		if p := firstProperty(t.Parameters); p != "" {
+			arg = p
+		}
+		return `{"name": ` + quoteJSON(t.Name) + `, "arguments": {` + quoteJSON(arg) + `: "…"}}`
+	}
+	return `{"name": "<operation>", "arguments": {"<arg>": "…"}}`
+}
+
+// firstProperty returns the first declared parameter name, or "".
+func firstProperty(raw json.RawMessage) string {
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if json.Unmarshal(raw, &schema) != nil || len(schema.Properties) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(schema.Properties))
+	for k := range schema.Properties {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys[0]
 }
 
 // instructions renders the tool_choice / parallel instructions.
@@ -75,12 +139,12 @@ func instructions(c Choice, parallelOff bool) string {
 	var b strings.Builder
 	switch {
 	case c.Named != "":
-		fmt.Fprintf(&b, "\nYou must call the function %q. Do not call any other function.\n", c.Named)
+		fmt.Fprintf(&b, "\nYou must use the operation %q. Do not use any other operation.\n", c.Named)
 	case c.Required:
-		b.WriteString("\nYou MUST call at least one function before answering.\n")
+		b.WriteString("\nYou MUST use at least one operation before answering.\n")
 	}
 	if parallelOff {
-		b.WriteString("\nCall at most one function per turn.\n")
+		b.WriteString("\nUse at most one operation per turn.\n")
 	}
 	return b.String()
 }
@@ -115,7 +179,7 @@ func BuildManifest(list []Tool, c Choice, parallelOff bool) (*Manifest, error) {
 		}
 	}
 
-	m := &Manifest{Tiered: len(selected) > TierThreshold, tools: selected}
+	m := &Manifest{Tiered: len(selected) > TierThreshold, tools: selected, opening: openingClause(len(selected))}
 	for _, t := range selected {
 		m.Declared = append(m.Declared, t.Name)
 	}
@@ -128,20 +192,18 @@ func BuildManifest(list []Tool, c Choice, parallelOff bool) (*Manifest, error) {
 	if m.Tiered {
 		m.Loader = true
 		b.WriteString(tierNote)
-		b.WriteString("\n<tools>\n")
+		b.WriteString(definitionHeader)
 		for _, t := range selected {
 			fmt.Fprintf(&b, `{"name":%s,"description":%s}`+"\n", quoteJSON(t.Name), quoteJSON(t.Description))
 		}
-		b.WriteString("</tools>\n")
 		// Declare the loader last so it never shadows a real tool's name.
 		m.Declared = append(m.Declared, toolSchemaName)
 	} else {
-		b.WriteString("\n<tools>\n")
+		b.WriteString(definitionHeader)
 		for _, t := range selected {
 			fmt.Fprintf(&b, `{"name":%s,"description":%s,"parameters":%s}`+"\n",
 				quoteJSON(t.Name), quoteJSON(t.Description), compactParams(t.Parameters))
 		}
-		b.WriteString("</tools>\n")
 	}
 
 	m.Preamble = b.String()
@@ -236,7 +298,7 @@ func (m *Manifest) Expanded(extra []Tool) *Manifest {
 	var b strings.Builder
 	b.WriteString(m.header())
 	b.WriteString(tierNote)
-	b.WriteString("\n<tools>\n")
+	b.WriteString(definitionHeader)
 	for _, t := range m.tools {
 		if full, ok := loaded[t.Name]; ok {
 			fmt.Fprintf(&b, `{"name":%s,"description":%s,"parameters":%s}`+"\n",
@@ -245,7 +307,6 @@ func (m *Manifest) Expanded(extra []Tool) *Manifest {
 		}
 		fmt.Fprintf(&b, `{"name":%s,"description":%s}`+"\n", quoteJSON(t.Name), quoteJSON(t.Description))
 	}
-	b.WriteString("</tools>\n")
 
 	declared := make([]string, 0, len(m.tools)+1)
 	for _, t := range m.tools {
@@ -268,5 +329,6 @@ func (m *Manifest) Expanded(extra []Tool) *Manifest {
 		tools:        m.tools,
 		instructions: m.instructions,
 		loaded:       allLoaded,
+		opening:      m.opening,
 	}
 }

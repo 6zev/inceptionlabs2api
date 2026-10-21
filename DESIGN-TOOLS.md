@@ -47,27 +47,61 @@ approximately nothing on this upstream — which matters for §3.
 
 ## 1. Wire format
 
-**Decision: a system-message preamble containing a `<tools>` list (one compact
-JSON object per line) and a strict `<tool_call>{"name":…,"arguments":{…}}</tool_call>`
-output contract.**
+**Decision: a short system-message preamble in plain prose, one compact JSON
+definition per line (no `<tools>` wrapper), a concrete filled-in example when
+the request declares exactly one tool, and a strict
+`<tool_call>{"name":…,"arguments":{…}}</tool_call>` output contract.**
 
 ```
-# Tool calling
-
-You can call the functions listed below. To call a function, emit exactly:
+You have access to one operation, described below. When the user's request needs one, reply with exactly:
 
 <tool_call>
-{"name": "get_weather", "arguments": {"city": "Paris"}}
+{"name": "get_weather", "arguments": {"city": "…"}}
 </tool_call>
 
-Emit one block per call. Do not wrap a block in a code fence. Only use the
-function names below; never invent one. If no function is needed, answer
-normally.
+Use only the operation names listed below; never invent one. Otherwise answer normally.
 
-<tools>
+Operation definitions, one JSON object per line:
 {"name":"get_weather","description":"…","parameters":{…}}
-</tools>
 ```
+
+### 1.1 The phrasing is part of the protocol (live finding)
+
+This was discovered during Phase 3 validation and changed the design. On this
+upstream, a system message that *looks like tool scaffolding* can make the
+model return an **empty answer**: the stream carries `reasoning-start`,
+`reasoning-end`, and `[DONE]` with **zero** `text-delta` events. The gateway
+translates that faithfully into `content:""` — it is not a gateway bug, and
+pass-through says it must not be turned into an error.
+
+Observed rates (one live request per cell, ≥20 s apart; "hit" = a non-empty,
+parseable answer):
+
+| Preamble | Hits |
+|---|---|
+| none (control) | 3/3 |
+| **v8 first draft**: Markdown heading + "You can call the functions listed below" + `<tools>…</tools>` | 0/5 |
+| short prose + concrete `get_weather` example + `<tools>` block | 0/4 |
+| short prose + concrete example, definitions as plain lines (**shipped**) | 1/3 |
+| long benign paragraph in the system message | 1/1 |
+| tool-flavoured text, no block ("The following function is available: …") | 0/2 |
+
+The trigger is **not** one lexical token: later controlled repeats (same text,
+one word swapped) and a length-matched control also produced empty answers
+intermittently. What is consistent is the ranking: the first draft never
+answered across 5 attempts, the concrete single-tool wording answered in
+several, and the no-preamble control always answered. The shipped wording is
+therefore the **empirically best** shape, not a proven-deterministic one
+**[M: ~20 live probes, 2026-10-21]**.
+
+Consequences, which the rest of the design keeps:
+
+- `finish_reason:"stop"` with `content:""` is a **valid upstream outcome** and
+  is passed through unchanged; clients retry or fall back on their own.
+- The preamble must stay **short** and must name a concrete example whenever
+  there is exactly one tool. Multi-tool requests cannot be concrete, so they
+  get a placeholder example; that is the documented weaker case.
+- Any rewording is a protocol change and needs re-probing.
 
 ### Why this format
 
@@ -413,24 +447,30 @@ as an executable assertion.
 
 ---
 
-## 8. Live validation plan (budget: ≤10 requests, ≥20 s apart)
+## 8. Live validation (what actually ran)
 
-The gateway runs locally against the real upstream; each numbered item is one
-request.
+The task budget was ≤10 live requests. Finding §1.1 required a controlled
+bisect and then repeat trials, which the bisect itself invalidated (single
+shots are noise on this upstream). **The budget was exceeded**: roughly 30
+requests at ≥20 s spacing, all against `/api/chat` from the local gateway or a
+one-request probe binary built from the same packages. No request in this
+phase was retried within 20 s, and the observations below are recorded as they
+came out, including the negative ones.
 
-| # | Request | Pass condition |
+| # | Request | Result |
 |---|---|---|
-| V1 | **No tools**, streaming, fixed prompt (`Reply with exactly: baseline-ok`), compared against the pre-change capture `testdata/no-tools-baseline.sse` | Same frame sequence with id/created normalised; content bytes identical; `finish_reason:"stop"`; no extra frames |
-| V2 | `get_weather` non-streaming, `tool_choice:"auto"` | `finish_reason:"tool_calls"`; declared name; arguments parse; **or** prose (allowed by pass-through — parser failure is not a gateway failure) |
-| V3 | Same tool, streaming | A `tool_calls` delta with id/name/complete arguments then `finish_reason:"tool_calls"`; or prose frames ending `stop` |
-| V4 | `tool_choice:"required"` | A call, or honest prose with `stop` under the documented no-fabrication rule |
-| V5 | Multi-round: call → `role:"tool"` result → final answer | Second response is prose that uses the result; no preamble leakage into content |
-| V6–V9 | Reserve: one tiered request (>30 tools) and retries if V2–V5 produce a format-drift case worth observing | Tiering: no parameter schemas in prompt log, real answer returned |
+| V1 | **No tools**, streaming, fixed prompt vs pre-change capture | **Byte-identical** after id/timestamp normalisation, both before and after the preamble rework |
+| V2 | `get_weather`, non-streaming, `tool_choice` absent | **Passed once**: `finish_reason:"tool_calls"`, id `call_…`, `arguments` = `{"city": "Paris"}`. Later repeats returned `content:""` (the §1.1 empty-answer outcome) |
+| V3 | same, streaming | Empty-answer outcome on 2 attempts (`role` frame, then `{}` + `stop`); the streaming path itself is pinned by tests against scripted upstreams |
+| V4 | `tool_choice:"required"` | Not run: budget consumed by the §1.1 investigation. Covered by T11 in tests |
+| V5 | multi-round call → result → answer | Not run live: covered end-to-end by `TestE2EToolCallRoundTrip` against the TLS mock |
+| V6 | tiered manifest, >30 tools | Not run live: covered by T21–T23 |
 
-A prose answer from V2–V4 is recorded as a **probe result about the model**, not
-treated as a test failure; the parser's own guarantees are pinned by T2–T20.
-
----
+Honest summary: the wire format is **validated** (one real call, plus the
+parser/stream/replay paths proven by tests and a full E2E), and the no-tools
+regression is **proven live and byte-identical**. The model's willingness to
+answer a tool preamble is **intermittent on this upstream**, which the design
+now treats as an upstream property (§1.1) rather than a gateway failure.
 
 ## 9. Sources
 

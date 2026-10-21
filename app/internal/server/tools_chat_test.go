@@ -58,7 +58,7 @@ func TestNoToolsRequestIsUnchanged(t *testing.T) {
 	}
 	for _, m := range req.Messages {
 		for _, p := range m.Parts {
-			if strings.Contains(p.Text, "# Tool calling") || strings.Contains(p.Text, "<tools>") {
+			if strings.Contains(p.Text, "You have access to") || strings.Contains(p.Text, "<tools>") {
 				t.Fatalf("preamble leaked into a tool-less request: %q", p.Text)
 			}
 		}
@@ -219,7 +219,7 @@ func TestRequiredButProse(t *testing.T) {
 	if ch.FinishReason != "stop" || ch.Message.Content != "I would rather not." || len(ch.Message.ToolCalls) != 0 {
 		t.Fatalf("choice = %+v", ch)
 	}
-	if !strings.Contains(up.lastRequest().Messages[0].Parts[0].Text, "MUST call") {
+	if !strings.Contains(up.lastRequest().Messages[0].Parts[0].Text, "MUST use") {
 		t.Fatal("required instruction missing from the preamble")
 	}
 }
@@ -247,7 +247,7 @@ func TestToolChoiceNoneTakesLegacyPath(t *testing.T) {
 	if len(req.Messages) != 1 || req.Messages[0].Role != "user" {
 		t.Fatalf("messages = %+v", req.Messages)
 	}
-	if strings.Contains(rec.Body.String(), "# Tool calling") {
+	if strings.Contains(rec.Body.String(), "You have access to") {
 		t.Fatal("preamble injected despite tool_choice none")
 	}
 	// A <tool_call> in the output must also not be parsed.
