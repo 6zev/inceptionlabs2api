@@ -144,6 +144,10 @@ func (s *Server) probeSearch(ctx context.Context) {
 		s.logf("search: config probe failed (search stays enabled, availability unknown): %v", err)
 		return
 	}
+	if cfg == nil {
+		s.logf("search: config probe returned no body; availability unknown")
+		return
+	}
 	available := cfg.RetrievalAvailable
 	s.searchMu.Lock()
 	s.searchAvailable = &available

@@ -175,6 +175,9 @@ func TestWebSearchMethodNotAllowed(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rec.Code)
 	}
+	if got := rec.Header().Get("Allow"); got != http.MethodPost {
+		t.Fatalf("Allow = %q, want POST", got)
+	}
 }
 
 func TestWebSearchEmptyResults(t *testing.T) {
@@ -434,5 +437,80 @@ func TestWebSearchUpstreamBodyShape(t *testing.T) {
 		if strings.Contains(string(b), key) {
 			t.Fatalf("unexpected %s in %s", key, b)
 		}
+	}
+}
+
+// Duplicate keys and trailing garbage are rejected: a body that a front proxy
+// might parse differently must not be silently accepted.
+func TestWebSearchRejectsDuplicatesAndTrailingData(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		`{"query":"q"} garbage`,
+		`{"query":"q"}{"query":"q2"}`,
+		`{"query":"q","query":"q2"}`,
+		`{"query":"q","config":{"effort":"instant"},"config":null}`,
+		`{"query":"q","config":{"effort":"instant","effort":"deep"}}`,
+		`{"query":"q","config":[]}`,
+	}
+	for _, body := range cases {
+		se := &fakeSearcher{}
+		rec := postSearch(t, newSearchServer(t, se), body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400", body, rec.Code)
+		}
+		if se.count() != 0 {
+			t.Errorf("body %s reached upstream", body)
+		}
+	}
+}
+
+func TestWebSearchSetsNoStore(t *testing.T) {
+	t.Parallel()
+	rec := postSearch(t, newSearchServer(t, &fakeSearcher{}), `{"query":"q"}`)
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+}
+
+// A single failure is counted once: searchError must not increment
+// upstream_errors and then delegate to upstreamError, which increments again.
+func TestWebSearchCountsUpstreamErrorOnce(t *testing.T) {
+	t.Parallel()
+	se := &fakeSearcher{fn: func(int) (*upstream.SearchResult, error) {
+		return nil, upstream.ErrIdleTimeout
+	}}
+	s := newSearchServer(t, se)
+	rec := postSearch(t, s, `{"query":"q"}`)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := s.upErrors.Load(); got != 1 {
+		t.Fatalf("upstream_errors = %d, want 1", got)
+	}
+}
+
+// A Searcher returning (nil, nil) must not panic the probe goroutine.
+func TestProbeNilConfigDoesNotPanic(t *testing.T) {
+	t.Parallel()
+	se := &fakeSearcher{cfgFn: func(context.Context) (*upstream.SearchConfigResponse, error) {
+		return nil, nil
+	}}
+	s := newSearchServer(t, se)
+	s.probeSearch(context.Background())
+	if got := s.SearchAvailable(); got != nil {
+		t.Fatalf("available = %v, want nil", *got)
+	}
+}
+
+// An explicit "config": null is the same as omitting it.
+func TestWebSearchNullConfigUsesDefaults(t *testing.T) {
+	t.Parallel()
+	se := &fakeSearcher{}
+	rec := postSearch(t, newSearchServer(t, se), `{"query":"q","config":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := se.lastRequest(); got.Config.Fanout != 3 || got.Config.Effort != "instant" {
+		t.Fatalf("defaults = %+v", got.Config)
 	}
 }

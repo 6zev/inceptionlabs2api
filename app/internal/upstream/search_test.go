@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -58,8 +59,8 @@ func TestSearchCollectsQueriesAndSources(t *testing.T) {
 	}
 	c, _ := newTestClient(t, m, 1)
 	res, err := c.Search(context.Background(), &SearchRequest{
-		Query:  "four-day workweek",
-		Config: SearchConfig{Fanout: 1, Depth: 2, KeepTopK: 3, Effort: "instant"},
+		Query:    "four-day workweek",
+		Config:   SearchConfig{Fanout: 1, Depth: 2, KeepTopK: 3, Effort: "instant"},
 		Timezone: "UTC", Language: "en-US",
 	}, time.Second)
 	if err != nil {
@@ -432,5 +433,59 @@ func TestSearchSingleBuffer(t *testing.T) {
 	}
 	if len(res.Sources) != 2 {
 		t.Fatalf("CRLF body: sources = %+v", res.Sources)
+	}
+}
+
+// A hostile upstream must not be able to make the gateway retain or echo
+// unbounded state, and must not smuggle non-http URLs to a browser consumer.
+func TestSearchSanitizesHostileSources(t *testing.T) {
+	t.Parallel()
+	sources := []string{
+		`{"title":"js","url":"javascript:alert(1)"}`,
+		`{"title":"data","url":"data:text/html,<script>x</script>"}`,
+		`{"title":"rel","url":"/relative"}`,
+		// \n is a JSON escape, so this decodes to a URL containing a real
+		// control character, which must be rejected.
+		`{"title":"ctl","url":"https://ok.example/\nX-Evil: 1"}`,
+		`{"title":"` + strings.Repeat("long", 500) + `","url":"https://long.example"}`,
+	}
+	m := startUpstream(t)
+	m.searchHandler = func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"t":"queries","queries":["`+strings.Repeat("q", maxQueryRunes+1)+`","ok"]}`+"\n")
+		io.WriteString(w, `{"t":"docs","sources":[`+strings.Join(sources, ",")+`]}`+"\n")
+	}
+	c, _ := newTestClient(t, m, 1)
+	res, err := c.Search(context.Background(), &SearchRequest{Query: "q"}, time.Second)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res.Queries) != 1 || res.Queries[0] != "ok" {
+		t.Fatalf("queries = %v, want only the bounded valid query", res.Queries)
+	}
+	if len(res.Sources) != 1 || res.Sources[0].URL != "https://long.example" {
+		t.Fatalf("sources = %+v, want only the http(s) entry", res.Sources)
+	}
+	if got := len([]rune(res.Sources[0].Title)); got != maxTitleRunes {
+		t.Fatalf("title len = %d, want %d", got, maxTitleRunes)
+	}
+}
+
+func TestSearchCapsSourceCount(t *testing.T) {
+	t.Parallel()
+	parts := make([]string, 0, maxCollectedSources+20)
+	for i := 0; i < maxCollectedSources+20; i++ {
+		parts = append(parts, `{"title":"t","url":"https://x.example/`+strconv.Itoa(i)+`"}`)
+	}
+	m := startUpstream(t)
+	m.searchHandler = func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"t":"docs","sources":[`+strings.Join(parts, ",")+`]}`+"\n")
+	}
+	c, _ := newTestClient(t, m, 1)
+	res, err := c.Search(context.Background(), &SearchRequest{Query: "q"}, time.Second)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(res.Sources) != maxCollectedSources {
+		t.Fatalf("sources = %d, want capped at %d", len(res.Sources), maxCollectedSources)
 	}
 }

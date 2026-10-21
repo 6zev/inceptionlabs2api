@@ -65,6 +65,7 @@ var searchConfigKeys = []string{"fanout", "depth", "keep_top_k", "effort"}
 // request, and the endpoint answers only once sources exist.
 func (s *Server) webSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
 			"method not allowed; use POST"))
 		return
@@ -109,6 +110,8 @@ func (s *Server) webSearch(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, s.searchError(err))
 		return
 	}
+	// Results derive from the caller's query; keep them out of shared caches.
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, webSearchResponse{
 		Object:  "web_search",
 		Queries: nonNil(res.Queries),
@@ -184,12 +187,17 @@ func decodeWebSearch(body []byte) (*webSearchRequest, *openai.RequestError) {
 	if err := dec.Decode(&raw); err != nil {
 		return nil, openai.Invalid(fmt.Sprintf("invalid JSON body: %v", err))
 	}
-	var trailing json.RawMessage
-	if err := dec.Decode(&trailing); err == nil {
+	// Anything other than EOF after the object — valid JSON or garbage — is
+	// rejected: a prefix that a front proxy or WAF might parse differently
+	// must not be silently tolerated.
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
 		return nil, openai.Invalid("invalid JSON body: unexpected data after the request object")
 	}
 	if raw == nil {
 		return nil, openai.Invalid("request body must be a JSON object")
+	}
+	if len(raw) != countTopLevelKeys(body) {
+		return nil, openai.Invalid("invalid JSON body: duplicate top-level keys are not allowed")
 	}
 	var unknown []string
 	for key := range raw {
@@ -223,6 +231,12 @@ func decodeWebSearch(body []byte) (*webSearchRequest, *openai.RequestError) {
 		if err := json.Unmarshal(raw["config"], &cfgRaw); err != nil {
 			return nil, openai.Invalid("config must be an object")
 		}
+		if cfgRaw == nil {
+			return nil, openai.Invalid("config must be an object")
+		}
+		if len(cfgRaw) != countTopLevelKeys(raw["config"]) {
+			return nil, openai.Invalid("invalid JSON body: duplicate config keys are not allowed")
+		}
 		var cfgUnknown []string
 		for key := range cfgRaw {
 			if !contains(searchConfigKeys, key) {
@@ -243,6 +257,28 @@ func decodeWebSearch(body []byte) (*webSearchRequest, *openai.RequestError) {
 		}
 	}
 	return &req, nil
+}
+
+// countTopLevelKeys counts the members of a JSON object, including duplicates
+// (encoding/json keeps only the last, so a length mismatch detects them).
+func countTopLevelKeys(raw []byte) int {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return -1
+	}
+	n := 0
+	for dec.More() {
+		if _, err := dec.Token(); err != nil {
+			return -1
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return -1
+		}
+		n++
+	}
+	return n
 }
 
 func unsupported(param string, offenders, allowed []string) *openai.RequestError {
@@ -270,16 +306,20 @@ func contains(list []string, key string) bool {
 }
 
 // searchError maps search failures onto the chat path's status/code surface.
+// It increments upstream_errors itself only for the failures it classifies;
+// the fallback delegates to upstreamError, which owns that counter, so a
+// single failure is never counted twice.
 func (s *Server) searchError(err error) *openai.RequestError {
-	s.upErrors.Add(1)
 	var se *upstream.SearchError
 	if errors.As(err, &se) {
+		s.upErrors.Add(1)
 		s.logf("upstream: search failed: %s", truncate(se.Message, 300))
 		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamError, "",
 			"upstream search pipeline failed")
 	}
 	switch {
 	case errors.Is(err, upstream.ErrSearchIncomplete):
+		s.upErrors.Add(1)
 		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamStream, "",
 			"upstream closed the search stream before returning sources")
 	case errors.Is(err, context.Canceled):

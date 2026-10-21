@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -30,6 +31,23 @@ func (e *SearchError) Error() string { return "upstream: search error: " + e.Mes
 // maxSearchLineBytes caps one NDJSON line. A docs event carries the whole
 // ranked list, so the buffer is generous.
 const maxSearchLineBytes = 16 << 20
+
+// Collection caps bound what a hostile or buggy upstream can make the
+// gateway retain and echo. They are well above any plausible real run: the
+// upstream's own maximum is fanout 5 × depth 3.
+const (
+	maxCollectedQueries = 32
+	maxCollectedSources = 50
+	maxQueryRunes       = 2000
+	maxTitleRunes       = 512
+	maxURLRunes         = 4096
+)
+
+// absoluteSearchCap bounds a whole run independently of the sliding idle
+// window, so an upstream that emits one keep-alive line per idle period
+// cannot pin a request forever. Ten idle windows is far beyond a real run
+// (the smallest captured run took 3.1 s).
+func absoluteSearchCap(idle time.Duration) time.Duration { return 10 * idle }
 
 // Search runs POST /api/search-lab/run and collects the rewritten queries
 // and the final docs source list. It stops reading as soon as retrieval is
@@ -119,6 +137,10 @@ func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*Searc
 
 	timer := time.NewTimer(idle)
 	defer timer.Stop()
+	// The deadline starts when collection starts, i.e. after the response
+	// headers; the pre-header phase has its own bound in post().
+	deadline := time.NewTimer(absoluteSearchCap(idle))
+	defer deadline.Stop()
 
 	res := &SearchResult{}
 	seenQuery := make(map[string]bool)
@@ -134,6 +156,8 @@ func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*Searc
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-timer.C:
+			return nil, ErrIdleTimeout
+		case <-deadline.C:
 			return nil, ErrIdleTimeout
 		case resLine := <-lines:
 			if !timer.Stop() {
@@ -164,10 +188,15 @@ func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*Searc
 			switch ev.Type {
 			case searchEventQueries:
 				for _, q := range ev.Queries {
-					if q = strings.TrimSpace(q); q != "" && !seenQuery[q] {
-						seenQuery[q] = true
-						res.Queries = append(res.Queries, q)
+					if len(res.Queries) >= maxCollectedQueries {
+						break
 					}
+					q = strings.TrimSpace(q)
+					if q == "" || len(q) > maxQueryRunes || seenQuery[q] {
+						continue
+					}
+					seenQuery[q] = true
+					res.Queries = append(res.Queries, q)
 				}
 			case searchEventDocs:
 				res.Sources = normalizeSources(ev.Sources)
@@ -191,22 +220,64 @@ func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*Searc
 	}
 }
 
-// normalizeSources cleans upstream titles (raw HTML whitespace) and drops
-// entries without a URL. The upstream already returns rank order.
+// normalizeSources cleans upstream titles (raw HTML whitespace), keeps only
+// http(s) URLs, and bounds both length and count. The upstream already
+// returns rank order. A non-http URL is dropped rather than passed through:
+// the documented consumer renders these as links, so a javascript:/data:
+// scheme would be executable in its origin.
 func normalizeSources(in []SearchSource) []SearchSource {
-	out := make([]SearchSource, 0, len(in))
+	out := make([]SearchSource, 0, min(len(in), maxCollectedSources))
 	for _, s := range in {
+		if len(out) >= maxCollectedSources {
+			break
+		}
 		url := strings.TrimSpace(s.URL)
-		if url == "" {
+		if !isHTTPURL(url) || len(url) > maxURLRunes || hasControl(url) {
 			continue
 		}
 		out = append(out, SearchSource{
-			Title: strings.Join(strings.Fields(s.Title), " "),
+			Title: truncateRunes(strings.Join(strings.Fields(s.Title), " "), maxTitleRunes),
 			URL:   url,
 			Score: s.Score,
 		})
 	}
 	return out
+}
+
+// isHTTPURL reports whether raw is an absolute http(s) URL with a host.
+func isHTTPURL(raw string) bool {
+	if len(raw) < len("http://")+1 {
+		return false
+	}
+	lower := strings.ToLower(raw)
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	return err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https")
+}
+
+// hasControl reports whether s contains ASCII control characters, which
+// could smuggle headers or terminal escapes into downstream consumers.
+func hasControl(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// truncateRunes returns s cut to at most n runes, preserving valid UTF-8.
+func truncateRunes(s string, n int) string {
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
 }
 
 // SearchConfig calls GET /api/search-lab/config. It needs no session token
