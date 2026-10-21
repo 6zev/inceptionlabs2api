@@ -170,20 +170,18 @@ solve token locally (v2 PoW, below)                      ~70–100 ms CPU, no ne
 POST <base>/.well-known/vercel/security/request-challenge -> 204 + Set-Cookie: _vcrcs=… (3600 s)
 ```
 
-**Prewarm semantics.** Boot starts clearance acquisition immediately in a
-background goroutine (`Client.StartClearancePrewarm`): it never blocks or
-fails boot, and a failure is logged and left to the ordinary retry paths
-(lazy `Ensure` on the next request, `Refresh` on a challenge). The fill is
-**concurrent** (§2.1.2): one goroutine per empty slot solves the PoW locally
-at the same time and paces only its `submitSolution` POSTs. The fill returns
-as soon as the **first** slot is live — that is when the gateway can serve —
-and the rest of the ring keeps filling behind it. Because the solve is ~100 ms
-and the acquisition shares the gateway's egress, `/healthz` reports
-`clearance.has_cookie:true` within about a second of boot in the normal case;
-a 20-slot ring reaches 20/20 a few seconds later, bounded by the submission
-spacing rather than by the solves. A background refresher (`RefreshLoop`)
-then re-acquires at the configured `IL2API_CLEARANCE_REFRESH` age (45 m of
-the 60 m TTL), measured from boot rather than from the first request.
+**Prewarm semantics.** Boot fills **the first slot synchronously**
+(`Client.StartClearancePrewarm` blocks for one acquisition, ~0.1–0.4 s) and
+the server starts as soon as that slot is live: warm a base, not the maximum.
+A boot fill that fails is **not** a failed startup — the service starts,
+`/healthz` reports exactly what is live, and the background loop retries. The
+remaining slots are filled by **one** background goroutine, strictly
+sequentially, with a 1–2 s (jittered) pause between acquisitions (§2.1.2), so
+a 20-slot ring reaches 20/20 over roughly 30–60 s and the edge sees only the
+mild, human-paced trickle the gateway's own traffic produces. A refresher
+running in the same loop then re-acquires at the configured
+`IL2API_CLEARANCE_REFRESH` age (45 m of the 60 m TTL), one slot per tick,
+measured from boot rather than from the first request.
 
 ### 2.1.2 Clearance ring — design and the evidence behind it
 
@@ -212,89 +210,96 @@ Conclusions the ring is built on:
 
 - **Fungible, no per-cookie penalty.** Probe 4 is the evidence: ten rapid
   requests on one cookie did not retire it and did not penalise cookie B.
-  A ring of 3 therefore buys (a) a request that gets challenged retires only
+  A ring of 20 therefore buys (a) a request that gets challenged retires only
   one slot, and (b) rotation spreads per-cookie request counts, which is a
   cheap hedge against a penalty that may exist at volumes the probes cannot
   reach. It does **not** buy parallelism for its own sake.
 - All ring slots must come from the **same egress** (the cookie is IP-bound,
   §2.1.1). Acquisition shares the transport, so this is automatic.
-- **Solves are local and concurrent; submissions are paced.** This is the
-  distinction the earlier "acquire sequentially" rule missed: the v2 PoW is
-  pure local CPU work (three SHA-256 prefix rounds, ~50–200 ms) and is *not*
-  upstream traffic at all, so solving for every empty slot at once is free of
-  WAF consequence. The only upstream calls in acquisition are the
-  `GET /api/session` probe and the `POST request-challenge` submission. Those
-  POSTs are spaced by `IL2API_CLEARANCE_SUBMIT_SPACING` (default 250 ms), so a
-  20-slot boot fill reaches the edge as ~20 submissions over ~5 s — gentler
-  than the request traffic the ring exists to protect. A single submission is
-  also bounded by a mutex (one POST in flight at a time); the spacing is the
-  rate limit, the mutex only removes timer jitter.
-- The concurrency bound is **one acquisition per slot**: a slot already being
-  filled is never started again (per-slot single-flight), while other slots
-  fill and serve independently. Boot returns to the caller as soon as the
-  first slot is live; the remaining slots finish in the background.
+- **No concurrency: one acquisition at a time, in one background loop.** The
+  earlier draft of this section proposed solving the PoW for every slot at
+  once and pacing only the submissions. That is unnecessary machinery: the
+  chain is ~0.1–0.4 s per slot, so a strictly sequential fill of 20 slots is
+  30–60 s of background work — invisible to callers, and inherently WAF-civil
+  because each acquisition is one probe plus one POST, separated by the
+  fill's own pause. The design is therefore deliberately boring: **one**
+  goroutine, no concurrent solves, no submission lock, no cross-slot
+  single-flight. Fewer moving parts means fewer ways to stall the request
+  path.
 
-**Ring lifecycle.** `IL2API_CLEARANCE_POOL` slots, each `{cookie, acquired}`:
+**Ring lifecycle.** `IL2API_CLEARANCE_POOL` slots, each
+`{cookie, acquiredAt, state}` where `state` is `pending` (never filled),
+`live` (holding a cookie) or `cooldown` (its last acquisition failed; waiting
+out `IL2API_CLEARANCE_COOLDOWN` before the loop retries it):
 
 - `Header()` (called once per upstream request) returns the next slot
   **round-robin, rotating once per request** — not once per token or per
   retry — together with the shared UA. A slot past `IL2API_CLEARANCE_REFRESH`
   is skipped if another live slot exists; a request never blocks on the ring.
-- `Prewarm(ctx)` starts the concurrent fill and returns once **one** slot is
-  live (or once the attempt is finished — an unchallenged egress, or a first
-  failure that is logged). The rest of the fill continues in the background.
-  `PrewarmNow(ctx)` is the blocking variant used by tests: it starts one
-  acquisition per empty slot, waits for all of them, and reports the first
-  failure. Both are safe to call with the ring already full (a no-op).
+- **Boot** acquires the first slot synchronously (~0.1–0.4 s) and then starts
+  the server. If that acquisition fails the server still starts: boot prewarm
+  failure is not a failed startup. `PrewarmNow(ctx)` is the blocking variant
+  used by tests: it fills the whole ring sequentially and reports the first
+  failure.
+- **The background fill loop** (`RunFillLoop`, the only long-lived goroutine)
+  repeats: if any slot is `pending`, fill the lowest-numbered one (PoW + one
+  POST), then sleep 1–2 s + jitter; if the oldest live slot is past
+  `IL2API_CLEARANCE_REFRESH`, replace it (one per iteration) instead; if the
+  ring is full and fresh, sleep a few seconds and look again. It never exits
+  until its context is cancelled. The same loop therefore covers a slot
+  retired by a 429: retirement makes the ring fall short of `Pool`, which is
+  exactly the condition the loop fills.
 - `Ensure(ctx)` acquires when **no** slot is live, or replaces the oldest slot
   when every slot is past the refresh margin. It never tops the ring up: the
-  boot prewarm fills empty slots to the configured size, and a partially
-  filled ring serves immediately with the slots it has.
-- The background `RefreshLoop` checks the ring every minute and replaces the
-  slots at the refresh margin, **one per tick**. At the 45 m margin and a
-  one-minute tick, a 20-slot ring is fully replaced in 20 ticks (20 min) —
-  comfortably inside the 20-minute headroom between the refresh margin and
-  the 60 m TTL, and no tick bursts more than one solve. A larger ring
-  therefore does not need a larger per-tick budget; the 45 m margin is what
-  makes one-per-tick sufficient.
-- **429 on a slot** retires *that slot only*: the request replays once with a
-  freshly acquired cookie (the play is made with a second, still-live slot if
-  one exists), and the retired slot is refilled **asynchronously** in its own
-  goroutine. The request path never waits for that refill; other slots are
-  untouched and their ages are unaffected.
+  background loop does that, and a partially filled ring serves immediately
+  with the slots it has.
+- **Refresh is smooth, never bursty.** `IL2API_CLEARANCE_REFRESH` is 45 m of
+  the 60 m TTL. The loop replaces **one slot per iteration**, and the slots'
+  acquisition times are naturally staggered by the sequential boot fill and
+  the one-at-a-time refills, so the ring rotates continuously: at 20 slots the
+  steady-state pace is ~2m15s per replacement, and the full ring is refreshed
+  inside the 15-minute headroom with no tick ever solving more than one slot.
+- **429 on a slot** retires *that slot only* (state `pending`): the request
+  path does nothing but mark it and immediately replay the request on the next
+  live slot. It never waits for a solve. The background loop picks the
+  retired slot up on its next iteration; other slots are untouched and their
+  ages are unaffected.
 - A probe of an unchallenged egress (no cookie) is recorded once
   (§2.1.1, L3); the ring does not manufacture cookies on an egress that does
   not need them.
 - The failed-acquisition cooldown is **per slot**: a slot whose last attempt
-  failed waits `IL2API_CLEARANCE_COOLDOWN` before that *slot* is retried, so
-  one broken attempt does not freeze the whole ring's fills (or its serving).
-  Retirement and refill are per-slot for the same reason.
+  failed enters `cooldown` for `IL2API_CLEARANCE_COOLDOWN` and the loop moves
+  on to other work in the meantime, so one broken attempt does not freeze the
+  whole ring's fills (or its serving).
 
 **Observability.** `/healthz` reports
-`clearance: {has_cookie, age_seconds, refresh_count, slots:[{cookie:bool,
-age_seconds, refresh_count}]}`. The top-level fields describe the oldest live
-slot (`has_cookie` false when the ring is empty); `slots` has one entry per
-configured slot so an operator can see a single retired slot against a healthy
-ring. `refresh_count` counts acquisitions for that slot.
+`clearance: {live, pool, has_cookie, age_seconds, refresh_count,
+slots:[{cookie:bool, state, age_seconds, refresh_count}]}`. `live` is the
+count of slots holding a cookie and `pool` the configured size; the top-level
+`has_cookie`/`age_seconds` describe the oldest live slot; `slots` has one
+entry per configured slot, with `state` (`pending` | `live` | `cooldown`) and
+its age, so an operator can watch the ring fill from 1/20 to 20/20 and see a
+single retired slot against a healthy ring. `refresh_count` counts
+acquisitions for that slot. The `ok` field of `/healthz` is `true` as soon as
+the service is up: readiness is minimum availability, not a full pool.
 
 **Why twenty.** Each acquisition is a real solve (~50–200 ms CPU observed in
-the probes) plus a paced POST. Twenty slots buy survivability against a
-bout of per-cookie retirements — the same stock shape chatglm2api keeps for
-anonymous identities — at a cost of ~5 s of boot-time submits and a 100 ms
+the probes) plus a POST. Twenty slots buy survivability against a bout of
+per-cookie retirements — the same stock shape chatglm2api keeps for anonymous
+identities — at a cost of a 30–60 s background fill at boot and one ~0.2 s
 refresh per slot per 45 min. Rotation across 20 slots also spreads per-cookie
 request counts far more than 3 did, which is the cheap hedge the probes
 support. `1` remains the single-cookie behaviour.
 
-**Cold boot.** Boot order is: transport → clearance prewarm (background) →
-pool maintainer starts filling `IL2API_POOL_MIN` (which needs clearance, so it
-waits for the first solve) → search config probe (needs a pooled token, so it
-waits for the pool). The first slot is live after one solve (~0.1–0.4 s), so
-the pool can start; the rest of the ring fills concurrently behind it within
-one submission-spacing window. Fully-warm state — ring at size, pool at min,
-search probed — is reached in a few seconds locally; the audio probe (30.9 s
-for 2.5 MB) shows the upstream can be slow, but none of those phases blocks
-boot. `/healthz` is reachable from the first second and reports each phase as
-it lands.
+**Cold boot.** Boot order is: transport → **clearance first slot
+(synchronous, ~0.1–0.4 s)** → server starts → background fill loop begins the
+remaining slots → pool maintainer fills `IL2API_POOL_MIN` (which needs
+clearance, so it uses the first slot) → search config probe (needs a pooled
+token). Fully-warm state — ring at 20/20, pool at min, search probed — is
+reached in ~30–60 s locally, almost all of it the paced ring fill; the audio
+probe (30.9 s for 2.5 MB) shows the upstream can be slow, but none of those
+phases blocks boot. `/healthz` is reachable from the first second, reports
+`live`/`pool` truthfully throughout, and each phase as it lands.
 
 The token format is
 `<version>.<seed>.<ttl>.<base64(payload)>.<signature>`, where
@@ -318,19 +323,20 @@ together with its captured-fixture tests (a real Chromium token/solution pair
 must verify offline).
 
 **Lifecycle.** One `Clearance` value per client (a ring of cookies, §2.1.2),
-mutex-guarded, with per-slot single-flight (one acquisition per slot;
-different slots fill concurrently):
+mutex-guarded, with one sequential background fill loop and per-slot
+acquisition single-flight inside it:
 
 - `Header() (ua, cookie)` is consulted on every upstream request and rotates
   the ring; empty cookie means "no slot is live yet".
 - `Refresh(ctx)` runs `GET → solve → POST` and stores a cookie in a slot with
-  its issue time. A **failed** acquisition opens a 15 s cooldown **on that
-  slot**, so a challenged burst — or a checkpoint that keeps refusing — cannot
-  become a solve storm while other slots keep filling and serving. Inside the
-  window a live cookie is reused, and a caller without one receives the
-  recorded failure rather than a silent success. A successful solve never
-  opens a window, so the replay after a 429 is never blocked. Submission
-  POSTs are paced ring-wide (§2.1.2); the solves themselves run concurrently.
+  its issue time. A **failed** acquisition puts that slot in `cooldown` for
+  15 s, so a challenged burst — or a checkpoint that keeps refusing — cannot
+  become a solve storm; the fill loop skips it in the meantime and keeps
+  working the other slots. Inside the window a live cookie is reused, and a
+  caller without one receives the recorded failure rather than a silent
+  success. A successful solve never opens a window, so the replay after a 429
+  is never blocked. Acquisitions are sequential — one at a time, in the one
+  fill loop — which is itself the pacing (§2.1.2).
 - An egress the edge does not challenge is recorded as such (with its
   timestamp) instead of being probed before every request; it is re-probed on
   the same schedule a cookie would be refreshed.
@@ -984,7 +990,7 @@ helper to prove family behaviour is a sign the helper's seam is wrong.
 | `/v1/audio/speech` | POST | yes | §7.2 |
 | `/v1/audio/transcriptions` | POST | yes | §7.3 |
 | `/v1/models` | GET | yes | static list, `{object:"list",data:[{id,object:"model",created,owned_by:"inceptionlabs"}]}` — audio models are **not** listed (OpenAI does not list them either) |
-| `/healthz` | GET/HEAD | no | `{"ok":true,"pool":{"size","min","max"},"clearance":{"has_cookie","age_seconds","refresh_count","slots":[{"cookie","age_seconds","refresh_count"}]},"search":{"available":bool|null},"counters":{...}}` |
+| `/healthz` | GET/HEAD | no | `{"ok":true,"pool":{"size","min","max"},"clearance":{"live","pool","has_cookie","age_seconds","refresh_count","slots":[{"cookie","state","age_seconds","refresh_count"}]},"search":{"available":bool|null},"counters":{...}}` |
 
 ### 7.1 `POST /v1/web_search`
 
@@ -1166,9 +1172,8 @@ rides a custom header). CORS runs outside auth so preflights are answerable.
 | `IL2API_IDLE_TIMEOUT` | `60s` | stream idle watchdog |
 | `IL2API_CONTEXT_CHARS` | `0` | deprecated no-op, retained for config compatibility; there is no input guard |
 | `IL2API_CLEARANCE_REFRESH` | `45m` | proactive clearance refresh age **per ring slot** (cookie TTL is 60m) |
-| `IL2API_CLEARANCE_COOLDOWN` | `15s` | minimum retry interval after a **failed** clearance acquisition |
+| `IL2API_CLEARANCE_COOLDOWN` | `15s` | minimum retry interval after a **failed** clearance acquisition, per slot |
 | `IL2API_CLEARANCE_POOL` | `20` | clearance cookies held in the rotation ring (§2.1.2); `1` = the old single-cookie behaviour |
-| `IL2API_CLEARANCE_SUBMIT_SPACING` | `250ms` | minimum spacing between `request-challenge` POSTs during acquisition; solves themselves are local and concurrent (§2.1.2) |
 | `IL2API_SESSION_TIMEOUT` | `15s` | single `/api/session` fetch timeout |
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` sliding idle watchdog (the same window the chat path uses for `IL2API_IDLE_TIMEOUT`) |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`; `off` skips the startup `/api/search-lab/config` probe (`search.available` stays `null`). The probe is advisory; requests are never gated on it |
@@ -1205,23 +1210,24 @@ Invalid values are startup errors with an actionable message.
   duplicate URLs, sources after `text-end` followed by a later text block,
   the capture fixture `testdata/source-url-capture.sse`, and the non-stream
   `message.annotations` shape. The sentinel titles never reach a client.
-- Clearance prewarm is pinned: boot starts acquisition without blocking
-  (a stalled challenge does not delay `StartClearancePrewarm`'s return), a
-  failed acquisition is tolerated and leaves `has_cookie:false`, and the
-  refresh loop re-acquires at the configured age from boot.
+- Clearance prewarm is pinned: boot acquires the first slot with a bounded
+  wait, a stalled or failing challenge does not fail startup (the server
+  starts, `has_cookie` stays false and the loop retries), and the refresh
+  loop re-acquires at the configured age from boot.
 - The clearance **ring** (§2.1.2) is pinned against a mock challenge endpoint:
-  boot fills every configured slot concurrently; the fill's solves overlap in
-  time while its submissions never do (and are spaced by the configured
-  interval); `Prewarm` returns as soon as one slot is live, with the rest of
-  the fill continuing in the background; `Header()` rotates once per request
-  (`n` requests over `k` slots each see each slot `n/k` times); a slot past
-  the refresh age is skipped while a live slot exists; the refresh loop
-  replaces one stale slot per tick, and 20 slots at the 45 m margin complete
-  inside the 60 m TTL; a 429 retires only the challenged slot and leaves the
-  others' ages untouched, refilling it asynchronously (the request path does
-  not wait for the solve); the failed-acquisition cooldown is per-slot;
-  `IL2API_CLEARANCE_POOL=1` reproduces the single-cookie behaviour. `/healthz`
-  reports per-slot ages and refresh counts.
+  boot leaves exactly one live slot with the rest `pending`; the background
+  fill loop completes the ring sequentially (never two acquisitions in
+  flight) and paces iterations by the configured 1–2 s + jitter; `Header()`
+  rotates once per request (`n` requests over `k` slots each see each slot
+  `n/k` times); a slot past the refresh age is skipped while a live slot
+  exists; the refresh loop replaces one stale slot per iteration, so 20 slots
+  are fully refreshed inside the 45 m→60 m headroom with no tick bursting; a
+  429 retires only the challenged slot, the request replays on the next live
+  slot without waiting, and the same background loop refills the retired slot;
+  a failed fill enters `cooldown` and is retried, leaving the other slots and
+  the service unaffected; shutdown cancels the loop with no goroutine leak
+  (`-race`); `IL2API_CLEARANCE_POOL=1` reproduces the single-cookie behaviour.
+  `/healthz` reports `live`/`pool` plus per-slot state and age.
 - Audio is tested against `httptest` mocks of `/api/tts` and `/api/stt`
   through the same TLS-checkpoint mock as chat, so the real
   `postAuthed`/`Send` path is exercised:
