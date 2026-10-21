@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -14,6 +15,7 @@ import (
 	"encoding/pem"
 	"io"
 	"math/big"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -49,6 +51,8 @@ type tlsUpstream struct {
 	chat   func(w http.ResponseWriter, r *http.Request)
 	search func(w http.ResponseWriter, r *http.Request)
 	config func(w http.ResponseWriter, r *http.Request)
+	tts    func(w http.ResponseWriter, r *http.Request)
+	stt    func(w http.ResponseWriter, r *http.Request)
 	status atomic.Int32
 	// sessionBody overrides the /api/session body when non-empty.
 	sessionBody string
@@ -112,6 +116,26 @@ func newTLSUpstream(t *testing.T) *tlsUpstream {
 	}
 	m := &tlsUpstream{ln: ln, roots: roots, base: "https://" + ln.Addr().String()}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/tts", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		fn := m.tts
+		m.mu.Unlock()
+		if fn == nil {
+			http.NotFound(w, r)
+			return
+		}
+		fn(w, r)
+	})
+	mux.HandleFunc("/api/stt", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		fn := m.stt
+		m.mu.Unlock()
+		if fn == nil {
+			http.NotFound(w, r)
+			return
+		}
+		fn(w, r)
+	})
 	mux.HandleFunc("/api/session", func(w http.ResponseWriter, r *http.Request) {
 		if m.status.Load() != 0 {
 			w.WriteHeader(int(m.status.Load()))
@@ -220,6 +244,7 @@ func newStack(t *testing.T, idle time.Duration) *stack {
 		Logf:         func(string, ...any) {},
 	}, c, p)
 	gs.SetSearcher(c)
+	gs.SetSpeech(c)
 	gs.SetClearance(c.Clearance())
 	srv := httptest.NewServer(gs.Handler())
 	t.Cleanup(srv.Close)
@@ -870,4 +895,132 @@ type sseChunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
+}
+
+// TestEndToEndAudioRoundTrip drives the whole audio suite through the real
+// client and checkpoint transport: TTS bytes come back from the mock and are
+// then fed to the transcription endpoint, which forwards them upstream.
+func TestEndToEndAudioRoundTrip(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, 5*time.Second)
+
+	const spoken = "The quick brown fox jumps over the lazy dog."
+	mp3 := append([]byte("ID3\x04\x00\x00\x00\x00\x00\x00"), 0xFF, 0xFB, 0x90, 0xC4, 0, 0, 0, 0)
+
+	var (
+		mu        sync.Mutex
+		ttsBody   map[string]string
+		sttPart   []byte
+		sttType   string
+		sttField  string
+		sttTokens []string
+	)
+	st.mock.tts = func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		ttsBody = body
+		mu.Unlock()
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Write(mp3)
+	}
+	st.mock.stt = func(w http.ResponseWriter, r *http.Request) {
+		mr, err := r.MultipartReader()
+		if err != nil {
+			t.Errorf("stt is not multipart: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		p, err := mr.NextPart()
+		if err != nil {
+			t.Errorf("stt has no part: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		data, _ := io.ReadAll(p)
+		mu.Lock()
+		sttPart, sttType, sttField = data, p.Header.Get("Content-Type"), p.FormName()
+		sttTokens = append(sttTokens, r.Header.Get("x-session-token"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"text":"`+spoken+`"}`)
+	}
+
+	// 1. Speech.
+	resp, err := http.Post(st.srv.URL+"/v1/audio/speech", "application/json",
+		strings.NewReader(`{"model":"tts-1","input":"`+spoken+`","voice":"alloy","response_format":"wav"}`))
+	if err != nil {
+		t.Fatalf("POST speech: %v", err)
+	}
+	audio, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("speech status = %d body %s", resp.StatusCode, audio)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "audio/mpeg" {
+		t.Fatalf("speech content-type = %q (response_format wav must still be mp3)", ct)
+	}
+	if !bytes.Equal(audio, mp3) {
+		t.Fatalf("speech body was rewritten: %q", audio)
+	}
+	mu.Lock()
+	sent := ttsBody
+	mu.Unlock()
+	if sent["text"] != spoken || sent["voice"] != "sarah" {
+		t.Fatalf("upstream tts body = %v", sent)
+	}
+
+	// 2. Feed the MP3 back to transcriptions.
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "speech.mp3")
+	fw.Write(audio)
+	mw.Close()
+	resp, err = http.Post(st.srv.URL+"/v1/audio/transcriptions", mw.FormDataContentType(), &buf)
+	if err != nil {
+		t.Fatalf("POST transcriptions: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("transcriptions status = %d body %s", resp.StatusCode, raw)
+	}
+	var tr struct {
+		Object string `json:"object"`
+		Text   string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		t.Fatalf("decode %s: %v", raw, err)
+	}
+	if tr.Object != "transcription" || tr.Text != spoken {
+		t.Fatalf("transcription = %s", raw)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !bytes.Equal(sttPart, audio) {
+		t.Fatalf("upstream received %d bytes, want the %d-byte mp3", len(sttPart), len(audio))
+	}
+	if sttField != "file" {
+		t.Fatalf("part field = %q", sttField)
+	}
+	// CreateFormFile sends application/octet-stream; the gateway must retype
+	// the part as audio/mpeg because the bytes are MPEG.
+	if sttType != "audio/mpeg" {
+		t.Fatalf("upstream part content-type = %q, want audio/mpeg", sttType)
+	}
+	if len(sttTokens) != 1 || sttTokens[0] == "" {
+		t.Fatalf("stt carried no session token: %v", sttTokens)
+	}
+
+	// 3. Counters.
+	h, err := http.Get(st.srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("healthz: %v", err)
+	}
+	hb, _ := io.ReadAll(h.Body)
+	h.Body.Close()
+	if !strings.Contains(string(hb), `"tts":1`) || !strings.Contains(string(hb), `"stt":1`) {
+		t.Fatalf("healthz = %s", hb)
+	}
 }
