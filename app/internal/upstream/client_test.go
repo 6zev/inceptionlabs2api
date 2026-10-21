@@ -856,3 +856,55 @@ func TestStatusErrorMessage(t *testing.T) {
 		t.Fatalf("long message len = %d, want a bounded prefix of %d", len(got), maxClientMessage)
 	}
 }
+
+// A challenge retires the slot it was carried by and replaces it; the ring is
+// never invalidated wholesale (SPEC §2.1.2).
+func TestChallengeRetiresTheSlotAndRefills(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	var attempts atomic.Int32
+	m.chatHandler = func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			m.challenge(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"type\":\"text-delta\",\"id\":\"text-0\",\"delta\":\"ok\"}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}
+	c, _ := newTestClient(t, m, 1)
+	if err := c.Clearance().Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	live := func() int {
+		n := 0
+		for _, s := range c.Clearance().State().Slots {
+			if s.Cookie {
+				n++
+			}
+		}
+		return n
+	}
+	// One slot is held; a challenge must not clear others or leave the ring
+	// short. (With one held slot the retirement is observable as a gap that
+	// the immediate Refresh and the background refill both target.)
+	if got := live(); got != 1 {
+		t.Fatalf("live slots before = %d, want 1", got)
+	}
+	stream, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	stream.Close()
+	if got := m.challengeSubmits.Load(); got < 2 {
+		t.Fatalf("clearance acquisitions = %d, want the challenge replay to solve", got)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if live() >= 1 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("ring is empty after the challenge: %+v", c.Clearance().State())
+}

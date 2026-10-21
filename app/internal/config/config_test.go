@@ -49,6 +49,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.ClearanceCooldown != 15*time.Second {
 		t.Errorf("ClearanceCooldown = %s, want 15s", cfg.ClearanceCooldown)
 	}
+	if cfg.ClearancePool != 3 {
+		t.Errorf("ClearancePool = %d, want the default 3", cfg.ClearancePool)
+	}
 }
 
 func TestFromEnvOverrides(t *testing.T) {
@@ -123,6 +126,7 @@ func TestValidationErrors(t *testing.T) {
 		{"negative context", map[string]string{"IL2API_CONTEXT_CHARS": "-2"}, "CONTEXT_CHARS"},
 		{"zero clearance refresh", map[string]string{"IL2API_CLEARANCE_REFRESH": "0s"}, "CLEARANCE_REFRESH"},
 		{"negative clearance cooldown", map[string]string{"IL2API_CLEARANCE_COOLDOWN": "-1s"}, "CLEARANCE_COOLDOWN"},
+		{"zero clearance pool", map[string]string{"IL2API_CLEARANCE_POOL": "0"}, "CLEARANCE_POOL"},
 		{"bad int", map[string]string{"IL2API_POOL_MIN": "two"}, "must be an integer"},
 		{"bad duration", map[string]string{"IL2API_POOL_TTL": "30"}, "must be a duration"},
 		{"zero duration", map[string]string{"IL2API_IDLE_TIMEOUT": "0s"}, "must be positive"},
@@ -220,12 +224,16 @@ func TestClearanceOverrides(t *testing.T) {
 	cfg, err := FromEnv(envMap(map[string]string{
 		"IL2API_CLEARANCE_REFRESH":  "30m",
 		"IL2API_CLEARANCE_COOLDOWN": "5s",
+		"IL2API_CLEARANCE_POOL":     "5",
 	}))
 	if err != nil {
 		t.Fatalf("FromEnv: %v", err)
 	}
 	if cfg.ClearanceRefresh != 30*time.Minute || cfg.ClearanceCooldown != 5*time.Second {
 		t.Fatalf("clearance durations not applied: %+v", cfg)
+	}
+	if cfg.ClearancePool != 5 {
+		t.Fatalf("ClearancePool = %d, want 5", cfg.ClearancePool)
 	}
 }
 

@@ -40,8 +40,11 @@ type Config struct {
 	AudioMaxBytes int64
 	// ClearanceRefresh is the proactive _vcrcs refresh age (cookie TTL 60m).
 	ClearanceRefresh time.Duration
-	// ClearanceCooldown is the minimum spacing between clearance refreshes.
+	// ClearanceCooldown is the minimum retry interval after a failed
+	// clearance acquisition.
 	ClearanceCooldown time.Duration
+	// ClearancePool is the size of the clearance ring (SPEC §2.1.2).
+	ClearancePool int
 }
 
 // Defaults returns the configuration used when no environment variable is set.
@@ -66,6 +69,7 @@ func Defaults() Config {
 
 		ClearanceRefresh:  45 * time.Minute,
 		ClearanceCooldown: 15 * time.Second,
+		ClearancePool:     3,
 	}
 }
 
@@ -149,6 +153,9 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if c.ClearanceCooldown, err = envDuration(getenv, "IL2API_CLEARANCE_COOLDOWN", c.ClearanceCooldown); err != nil {
 		return Config{}, err
 	}
+	if c.ClearancePool, err = envInt(getenv, "IL2API_CLEARANCE_POOL", c.ClearancePool); err != nil {
+		return Config{}, err
+	}
 	if v := strings.TrimSpace(strings.ToLower(getenv("IL2API_SEARCH_CONFIG_CHECK"))); v != "" {
 		switch v {
 		case "on", "1", "true", "yes":
@@ -205,6 +212,9 @@ func (c Config) validate() error {
 	}
 	if c.ClearanceCooldown < 0 {
 		return fmt.Errorf("config: IL2API_CLEARANCE_COOLDOWN must not be negative, got %s", c.ClearanceCooldown)
+	}
+	if c.ClearancePool < 1 {
+		return fmt.Errorf("config: IL2API_CLEARANCE_POOL must be >= 1, got %d", c.ClearancePool)
 	}
 	u, err := url.Parse(c.UpstreamBase)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {

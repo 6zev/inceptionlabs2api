@@ -107,9 +107,11 @@ type Config struct {
 	SessionTimeout time.Duration
 	// ClearanceRefresh is the proactive cookie refresh age. Zero means 45m.
 	ClearanceRefresh time.Duration
-	// ClearanceCooldown is the minimum spacing between acquisitions. Zero
-	// means 15s.
+	// ClearanceCooldown is the minimum retry interval after a failed
+	// acquisition. Zero means 15s.
 	ClearanceCooldown time.Duration
+	// ClearancePool is the size of the clearance ring. Zero means 3.
+	ClearancePool int
 	// RootCAs is optional; nil means the system trust store.
 	RootCAs *x509.CertPool
 	// Logf is optional; nil means log.Printf.
@@ -142,6 +144,7 @@ func NewClient(cfg Config) (*Client, pool.Fetcher) {
 	c.clear = clear.New(clear.Config{
 		BaseURL:  c.base,
 		Client:   hc,
+		Pool:     cfg.ClearancePool,
 		Refresh:  cfg.ClearanceRefresh,
 		Cooldown: cfg.ClearanceCooldown,
 		Logf:     logf,
@@ -179,6 +182,43 @@ func (c *Client) applyClearance(req *http.Request) {
 	}
 }
 
+// challengedCookie extracts the clearance cookie value from the request that
+// produced a challenged response, so only that ring slot is retired. It is ""
+// when the request carried none (an unprotected probe), which Retire ignores.
+func challengedCookie(resp *http.Response) string {
+	if resp == nil || resp.Request == nil {
+		return ""
+	}
+	for _, ck := range resp.Request.Cookies() {
+		if ck.Name == clear.CookieName {
+			return ck.Value
+		}
+	}
+	return ""
+}
+
+// retireClearance retires the ring slot a challenge just rejected and refills
+// it in the background (SPEC §2.1.2). Only that slot is touched, so requests
+// rotating over the other slots keep their cookies and ages.
+func (c *Client) retireClearance(cookie string) {
+	if err := c.clear.Retire(cookie); err != nil {
+		c.logf("upstream: retiring clearance slot: %v", err)
+		return
+	}
+	go c.refillClearance()
+}
+
+// refillClearance acquires one cookie for an empty slot, bounded by the
+// clearance timeout. It runs outside the request path so the replay never
+// waits for it.
+func (c *Client) refillClearance() {
+	ctx, cancel := context.WithTimeout(context.Background(), clear.DefaultTimeout)
+	defer cancel()
+	if err := c.clear.Refill(ctx); err != nil {
+		c.logf("upstream: refilling a retired clearance slot failed: %v", err)
+	}
+}
+
 // ensureClearance acquires (or refreshes) the clearance cookie.
 func (c *Client) ensureClearance(ctx context.Context) error {
 	if err := c.clear.Ensure(ctx); err != nil {
@@ -207,11 +247,12 @@ func (c *Client) Send(ctx context.Context, method, path string, body []byte, hea
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
 	resp.Body.Close()
-	c.logf("upstream: checkpoint challenged %s %s; refreshing clearance and replaying once", method, path)
+	c.logf("upstream: checkpoint challenged %s %s; retiring the slot and replaying once", method, path)
 
-	// The challenge proves the cookie is not accepted; forget it rather than
-	// letting the cooldown reuse it, then acquire a new one.
-	c.clear.Invalidate()
+	// The challenge proves *that* cookie is not accepted. Retire only the slot
+	// that carried it, replace it, and replay; the other slots keep serving
+	// requests in the meantime (SPEC §2.1.2).
+	c.retireClearance(challengedCookie(resp))
 	if err := c.clear.Refresh(ctx); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrClearance, err)
 	}

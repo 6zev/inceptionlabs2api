@@ -46,17 +46,29 @@ func TestPrewarmAcquiresCookie(t *testing.T) {
 	c := newTestClearance(t, cs.srv)
 	c.Prewarm(context.Background())
 
-	deadline := time.Now().Add(3 * time.Second)
+	// A deadline, not a latency claim: under -race with the full suite the
+	// three sequential solves plus TLS handshakes can take seconds. The
+	// property under test is that the boot fill reaches every slot.
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if c.State().HasCookie {
-			if got := cs.tokenCount(); got != 1 {
-				t.Fatalf("challenge fetches = %d, want 1", got)
+		st := c.State()
+		if st.HasCookie && len(st.Slots) == DefaultPool {
+			filled := 0
+			for _, s := range st.Slots {
+				if s.Cookie {
+					filled++
+				}
 			}
-			return
+			if filled == DefaultPool {
+				if got := cs.tokenCount(); got != DefaultPool {
+					t.Fatalf("challenge fetches = %d, want one per slot", got)
+				}
+				return
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("cookie never appeared after Prewarm (state %+v)", c.State())
+	t.Fatalf("ring never filled after Prewarm (state %+v)", c.State())
 }
 
 // A failed acquisition is tolerated: it is logged, boot continues, and the

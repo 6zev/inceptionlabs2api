@@ -39,6 +39,7 @@ func run() error {
 		SessionTimeout:    cfg.SessionTimeout,
 		ClearanceRefresh:  cfg.ClearanceRefresh,
 		ClearanceCooldown: cfg.ClearanceCooldown,
+		ClearancePool:     cfg.ClearancePool,
 		Logf:              logf,
 	})
 
@@ -54,9 +55,11 @@ func run() error {
 	defer p.Close()
 	up.BindPool(p)
 
-	// Prewarm clearance and keep it fresh from boot, so the first chat request
-	// does not pay the PoW + round trip and /healthz reports a cookie within
-	// about a second (SPEC §2.1.1). Non-blocking; failures are logged.
+	// Prewarm the clearance ring and keep it fresh from boot, so the first chat
+	// request does not pay the PoW + round trip and /healthz reports a filled
+	// ring within about a second (SPEC §2.1.1, §2.1.2). Non-blocking; failures
+	// are logged. The pool then fills behind it (it needs clearance to fetch a
+	// token), and the search probe runs last (it needs a pooled token).
 	bootCtx, stopBoot := context.WithCancel(context.Background())
 	defer stopBoot()
 	up.StartClearancePrewarm(bootCtx)

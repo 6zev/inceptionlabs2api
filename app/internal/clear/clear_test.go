@@ -72,8 +72,15 @@ func newChallengeServer(t *testing.T) *challengeServer {
 		}
 		c.mu.Lock()
 		c.solved[token] = true
+		n := len(c.solved)
 		c.mu.Unlock()
-		http.SetCookie(w, &http.Cookie{Name: "_vcrcs", Value: "1.cookievalue", Path: "/", MaxAge: 3600})
+		// Each solve yields a distinct value, like the live edge (probe 1:
+		// three acquisitions produced three different cookies).
+		value := "1.cookievalue"
+		if n > 1 {
+			value = fmt.Sprintf("1.cookievalue-%d", n)
+		}
+		http.SetCookie(w, &http.Cookie{Name: "_vcrcs", Value: value, Path: "/", MaxAge: 3600})
 		w.WriteHeader(http.StatusNoContent)
 	})
 	c.srv = httptest.NewServer(mux)
@@ -101,7 +108,7 @@ func makeToken(seed int64) string {
 
 func (c *challengeServer) validCookie(r *http.Request) bool {
 	ck, err := r.Cookie("_vcrcs")
-	return err == nil && ck.Value == "1.cookievalue"
+	return err == nil && strings.HasPrefix(ck.Value, "1.cookievalue")
 }
 
 func (c *challengeServer) tokenCount() int  { return int(c.tokens.Load()) }
@@ -214,19 +221,25 @@ func TestRefreshRespectsCooldown(t *testing.T) {
 	if err := c.Refresh(context.Background()); err != nil {
 		t.Fatalf("first Refresh: %v", err)
 	}
-	// A second explicit refresh inside the cooldown is a no-op.
+	// A second explicit refresh inside the cooldown still solves: a challenge
+	// replay is a recovery path and must never be blocked (the old single
+	// cookie's rule). It replaces the oldest slot instead of adding one, so
+	// the ring never grows past its size.
 	if err := c.Refresh(context.Background()); err != nil {
 		t.Fatalf("second Refresh: %v", err)
 	}
-	if got := cs.tokenCount(); got != 1 {
-		t.Fatalf("challenge fetches = %d, want 1 inside the cooldown", got)
+	if got := cs.tokenCount(); got != 2 {
+		t.Fatalf("challenge fetches = %d, want 2 (a challenge replay always solves)", got)
+	}
+	if st := c.State(); len(st.Slots) != DefaultPool {
+		t.Fatalf("slots = %d, want %d (a replacement, not a growth)", len(st.Slots), DefaultPool)
 	}
 	now = now.Add(c.cfg.Cooldown)
 	if err := c.Refresh(context.Background()); err != nil {
 		t.Fatalf("third Refresh: %v", err)
 	}
-	if got := cs.tokenCount(); got != 2 {
-		t.Fatalf("challenge fetches = %d, want 2 after the cooldown", got)
+	if got := cs.tokenCount(); got != 3 {
+		t.Fatalf("challenge fetches = %d, want 3 after the cooldown", got)
 	}
 }
 
