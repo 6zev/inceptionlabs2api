@@ -174,14 +174,9 @@ func (s *Server) probeSearch(ctx context.Context) {
 	s.logf("search: retrievalAvailable=%v", available)
 }
 
-// searchDisabled reports a definitive retrievalAvailable:false.
-func (s *Server) searchDisabled() bool {
-	s.searchMu.Lock()
-	defer s.searchMu.Unlock()
-	return s.searchAvailable != nil && !*s.searchAvailable
-}
-
-// SearchAvailable returns the cached probe result, nil when unknown.
+// SearchAvailable returns the cached probe result, nil when unknown. The probe
+// is advisory: it is reported on /healthz and never gates a request, so a stale
+// or wrong value cannot take a working endpoint offline (SPEC §7.1).
 func (s *Server) SearchAvailable() *bool {
 	s.searchMu.Lock()
 	defer s.searchMu.Unlock()

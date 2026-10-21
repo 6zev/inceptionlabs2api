@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"inceptionlabs2api/internal/pool"
 )
 
 // addAudioRoutes wires /api/tts and /api/stt onto the shared TLS mock.
@@ -186,6 +188,63 @@ func TestTranscribeStalledBodyIsBounded(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("Transcribe waited %s on a stalled body", elapsed)
 	}
+}
+
+// When the whole-call deadline fires, the transport cancels the request; the
+// upstream then closes the body cleanly (END_STREAM), so the body read can
+// return io.EOF with zero bytes *before* it finds the cancellation. That must
+// still be classified as the idle timeout it is, not as an empty body or an
+// unparseable transcript. (Observed as a flake in the stalled-body tests: the
+// error said "parse transcript: unexpected end of JSON input (body \"\")".)
+func TestAudioDeadlineCutIsIdleTimeoutEvenOnCleanEOF(t *testing.T) {
+	t.Parallel()
+	// A stub transport whose 200 response body is already complete and empty.
+	// With an expired parent context the call is cut by the deadline, yet the
+	// body read returns a clean EOF: the classification must come from the
+	// deadline, not from the bytes. Real-world reproduction: after the
+	// whole-call timeout cancels the request, the upstream closes the body
+	// cleanly and the read finds END_STREAM before it finds the cancellation.
+	rt := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	})
+	c, p := newStubClient(t, rt)
+
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if _, err := c.Speech(expired, SpeechRequest{Text: "x"}, time.Minute); !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("Speech err = %v, want ErrIdleTimeout", err)
+	}
+	if _, err := c.Transcribe(expired, AudioUpload{Filename: "a.mp3", Data: testMP3}, time.Minute); !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("Transcribe err = %v, want ErrIdleTimeout", err)
+	}
+	_ = p
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// newStubClient builds a Client whose transport is rt over a pre-filled pool.
+func newStubClient(t *testing.T, rt http.RoundTripper) (*Client, *pool.Pool) {
+	t.Helper()
+	c, _ := NewClient(Config{BaseURL: "https://stub.invalid", Logf: func(string, ...any) {}})
+	c.hc.Transport = rt
+	var issued int
+	p := pool.New(pool.Config{Min: 1, Max: 8, TTL: time.Minute, Interval: time.Hour}, func(context.Context) (string, error) {
+		issued++
+		return "1792553057." + strings.Repeat("0", 31) + "a." + strings.Repeat("f", 64), nil
+	})
+	t.Cleanup(p.Close)
+	c.pool = p
+	if _, err := p.Get(context.Background()); err != nil {
+		t.Fatalf("warm pool: %v", err)
+	}
+	return c, p
 }
 
 func TestSpeechRejectsEmptyBody(t *testing.T) {

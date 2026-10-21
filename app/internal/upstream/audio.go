@@ -65,6 +65,12 @@ func (c *Client) Speech(ctx context.Context, req SpeechRequest, timeout time.Dur
 	if err != nil {
 		return nil, audioReadError(ctx, "speech", err)
 	}
+	if cutByDeadline(ctx) {
+		// The deadline cancelled the request and the transport handed back a
+		// clean EOF with whatever bytes had arrived. That is a timeout, not a
+		// short answer; say so before interpreting the bytes.
+		return nil, idleTimeout("speech")
+	}
 	if len(audio) > maxAudioBytes {
 		return nil, fmt.Errorf("upstream: speech body exceeds %d bytes", maxAudioBytes)
 	}
@@ -128,6 +134,9 @@ func (c *Client) Transcribe(ctx context.Context, up AudioUpload, timeout time.Du
 	if err != nil {
 		return "", audioReadError(ctx, "transcript", err)
 	}
+	if cutByDeadline(ctx) {
+		return "", idleTimeout("transcript")
+	}
 	var out struct {
 		Text string `json:"text"`
 	}
@@ -152,9 +161,23 @@ func withCallTimeout(ctx context.Context, timeout time.Duration) (context.Contex
 // caller's.
 func audioReadError(ctx context.Context, what string, err error) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("%w: reading %s body: %v", ErrIdleTimeout, what, err)
+		return idleTimeout(what)
 	}
 	return fmt.Errorf("upstream: read %s body: %w", what, err)
+}
+
+// cutByDeadline reports whether this call's own timeout expired. Unlike
+// audioReadError it applies after a *successful* read: a body cut by the
+// deadline can arrive as a clean EOF (the peer closes END_STREAM when the
+// request is cancelled), and an empty or partial body must not then be
+// reported as "the upstream sent nothing"/"unparseable" (SPEC §7.2).
+func cutByDeadline(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+// idleTimeout is the typed audio timeout error, mapped to 504.
+func idleTimeout(what string) error {
+	return fmt.Errorf("%w: %s body did not complete before the call deadline", ErrIdleTimeout, what)
 }
 
 // escapeQuotes escapes a filename for a quoted Content-Disposition parameter.

@@ -14,12 +14,13 @@ import (
 	"inceptionlabs2api/internal/upstream"
 )
 
-// Search request bounds are the upstream's published ranges. Out-of-range
-// numbers are clamped, which is a translation; they are never a 400.
+// Search request bounds are the ranges the upstream publishes in
+// /api/search-lab/config (`limits`). Out-of-range numbers are clamped, which
+// is a translation; they are never a 400. keep_top_k has no published range
+// and is therefore not bounded here (SPEC §7.1).
 const (
-	maxFanout   = 5
-	maxDepth    = 3
-	maxKeepTopK = 50
+	maxFanout = 5
+	maxDepth  = 3
 )
 
 // webSearchRequest is the POST /v1/web_search body. Config is optional, so
@@ -85,12 +86,6 @@ func (s *Server) webSearch(w http.ResponseWriter, r *http.Request) {
 			"web search backend is not configured"))
 		return
 	}
-	if s.searchDisabled() {
-		s.fail(w, openai.New(http.StatusServiceUnavailable, "server_error", openai.CodeSearchUnavailable, "",
-			"web retrieval is not configured on this deployment"))
-		return
-	}
-
 	res, err := s.se.Search(r.Context(), searchRequest(req), s.cfg.SearchTimeout)
 	if err != nil {
 		// A client that walked away has no socket to answer on; writing an
@@ -126,7 +121,7 @@ func searchRequest(req *webSearchRequest) *upstream.SearchRequest {
 		Config: upstream.SearchConfig{
 			Fanout:   clamp(in.Fanout, 1, maxFanout, 3),
 			Depth:    clamp(in.Depth, 1, maxDepth, 1),
-			KeepTopK: clamp(in.KeepTopK, 1, maxKeepTopK, 10),
+			KeepTopK: keepTopK(in.KeepTopK),
 			Effort:   effort,
 		},
 		Timezone: "UTC",
@@ -144,6 +139,16 @@ func clamp(v, lo, hi, def int) int {
 	}
 	if v > hi {
 		return hi
+	}
+	return v
+}
+
+// keepTopK defaults an unset value and passes everything else through: the
+// upstream publishes no range for keepTopK, so a gateway bound would be an
+// invented policy (§1.1, §7.1).
+func keepTopK(v int) int {
+	if v == 0 {
+		return 10
 	}
 	return v
 }

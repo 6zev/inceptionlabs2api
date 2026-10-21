@@ -108,10 +108,17 @@ func TestWebSearchDefaultsAndClamping(t *testing.T) {
 		t.Fatalf("timezone/language = %q/%q", got.Timezone, got.Language)
 	}
 
+	// fanout/depth are the two values the upstream publishes a range for
+	// (/api/search-lab/config limits). They are clamped; keep_top_k is not,
+	// because the upstream publishes no range for it and clamping to an
+	// invented bound would be second-guessing (SPEC §7.1).
 	postSearch(t, s, `{"query":"q","config":{"fanout":9,"depth":0,"keep_top_k":500}}`)
 	got = se.lastRequest()
-	if got.Config.Fanout != 5 || got.Config.Depth != 1 || got.Config.KeepTopK != 50 {
+	if got.Config.Fanout != 5 || got.Config.Depth != 1 {
 		t.Fatalf("clamped = %+v", got.Config)
+	}
+	if got.Config.KeepTopK != 500 {
+		t.Fatalf("keep_top_k = %d, want 500 passed through unclamped", got.Config.KeepTopK)
 	}
 }
 
@@ -305,23 +312,43 @@ func TestWebSearchUpstreamErrorMapping(t *testing.T) {
 	}
 }
 
-func TestWebSearchConfigDisabledIs503(t *testing.T) {
+// The config probe is advisory: even a definitive retrievalAvailable:false
+// only changes /healthz. The request still flows and the upstream's answer —
+// here an error — is what the client sees. (The old behaviour answered 503
+// from the cached probe, which let a stale probe take a working endpoint
+// offline.)
+func TestWebSearchConfigFalseDoesNotGateRequests(t *testing.T) {
 	t.Parallel()
-	se := &fakeSearcher{cfg: &upstream.SearchConfigResponse{RetrievalAvailable: false}}
+	se := &fakeSearcher{
+		cfg: &upstream.SearchConfigResponse{RetrievalAvailable: false},
+		fn: func(int) (*upstream.SearchResult, error) {
+			return nil, &upstream.StatusError{Status: 503, Body: `{"error":"retrieval is disabled"}`}
+		},
+	}
 	s := newSearchServer(t, se)
 	s.probeSearch(context.Background())
 
 	rec := postSearch(t, s, `{"query":"q"}`)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want the upstream's 502, body %s", rec.Code, rec.Body)
 	}
 	var env openai.ErrorResponse
 	json.Unmarshal(rec.Body.Bytes(), &env)
-	if env.Error.Code != openai.CodeSearchUnavailable {
-		t.Fatalf("code = %q", env.Error.Code)
+	if env.Error.Code != openai.CodeUpstreamError {
+		t.Fatalf("code = %q, want upstream_error", env.Error.Code)
 	}
-	if se.count() != 0 {
-		t.Fatal("a disabled deployment still ran a search")
+	if !strings.Contains(env.Error.Message, "retrieval is disabled") {
+		t.Fatalf("upstream message lost: %q", env.Error.Message)
+	}
+	if se.count() != 1 {
+		t.Fatalf("searches = %d, want the request to reach the upstream", se.count())
+	}
+	// The health view still reports what the probe said.
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	hz := httptest.NewRecorder()
+	s.Handler().ServeHTTP(hz, req)
+	if !strings.Contains(hz.Body.String(), `"available":false`) {
+		t.Fatalf("healthz = %s", hz.Body)
 	}
 }
 
