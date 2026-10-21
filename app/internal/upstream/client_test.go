@@ -511,7 +511,6 @@ func TestChatClientCancelKeepsToken(t *testing.T) {
 		readErr <- stream.Reader.Read(ctx, func(Event) error { return nil })
 	}()
 	<-started
-	tok := m.tokens()[0]
 	cancel()
 	stream.Close()
 	select {
@@ -526,7 +525,6 @@ func TestChatClientCancelKeepsToken(t *testing.T) {
 	if st := p.Stats(); st.Size == 0 {
 		t.Fatal("pool lost the token on client cancel")
 	}
-	_ = tok
 }
 
 // openaiText builds a minimal text message.
@@ -576,16 +574,18 @@ func TestChatHeaderTimeoutIsBounded(t *testing.T) {
 		case <-r.Context().Done():
 		}
 	}
-	c, _ := newTestClient(t, m, 1)
+	c, p := newTestClient(t, m, 1)
+	// Warm the pool so the bound being measured is the header phase, not the
+	// one-off clearance solve.
+	if _, err := p.Get(context.Background()); err != nil {
+		t.Fatalf("warm pool: %v", err)
+	}
 	start := time.Now()
-	_, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), 100*time.Millisecond, nil)
-	var se *StatusError
-	if err == nil || errors.As(err, &se) {
-		// The client wraps the transport error; a timeout is the expected
-		// outcome and must not look like an auth rejection.
-		if errors.Is(err, ErrAuthRejected) {
-			t.Fatalf("header timeout misclassified as auth rejection: %v", err)
-		}
+	_, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), 200*time.Millisecond, nil)
+	// The header bound expiring is reported as the idle timeout (504 on the
+	// server), never as an auth rejection or a silent success.
+	if !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("err = %v, want ErrIdleTimeout", err)
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("waited %s for headers, want the idle bound", elapsed)

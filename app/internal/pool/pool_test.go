@@ -210,11 +210,6 @@ func TestDiscardRemovesOnlyThatToken(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		var found bool
-		for _, tok := range []string{} {
-			_ = tok
-		}
-		_ = found
 		st := p.Stats()
 		if st.Size == 2 {
 			break

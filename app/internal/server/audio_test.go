@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -532,5 +531,3 @@ func TestSpeechErrorIsNotCountedAsUpstreamWhenStructural(t *testing.T) {
 		t.Fatalf("structural 400 counted as an upstream error: %+v", got.Counters)
 	}
 }
-
-var _ = errors.Is
