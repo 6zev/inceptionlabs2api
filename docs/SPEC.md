@@ -13,7 +13,9 @@ OpenAI-compatible Chat Completions API.
 
 **In scope:** anonymous session acquisition, a small token pool,
 `POST /v1/chat/completions` (stream and non-stream),
-`POST /v1/web_search` (standalone retrieval, §2.3 / §7.1), `GET /v1/models`,
+`POST /v1/web_search` (standalone retrieval, §2.3 / §7.1),
+`POST /v1/audio/speech` (TTS, §2.5.1 / §7.2),
+`POST /v1/audio/transcriptions` (STT, §2.5.2 / §7.3), `GET /v1/models`,
 `GET /healthz`, optional bearer-key auth, OpenAI-shaped errors, a 60 s sliding
 idle watchdog, and a disconnect-safe pool.
 
@@ -64,6 +66,10 @@ Explicitly **not** validated (dropped, coerced, or passed through):
 | `content` parts other than `text` (`image_url`, `input_audio`, `file`, …) | text parts are kept; media parts are **rendered as a short text placeholder** so they are visible to the model, never a 400 | The upstream is text-only; the caller's intent survives as text. |
 | Input length | **passed through**; no client-side 400 | The upstream truncates at its own context limit. That is the upstream's contract. |
 | `/v1/web_search` unknown keys, out-of-range `fanout`/`depth`/`keep_top_k`, unknown `effort` | unknown keys **dropped**; numeric values **clamped** to the upstream's published ranges; `effort` **passed through** | The upstream answers what it can. |
+| `/v1/audio/speech` `response_format`, `speed`, unknown keys | `response_format` accepted and ignored (mp3 is the only format the upstream produces); `speed` **dropped silently**; unknown keys **dropped** | There is no upstream knob. The client asked for a format the upstream cannot make; the gateway serves what exists (§2.5.1). |
+| `/v1/audio/speech` `input` length | **passed through**; no client-side cap | The playground truncates at 5 000 chars client-side; the upstream's own behaviour above that is undefined, so the gateway lets it answer. |
+| `/v1/audio/transcriptions` `language`, `prompt`, `temperature`, unknown fields | **dropped silently** | The upstream accepts only `file`. |
+| `/v1/audio/transcriptions` non-MPEG audio | **passed through unchanged**, part typed by sniffing | The upstream's contract is MP3-only; the gateway does not transcode (no ffmpeg, §2.5.2). |
 
 What is **kept** because it is genuine gateway safety, not second-guessing
 upstream policy:
@@ -400,6 +406,100 @@ silent and wrong. (OpenAI's field names are `start_index`/`end_index`.)
 Sources are collected in arrival order and emitted even when the upstream
 places them after the first text block and a later block follows (§2.4 probe).
 
+### 2.5 Audio — `/api/tts` and `/api/stt`
+
+Both routes live behind the same transport as chat: clearance cookie,
+`x-session-token`, HTTP/2. Neither is streamed by the upstream in any
+meaningful sense — TTS returns one complete body, STT returns one JSON object.
+
+#### 2.5.1 TTS — `POST /api/tts`
+
+```
+POST /api/tts
+content-type: application/json
+x-session-token: <token>
+
+{"text":"Capability probe audio test one.","voice":"sarah"}
+```
+
+`voice` is optional. Response: `200 audio/mpeg` — a complete MP3 file
+(ID3v2.4 header, MPEG-1 Layer III, 128 kbps, 44.1 kHz, mono). No `model`,
+`format`, `speed`, or `response_format` field exists; anything beyond `text`
+and `voice` is ignored.
+
+**Voice names are not validated upstream.** An unknown name answers `200` with
+a 0.44 s clip — a silent mis-serve, not an error. A gateway that forwards a
+user-supplied string therefore lies to the caller, so the gateway whitelists.
+
+**Voice discovery (bundle archaeology + 3 confirmation probes, 2026-10-21).**
+The bundle never enumerates voices: no picker array, no voice-id list. The
+only voice names present anywhere in the 20 chunks are the scenario defaults
+`voice:"sarah"` and the four names in the `/api/voice/config` scenarios.
+The live config (captured `outF/voice-config-full`) names exactly **four**:
+`jessica`, `chris`, `charlie`, `sarah`. Three confirmation probes were run
+with identical text (`v5-voice-*`, 2026-10-21) and every name produced a
+distinct file (MPEG audio hashes differ):
+
+| Voice | Bytes | Audio | Duration |
+|---|---|---|---|
+| `chris` | 33 480 | 33 436 | 2.090 s |
+| `charlie` | 35 570 | 35 526 | 2.220 s |
+| `sarah` | 36 406 | 36 362 | 2.273 s |
+
+`jessica` is named by the config but was not re-probed; the audit report
+records a live `jessica` call (47 273 B / 2.95 s for 40 chars). The whitelist
+is therefore `jessica|chris|charlie|sarah`. Unknown voices are **rejected with
+400** (`param:"voice"`), because forwarding one silently returns a nonsense
+clip. This is the one place the gateway enforces a value the upstream would
+otherwise accept-and-mishandle.
+
+Names are case-insensitive on input and sent lowercased. An absent or empty
+`voice` is sent omitting the field (the upstream's own default).
+
+**Text.** Sent as-is, no length cap (§1.1). The bundle truncates at 5 000
+chars client-side; the upstream was not probed above 155 chars, so >5 000 is
+undefined and the gateway does not invent a limit.
+
+**Body read.** Complete body, bounded by `IL2API_AUDIO_TIMEOUT` on the
+pre-header phase and a whole-body read cap of 32 MiB. Body bytes are proxied
+unchanged — no re-encoding, no ID3 rewriting.
+
+#### 2.5.2 STT — `POST /api/stt`
+
+Multipart, exactly one field `file`; the part **must** carry an explicit
+`audio/*` content type (`application/octet-stream` → `400
+{"error":"Invalid file type"}`). The byte stream must be real MPEG audio:
+WAV at 8/16/48 kHz and WebM-labelled WAV all answer `200 {"text":""}` — a
+silent no-op, not an error. A TTS MP3 round-trips byte-exactly
+(`outH/stt-tts-loop`). No `model`, `language`, or `prompt` field exists.
+
+**Gateway contract: MP3-only, no transcode.** The gateway sniffs the uploaded
+bytes for an MPEG frame sync or an ID3v2 tag and types the part `audio/mpeg`
+when found, `application/octet-stream` otherwise, then forwards the bytes
+unchanged. It never shells out to ffmpeg and adds no dependency. Non-MPEG
+audio is forwarded honestly and the upstream answers `{"text":""}` (or
+`Invalid file type`); the gateway does not manufacture a 415 and does not
+transcode. This is documented as the upstream's contract, not a gateway
+limitation to work around.
+
+Sniff rule: an ID3v2 magic (`ID3`) or a valid MPEG audio frame header
+(`0xFF` followed by `0xE0` mask with a legal version/layer/bitrate) within the
+first 8 KiB (ID3 tags can precede the first frame) counts as MPEG.
+
+**Empty text is the upstream's answer.** A `200 {"text":""}` is returned to
+the client as `{"object":"transcription","text":""}`; the gateway does not
+turn it into an error. (The audit suggested mapping empty to a real error;
+that would second-guess a legitimate "no speech" answer and is rejected here
+under §1.1.) The README documents the MP3-only condition loudly instead.
+
+#### 2.5.3 Errors
+
+Both endpoints reuse the chat path's upstream mapping: non-200 →
+`502 upstream_error` carrying the upstream message; pool empty → `503`;
+clearance failure → `503`; client gone → no write. Structural failures are
+the only gateway-generated 4xx: empty/non-string `input`, missing multipart
+`file`, empty file bytes, malformed JSON, unknown `voice`, method not allowed.
+
 ## 3. Wire format — OpenAI Chat Completions
 
 ### 3.1 Request
@@ -607,7 +707,9 @@ Token = `{unix_ts}.{32 hex}.{64 hex}`; shape is validated at acquisition.
 |---|---|---|---|
 | `/v1/chat/completions` | POST | yes | §3 |
 | `/v1/web_search` | POST | yes | §7.1 |
-| `/v1/models` | GET | yes | static list, `{object:"list",data:[{id,object:"model",created,owned_by:"inceptionlabs"}]}` |
+| `/v1/audio/speech` | POST | yes | §7.2 |
+| `/v1/audio/transcriptions` | POST | yes | §7.3 |
+| `/v1/models` | GET | yes | static list, `{object:"list",data:[{id,object:"model",created,owned_by:"inceptionlabs"}]}` — audio models are **not** listed (OpenAI does not list them either) |
 | `/healthz` | GET/HEAD | no | `{"ok":true,"pool":{"size","min","max"},"search":{"available":bool|null},"counters":{...}}` |
 
 ### 7.1 `POST /v1/web_search`
@@ -662,6 +764,84 @@ Error mapping (same envelope and codes as chat):
 | NDJSON body ends without `docs`/`error` | 502 | `upstream_stream_error` |
 | sliding 60 s idle watchdog (any line resets it) | 504 | `upstream_idle_timeout` |
 
+### 7.2 `POST /v1/audio/speech`
+
+OpenAI's speech request shape, restricted to the fields the upstream can
+honour:
+
+```json
+{"model":"tts-1","input":"Hello from the gateway.","voice":"alloy",
+ "response_format":"mp3","speed":1.0}
+```
+
+| Field | Behaviour |
+|---|---|
+| `model` | **accepted and ignored**. There is one upstream voice engine; any value is fine (OpenAI SDKs send `tts-1`/`tts-1-hd`). Missing is fine too. |
+| `input` | **required**; omitted, non-string, or whitespace-only → `400` with `param:"input"`. Any length is forwarded unchanged. |
+| `voice` | mapped to the upstream whitelist (§2.5.1). Case-insensitive. Unknown → `400` with `param:"voice"` and the accepted list in the message. Absent/empty → upstream default (field omitted). |
+| `response_format` | **accepted and ignored**. The upstream produces MP3 only; the response is **always** `audio/mpeg`. A client asking for `wav` gets MP3, documented in the README and SPEC rather than a 400 — there is nothing else the upstream can produce. |
+| `speed` | **dropped silently**. The upstream has no speed knob. |
+| unknown keys | **dropped silently** (§1.1). |
+
+Response (200): the upstream MP3 body, byte-for-byte, with
+`Content-Type: audio/mpeg`, `Cache-Control: no-store`, and `Content-Length`.
+The body is buffered to completion before headers are committed, so an
+upstream failure still yields a proper JSON error envelope and never a
+truncated audio stream.
+
+Error mapping:
+
+| Condition | HTTP | code |
+|---|---|---|
+| malformed JSON / trailing data / not an object | 400 | `invalid_request_error` |
+| missing, non-string, or whitespace-only `input` | 400 | `invalid_request_error` (`param:"input"`) |
+| unknown `voice` | 400 | `invalid_request_error` (`param:"voice"`) |
+| method not allowed | 405 | `method_not_allowed` (`Allow: POST`) |
+| pool empty | 503 | `upstream_unavailable` |
+| clearance failure | 503 | `upstream_clearance_failed` |
+| upstream non-200 | 502 | `upstream_error` (upstream message preserved) |
+| upstream timeout | 504 | `upstream_idle_timeout` |
+
+`/healthz` counters gain `tts` and `stt` — the number of accepted (method
+allowed) requests to each route, incremented at entry like `requests`.
+
+### 7.3 `POST /v1/audio/transcriptions`
+
+OpenAI's transcription request: `multipart/form-data` with a `file` part, plus
+optional fields the upstream does not understand.
+
+| Field | Behaviour |
+|---|---|
+| `file` | **required**. Missing part, empty body, or a part that cannot be read → `400` (`param:"file"`). The bytes are forwarded unchanged, typed by sniffing (§2.5.2). |
+| `model`, `language`, `prompt`, `temperature`, `response_format`, unknown fields | **dropped silently**. The upstream accepts none of them. |
+| `response_format` | OpenAI's default is `json`; the gateway always returns `json`. `text`/`verbose_json`/`srt`/`vtt` are **not** implemented — the field is dropped. |
+
+Response (200), OpenAI `json` shape:
+
+```json
+{"object":"transcription","text":"The quick brown fox jumps over the lazy dog."}
+```
+
+`text` is the upstream `text` verbatim (including `""`). `Cache-Control:
+no-store` — transcripts derive from the caller's audio.
+
+Error mapping:
+
+| Condition | HTTP | code |
+|---|---|---|
+| not multipart / missing `file` / empty file | 400 | `invalid_request_error` (`param:"file"`) |
+| multipart malformed / body over cap | 400 / 413 | `invalid_request_error` / `request_too_large` |
+| method not allowed | 405 | `method_not_allowed` (`Allow: POST`) |
+| pool empty / clearance failure | 503 | `upstream_unavailable` / `upstream_clearance_failed` |
+| upstream non-200 (e.g. `Invalid file type`) | 502 | `upstream_error` (upstream message preserved) |
+| upstream 200 with unparseable JSON | 502 | `upstream_error` |
+| upstream timeout | 504 | `upstream_idle_timeout` |
+
+**Upload bound.** Unlike the JSON routes, the transcription body is bounded at
+`IL2API_AUDIO_MAX_BYTES` (default 25 MiB — OpenAI's own limit), because audio
+files are legitimately large and the 6 MiB JSON cap would reject ordinary
+recordings. Exceeding it is a `413` before any upstream call.
+
 `/healthz` gains `search.available`: `true` / `false` from the last
 `/api/search-lab/config` probe, `null` before the first one completes or when
 probing is disabled. The probe runs once at startup in a background goroutine
@@ -699,6 +879,8 @@ rides a custom header). CORS runs outside auth so preflights are answerable.
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` sliding idle watchdog (the same window the chat path uses for `IL2API_IDLE_TIMEOUT`) |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`; `off` skips the startup `/api/search-lab/config` probe (`search.available` stays `null`) |
 | `IL2API_SEARCH_PROBE_TIMEOUT` | `15s` | bound on the one startup config probe |
+| `IL2API_AUDIO_TIMEOUT` | `120s` | pre-header timeout for `/api/tts` and `/api/stt` (TTS took ~1 s live; the window is generous for long inputs) |
+| `IL2API_AUDIO_MAX_BYTES` | `26214400` (25 MiB) | upload cap for `/v1/audio/transcriptions`; larger bodies are a 413 without an upstream call |
 
 Invalid values are startup errors with an actionable message.
 
@@ -713,7 +895,10 @@ Invalid values are startup errors with an actionable message.
 - The transport is exercised against a **local TLS listener** only (plus a
   local CONNECT proxy), never against Vercel. No live probing: the bypass is
   proven, and the only live check is the one final deployment smoke
-  (`/healthz` + one chat + one search) described in the task.
+  (`/healthz` + one chat + one search) described in the task. The audio
+  suite additionally used three spaced live TTS probes to confirm the voice
+  whitelist (§2.5.1) and a final two-request smoke (speech → MP3 → feed the
+  MP3 back to transcriptions, asserting a non-empty transcript).
 - Integration tests run the real HTTP handlers against an `httptest` mock
   upstream, covering streaming framing, reasoning ordering, multi-block
   streams, snapshot text, mid-stream failure, idle timeout, auth, oversized
@@ -730,6 +915,23 @@ Invalid values are startup errors with an actionable message.
   (a stalled challenge does not delay `StartClearancePrewarm`'s return), a
   failed acquisition is tolerated and leaves `has_cookie:false`, and the
   refresh loop re-acquires at the configured age from boot.
+- Audio is tested against `httptest` mocks of `/api/tts` and `/api/stt`
+  through the same TLS-checkpoint mock as chat, so the real
+  `postAuthed`/`Send` path is exercised:
+  - TTS success (request body shape `{text,voice}`, response bytes returned
+    unchanged with `audio/mpeg`), default voice (field omitted), every
+    whitelisted voice, `voice` case folding, unknown voice → 400 before any
+    upstream call, `response_format`/`speed`/`model` ignored, empty input →
+    400, trailing JSON → 400, upstream 4xx → 502 envelope, pool/clearance
+    failures → 503, method not allowed.
+  - STT success (multipart `file` forwarded byte-for-byte, part typed
+    `audio/mpeg` when the bytes are MPEG, `application/octet-stream`
+    otherwise), `{object:"transcription",text}` shape, empty text preserved
+    as 200 `""`, upstream `Invalid file type` → 502, missing `file` → 400,
+    empty file → 400, oversized upload → 413 without an upstream call,
+    non-multipart → 400, method not allowed.
+  - One full-stack integration test: TTS MP3 → STT text, against a mock
+    upstream whose `/api/stt` echoes a known transcript.
 - Web search is tested entirely against an `httptest` NDJSON mock: the full
   plan → retrieve → rerank → docs pipeline, a gzip-encoded body, a `br` body
   typed error, a missing `docs` event, a terminal `error` event, truncation,
