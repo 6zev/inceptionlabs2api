@@ -117,7 +117,7 @@ func TestDecodeRejectsMalformedBodies(t *testing.T) {
 		`{"model":"m","messages":"hi"}`, // wrong type
 		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":"yes"}`, // wrong type
 		`{"model":"m","messages":[{"role":"user","content":"hi"}]}{"x":1}`,         // trailing data
-		`{"model":"m","messages":[{"role":"user","content":"hi"}]}garbage`,        // trailing junk
+		`{"model":"m","messages":[{"role":"user","content":"hi"}]}garbage`,         // trailing junk
 	}
 	for _, body := range cases {
 		if _, re := decodeStrict(t, body); re == nil {

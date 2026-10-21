@@ -67,9 +67,9 @@ func TestPrewarmFailureIsTolerated(t *testing.T) {
 	cs.failSubmit = http.StatusBadGateway
 	var logged atomic.Int32
 	c := New(Config{
-		BaseURL: cs.srv.URL,
+		BaseURL:  cs.srv.URL,
 		Cooldown: -1,
-		Logf:    func(string, ...any) { logged.Add(1) },
+		Logf:     func(string, ...any) { logged.Add(1) },
 	})
 	c.Prewarm(context.Background())
 

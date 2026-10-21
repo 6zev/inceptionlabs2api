@@ -86,14 +86,14 @@ type Counters struct {
 
 // Server holds the handler dependencies.
 type Server struct {
-	cfg  Config
-	up   Chatter
-	se   Searcher
+	cfg   Config
+	up    Chatter
+	se    Searcher
 	pool  PoolStats
 	clr   ClearanceStats
 	audio Speech
-	now  func() time.Time
-	logf func(format string, args ...any)
+	now   func() time.Time
+	logf  func(format string, args ...any)
 
 	searchMu sync.Mutex
 	// searchAvailable is nil until the config probe succeeds; false is a
