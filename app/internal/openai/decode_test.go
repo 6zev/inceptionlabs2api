@@ -117,11 +117,25 @@ func TestDecodeRejectsMalformedBodies(t *testing.T) {
 		`{"model":"m","messages":"hi"}`, // wrong type
 		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":"yes"}`, // wrong type
 		`{"model":"m","messages":[{"role":"user","content":"hi"}]}{"x":1}`,         // trailing data
+		`{"model":"m","messages":[{"role":"user","content":"hi"}]}garbage`,        // trailing junk
 	}
 	for _, body := range cases {
 		if _, re := decodeStrict(t, body); re == nil {
 			t.Errorf("%q: expected a structural error", body)
 		}
+	}
+}
+
+// Trailing data must be reported as such, not as an opaque unmarshal error:
+// all three JSON routes reject it for the same reason (SPEC §1.1 class 1).
+func TestDecodeTrailingDataMessage(t *testing.T) {
+	t.Parallel()
+	_, re := decodeStrict(t, `{"model":"m","messages":[{"role":"user","content":"hi"}]}garbage`)
+	if re == nil {
+		t.Fatal("expected a structural error")
+	}
+	if !strings.Contains(re.Message, "unexpected data") {
+		t.Fatalf("message = %q, want the trailing-data explanation", re.Message)
 	}
 }
 

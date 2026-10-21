@@ -3,7 +3,9 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 )
 
 // reasoningEfforts maps the one OpenAI value Mercury has no equivalent for.
@@ -24,8 +26,11 @@ func Decode(body []byte) (*ChatRequest, *RequestError) {
 	if err := dec.Decode(&raw); err != nil {
 		return nil, Invalid(fmt.Sprintf("invalid JSON body: %v", err))
 	}
-	var trailing json.RawMessage
-	if err := dec.Decode(&trailing); err == nil {
+	// Anything other than EOF after the object — valid JSON or garbage — is
+	// rejected: a prefix that a front proxy or WAF might parse differently
+	// must not be silently tolerated. The other JSON routes (web_search,
+	// audio) use the same rule.
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
 		return nil, Invalid("invalid JSON body: unexpected data after the request object")
 	}
 	if raw == nil {
