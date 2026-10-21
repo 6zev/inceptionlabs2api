@@ -277,8 +277,16 @@ func TestMaintainerReportsErrors(t *testing.T) {
 	errCh := make(chan error, 4)
 	cfg := Config{
 		Min: 1, Max: 1, TTL: time.Hour, Interval: time.Millisecond,
-		Now:          clock.Now,
-		OnFetchError: func(err error) { errCh <- err },
+		Now: clock.Now,
+		// The maintainer must never block on the callback: a caller that stops
+		// draining (as this test does) would otherwise deadlock Close, since
+		// the ticker fires every millisecond.
+		OnFetchError: func(err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		},
 	}
 	p := New(cfg, fc.Fetch)
 	defer p.Close()

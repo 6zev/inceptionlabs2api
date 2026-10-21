@@ -30,10 +30,6 @@ const (
 	maxTokenLen = 11 + 1 + nonceHexLen + 1 + signHexLen
 )
 
-// ErrInvalidToken is returned when a fetched token does not match the
-// {unix_ts}.{32 hex}.{64 hex} shape.
-var ErrInvalidToken = errors.New("pool: invalid session token")
-
 // ErrNoToken is returned by Get when no live token exists and a fetch is not
 // possible or fails.
 var ErrNoToken = errors.New("pool: no session token available")
@@ -186,7 +182,7 @@ func (p *Pool) Discard(tok string) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), refillTimeout)
 		defer cancel()
 		if err := p.grow(ctx); err != nil {
 			p.reportFetchError(err)
