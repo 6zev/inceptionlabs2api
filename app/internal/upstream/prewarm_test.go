@@ -60,14 +60,23 @@ func TestStartClearancePrewarmAcquiresWithoutRequests(t *testing.T) {
 		t.Fatalf("StartClearancePrewarm took %s, want an immediate return", elapsed)
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
+	// The boot fill lands one slot at a time; wait for the ring to be full and
+	// report which slots are up if it never is.
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if c.Clearance().State().HasCookie {
+		st := c.Clearance().State()
+		filled := 0
+		for _, s := range st.Slots {
+			if s.Cookie {
+				filled++
+			}
+		}
+		if filled == len(st.Slots) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("no cookie after prewarm: %+v", c.Clearance().State())
+	t.Fatalf("ring not filled after prewarm: %+v", c.Clearance().State())
 }
 
 // The loop and prewarm run together as boot starts them; cancellation stops
@@ -82,4 +91,25 @@ func TestStartClearancePrewarmCancelsWithContext(t *testing.T) {
 	// No assertion beyond the race detector and a prompt test exit: the loop
 	// must observe cancellation.
 	time.Sleep(50 * time.Millisecond)
+}
+
+// Boot fills the configured ring size, not just one cookie, and does so from
+// the prewarm goroutine without any request traffic (SPEC §2.1.2).
+func TestStartClearancePrewarmFillsTheRing(t *testing.T) {
+	t.Parallel()
+	ps := newPrewarmServer(t)
+	c, _ := NewClient(Config{BaseURL: ps.srv.URL, ClearancePool: 2, Logf: func(string, ...any) {}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.StartClearancePrewarm(ctx)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		st := c.Clearance().State()
+		if len(st.Slots) == 2 && st.Slots[0].Cookie && st.Slots[1].Cookie {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("ring not filled to its configured size: %+v", c.Clearance().State())
 }

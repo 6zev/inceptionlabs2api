@@ -778,7 +778,7 @@ func TestEndToEndClearancePrewarmAtBoot(t *testing.T) {
 		t.Fatalf("StartClearancePrewarm blocked for %s", elapsed)
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(st.srv.URL + "/healthz")
 		if err != nil {
@@ -790,14 +790,23 @@ func TestEndToEndClearancePrewarmAtBoot(t *testing.T) {
 			Clearance struct {
 				HasCookie    *bool `json:"has_cookie"`
 				RefreshCount int64 `json:"refresh_count"`
+				Slots        []struct {
+					Cookie bool `json:"cookie"`
+				} `json:"slots"`
 			} `json:"clearance"`
 		}
 		if err := json.Unmarshal(raw, &body); err != nil {
 			t.Fatalf("decode healthz %s: %v", raw, err)
 		}
-		if body.Clearance.HasCookie != nil && *body.Clearance.HasCookie {
-			if body.Clearance.RefreshCount < 1 {
-				t.Fatalf("refresh_count = %d after a cookie appeared", body.Clearance.RefreshCount)
+		filled := 0
+		for _, s := range body.Clearance.Slots {
+			if s.Cookie {
+				filled++
+			}
+		}
+		if body.Clearance.HasCookie != nil && *body.Clearance.HasCookie && len(body.Clearance.Slots) > 0 && filled == len(body.Clearance.Slots) {
+			if body.Clearance.RefreshCount < int64(filled) {
+				t.Fatalf("refresh_count = %d after %d slots filled", body.Clearance.RefreshCount, filled)
 			}
 			return
 		}
