@@ -155,11 +155,12 @@ func TestManifestNamedUnknownTool(t *testing.T) {
 // Unparseable or absent parameters render as {}, never drop the tool.
 func TestManifestBadParametersBecomeEmptyObject(t *testing.T) {
 	t.Parallel()
-	m, err := BuildManifest([]Tool{{Name: "x", Parameters: json.RawMessage(`{"type":`)}, {Name: "y"}}, Choice{Auto: true}, false)
+	m, err := BuildManifest([]Tool{{Name: "x", Description: "d", Parameters: json.RawMessage(`{"type":`)}, {Name: "y", Description: "e"}}, Choice{Auto: true}, false)
 	if err != nil {
 		t.Fatalf("BuildManifest: %v", err)
 	}
-	if !strings.Contains(m.Preamble, `"name":"x","description":"","parameters":{}`) {
+	// Bad parameters degrade to {}, and a present description stays.
+	if !strings.Contains(m.Preamble, `{"name":"x","description":"d","parameters":{}}`) {
 		t.Fatalf("preamble:\n%s", m.Preamble)
 	}
 }

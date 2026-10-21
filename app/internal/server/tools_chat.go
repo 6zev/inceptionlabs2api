@@ -111,6 +111,19 @@ func (s *Server) readRound(ctx context.Context, ureq *upstream.ChatRequest, mani
 	return &out, nil
 }
 
+// emptyToolAnswer reports the measured upstream failure mode: with a tool
+// manifest present the model occasionally returns reasoning-only, zero text
+// and zero calls (probe/outQ q1/q3/q4, probe/outP2 timing runs). The upstream
+// web surface shows the same flakiness without any preamble, so this is the
+// model's occasional refusal-shaped pause, not a request defect. The client
+// asked for tool calling; an empty answer is not a valid tool response, so
+// the gateway re-asks once internally with the same manifest — protocol
+// completion, not content interception: whatever the retry returns is passed
+// through verbatim, empty or not.
+func (r *round) emptyToolAnswer() bool {
+	return r.content == "" && r.reasoning == "" && len(r.calls) == 0
+}
+
 // resolveRounds runs the tiered loop: read a round, and if it called the
 // schema loader, expand and re-ask. Intermediate rounds are internal steps; the
 // returned round is the one the client sees. The loop bound is maxRounds.
@@ -213,22 +226,111 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 	var cites upstream.CitationCollector
 	parser := tools.NewParser(manifest.Declared)
 	emitted := 0
+	// produced tracks whether ANY client-visible byte went out. The measured
+	// empty-answer failure mode (reasoning-only stream, no text, no calls)
+	// emits nothing until the very end — so a retry must happen before any
+	// frame leaves. Reasoning deltas are buffered, not written, until the
+	// first content/call proves the round is alive.
+	sawAlive := false
+	bufReasoning := ""
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
 		cites.Observe(ev, s.logf)
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
-			if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
-				return errClientGone
+			if sawAlive {
+				if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
+					return errClientGone
+				}
+			} else {
+				bufReasoning += ev.Reasoning()
 			}
 		case upstream.EventTextStart, upstream.EventTextDelta:
 			released := parser.Feed([]byte(ev.ContentText()))
+			if !sawAlive {
+				// First sign of life: flush the buffered reasoning, then go
+				// live. A <tool_call>-block call may release no text at all, so a
+				// parsed call alone also counts as alive.
+				sawAlive = true
+				if bufReasoning != "" {
+					if !write(openai.Delta{ReasoningContent: bufReasoning}, nil) {
+						return errClientGone
+					}
+					bufReasoning = ""
+				}
+			}
 			if len(released) > 0 && !write(openai.Delta{Content: string(released)}, nil) {
 				return errClientGone
 			}
 			emitted = emitToolCalls(w, flusher, parser.Calls(), emitted, write)
+			if len(parser.Calls()) > 0 {
+				sawAlive = true
+			}
 		}
 		return nil
 	})
+	// The measured empty-answer failure mode ends the upstream stream with
+	// nothing ever released. If no byte went out (and the client is still
+	// connected), re-ask ONCE with a fresh stream before writing anything.
+	// The retry consumes the same upstream contract; its result passes
+	// through verbatim, empty or not.
+	if readErr == nil && !sawAlive && len(parser.Calls()) == 0 {
+		stream.Close()
+		s.logf("tools: empty answer round (no text/call), retrying once")
+		stream2, err2 := s.up.Chat(r.Context(), ureq, s.cfg.IdleTimeout, func(line string) {
+			s.logf("upstream: skipping malformed SSE line: %q", truncate(line, 200))
+		})
+		if err2 == nil {
+			defer stream2.Close()
+			parser2 := tools.NewParser(manifest.Declared)
+			cites2 := upstream.CitationCollector{}
+			readErr2 := stream2.Reader.Read(r.Context(), func(ev upstream.Event) error {
+				cites2.Observe(ev, s.logf)
+				switch ev.Type {
+				case upstream.EventReasoningDelta:
+					if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
+						return errClientGone
+					}
+				case upstream.EventTextStart, upstream.EventTextDelta:
+					released := parser2.Feed([]byte(ev.ContentText()))
+					if len(released) > 0 && !write(openai.Delta{Content: string(released)}, nil) {
+						return errClientGone
+					}
+					emitted = emitToolCalls(w, flusher, parser2.Calls(), emitted, write)
+				}
+				return nil
+			})
+			if readErr2 == nil {
+				cites = cites2
+				if tail := parser2.Flush(); len(tail) > 0 {
+					if !write(openai.Delta{Content: string(tail)}, nil) {
+						return
+					}
+				}
+				emitToolCalls(w, flusher, parser2.Calls(), emitted, write)
+				finish := "stop"
+				if len(parser2.Calls()) > 0 {
+					finish = "tool_calls"
+				}
+				if !write(openai.Delta{Annotations: cites.Citations()}, &finish) {
+					return
+				}
+				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+				return
+			}
+			// Retry also failed at transport level: fall through to the
+			// original stream's tail handling below (nothing was written).
+			s.upErrors.Add(1)
+			s.logf("upstream: retry stream failed after headers: %v", readErr2)
+			readErr = readErr2
+		} else {
+			s.upErrors.Add(1)
+			s.logf("upstream: retry open failed: %v", err2)
+			readErr = err2
+		}
+	}
 	if readErr != nil {
 		if errors.Is(readErr, errClientGone) {
 			return

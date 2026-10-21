@@ -107,8 +107,16 @@ func (m *Manifest) header() string {
 		}
 	} else {
 		for _, t := range m.tools {
-			fmt.Fprintf(&defs, `{"name":%s,"description":%s,"parameters":%s}`+"\n",
-				quoteJSON(t.Name), quoteJSON(t.Description), compactParams(t.Parameters))
+			// An empty description renders natively: the code-lab catalog
+			// (probe/outY/y1, verbatim) never carries a description field
+			// without content, so an empty string becomes an omitted field
+			// rather than literal "".
+			params := ""
+			if t.Description != "" {
+				params = `,"description":` + quoteJSON(t.Description)
+			}
+			fmt.Fprintf(&defs, `{"name":%s%s,"parameters":%s}`+"\n",
+				quoteJSON(t.Name), params, compactParams(t.Parameters))
 		}
 	}
 	preamble := "You are a helpful assistant with access to the following tools:\n\n" +
@@ -306,17 +314,29 @@ func (m *Manifest) Expanded(extra []Tool) *Manifest {
 	}
 
 	var b strings.Builder
-	b.WriteString(m.header())
-	b.WriteString(tierNote)
-	b.WriteString(definitionHeader)
+	// Rebuild with the same skeleton the BuildManifest preamble uses; the
+	// tier note replaces the full definitions for un-expanded tools.
+	b.WriteString("You are a helpful assistant with access to the following tools:\n\n")
 	for _, t := range m.tools {
 		if full, ok := loaded[t.Name]; ok {
-			fmt.Fprintf(&b, `{"name":%s,"description":%s,"parameters":%s}`+"\n",
-				quoteJSON(full.Name), quoteJSON(full.Description), compactParams(full.Parameters))
+			params := ""
+			if full.Description != "" {
+				params = `,"description":` + quoteJSON(full.Description)
+			}
+			fmt.Fprintf(&b, `{"name":%s%s,"parameters":%s}`+"\n",
+				quoteJSON(full.Name), params, compactParams(full.Parameters))
 			continue
 		}
-		fmt.Fprintf(&b, `{"name":%s,"description":%s}`+"\n", quoteJSON(t.Name), quoteJSON(t.Description))
+		params := ""
+		if t.Description != "" {
+			params = `,"description":` + quoteJSON(t.Description)
+		}
+		fmt.Fprintf(&b, `{"name":%s%s}`+"\n", quoteJSON(t.Name), params)
 	}
+	b.WriteString("\nIf you need to use a tool, respond with a " + callStart + " JSON block " +
+		"containing {\"name\": \"tool name\", \"arguments\": {…}}. " +
+		"Use only the tools listed; never invent one. Otherwise answer normally.\n")
+	b.WriteString(tierNote)
 
 	declared := make([]string, 0, len(m.tools)+1)
 	for _, t := range m.tools {

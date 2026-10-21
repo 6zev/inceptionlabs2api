@@ -276,6 +276,83 @@ func TestToolCallKeepsCitations(t *testing.T) {
 	}
 }
 
+// The measured empty-answer failure mode: a reasoning-only stream, zero text,
+// zero calls (probe/outQ). The streaming path must retry ONCE invisibly — no
+// frames from the dead round may reach the client — and pass the retry's
+// answer through verbatim.
+func TestStreamEmptyAnswerRetriedOnce(t *testing.T) {
+	t.Parallel()
+	empty := "data: {\"type\":\"reasoning-start\",\"id\":\"r0\"}\n\n" +
+		"data: {\"type\":\"reasoning-end\",\"id\":\"r0\"}\n\n" +
+		"data: [DONE]\n\n"
+	up := &fakeChatter{fn: func(call int) (*upstream.Stream, error) {
+		if call == 1 {
+			return streamOf(empty), nil
+		}
+		return streamOf(toolStream(``)), nil
+	}}
+	s := newTestServer(up)
+	rec := postChat(t, s, toolBody(true, ""))
+	if up.count() != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (empty + one retry)", up.count())
+	}
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"stop"`) {
+		t.Fatalf("empty retry not passed through: %s", rec.Body)
+	}
+}
+
+// The retry's answer passes through verbatim — a real tool call in the retry
+// finishes tool_calls with the call frames, not the dead round's silence.
+func TestStreamEmptyAnswerRetryHitsCall(t *testing.T) {
+	t.Parallel()
+	empty := "data: {\"type\":\"reasoning-start\",\"id\":\"r0\"}\n\n" +
+		"data: {\"type\":\"reasoning-end\",\"id\":\"r0\"}\n\n" +
+		"data: [DONE]\n\n"
+	up := &fakeChatter{fn: func(call int) (*upstream.Stream, error) {
+		if call == 1 {
+			return streamOf(empty), nil
+		}
+		return streamOf(toolStream(`<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>`)), nil
+	}}
+	s := newTestServer(up)
+	rec := postChat(t, s, toolBody(true, ""))
+	if up.count() != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (empty + one retry)", up.count())
+	}
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) {
+		t.Fatalf("retry call result lost: %s", rec.Body)
+	}
+}
+
+// The retry is bounded: two consecutive empty rounds are NOT retried again;
+// the second empty answer passes through as the honest result.
+func TestStreamDoubleEmptyStops(t *testing.T) {
+	t.Parallel()
+	empty := "data: {\"type\":\"reasoning-start\",\"id\":\"r0\"}\n\n" +
+		"data: {\"type\":\"reasoning-end\",\"id\":\"r0\"}\n\n" +
+		"data: [DONE]\n\n"
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return streamOf(empty), nil }}
+	s := newTestServer(up)
+	postChat(t, s, toolBody(true, ""))
+	if up.count() != 2 {
+		t.Fatalf("upstream calls = %d, want exactly 2 (one retry, not a loop)", up.count())
+	}
+}
+
+// A prose-only stream is a valid answer and must NOT trigger the retry.
+func TestStreamProseDoesNotRetry(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return streamOf(toolStream("It is sunny.")), nil }}
+	s := newTestServer(up)
+	rec := postChat(t, s, toolBody(true, ""))
+	if up.count() != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (prose answers are final)", up.count())
+	}
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"stop"`) {
+		t.Fatalf("finish missing: %s", rec.Body)
+	}
+}
+
 // Non-streaming shape: content is "" when the turn is only a call.
 func TestNonStreamToolCall(t *testing.T) {
 	t.Parallel()
