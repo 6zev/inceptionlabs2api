@@ -716,3 +716,104 @@ func TestEmptyToolCallsAccepted(t *testing.T) {
 		t.Fatalf("messages = %d, want 3", got)
 	}
 }
+
+func TestEarlyFailureErrorCodes(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"idle", upstream.ErrIdleTimeout, http.StatusGatewayTimeout, openai.CodeUpstreamIdle},
+		{"deadline", context.DeadlineExceeded, http.StatusGatewayTimeout, openai.CodeUpstreamIdle},
+		{"truncated", upstream.ErrStreamTruncated, http.StatusBadGateway, openai.CodeUpstreamStream},
+		{"auth", upstream.ErrAuthRejected, http.StatusBadGateway, openai.CodeUpstreamAuth},
+		{"cancel", context.Canceled, http.StatusRequestTimeout, openai.CodeInvalidRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return nil, tc.err }}
+			rec := postChat(t, newTestServer(up), `{"model":"mercury-3","messages":[{"role":"user","content":"q"}]}`)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.status)
+			}
+			var env openai.ErrorResponse
+			json.Unmarshal(rec.Body.Bytes(), &env)
+			if env.Error.Code != tc.code {
+				t.Fatalf("code = %q, want %q", env.Error.Code, tc.code)
+			}
+		})
+	}
+}
+
+func TestStreamErrorBeforeHeadersIsJSON(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return nil, errors.New("boom") }}
+	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","stream":true,"messages":[{"role":"user","content":"q"}]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "data: ") {
+		t.Fatalf("pre-header failure emitted SSE: %s", rec.Body)
+	}
+}
+
+func TestStreamMidStreamClientWriteFailure(t *testing.T) {
+	t.Parallel()
+	// A ResponseWriter that fails every write after the headers simulates a
+	// client vanishing between frames.
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) {
+		body := strings.Repeat("data: {\"type\":\"text-delta\",\"id\":\"text-0\",\"delta\":\"x\"}\n\n", 5) + "data: [DONE]\n\n"
+		return streamOf(body), nil
+	}}
+	s := newTestServer(up)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"mercury-3","stream":true,"messages":[{"role":"user","content":"q"}]}`))
+	rec := &failingWriter{header: http.Header{}, limit: 2}
+	s.Handler().ServeHTTP(rec, req)
+	if !rec.failed {
+		t.Fatal("writer never failed; test did not exercise the path")
+	}
+}
+
+// failingWriter succeeds for limit writes, then fails.
+type failingWriter struct {
+	header http.Header
+	limit  int
+	writes int
+	failed bool
+	status int
+}
+
+func (f *failingWriter) Header() http.Header { return f.header }
+func (f *failingWriter) WriteHeader(status int) {
+	f.status = status
+}
+func (f *failingWriter) Write(p []byte) (int, error) {
+	if f.writes >= f.limit {
+		f.failed = true
+		return 0, errors.New("client gone")
+	}
+	f.writes++
+	return len(p), nil
+}
+
+func TestHealthzMethodNotAllowed(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(&fakeChatter{})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/healthz", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestModelsMethodNotAllowed(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(&fakeChatter{})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/models", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
