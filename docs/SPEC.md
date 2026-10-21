@@ -166,15 +166,31 @@ other than `identity`/`br` is a typed error rather than mojibake.
 **Snippets.** `docs.sources[]` carries only `title`, `url`, `score`; there is
 no per-source snippet anywhere in the NDJSON — neither `docs` nor the
 synthesis stage adds one. The gateway therefore returns `snippet: ""` and
-does **not** wait for `run_done`: the run is done as soon as `docs` arrives
-(latency and several LLM calls saved). This is an honest empty field, not a
+does **not** wait for `run_done`. This is an honest empty field, not a
 truncation. The SYNTHESIZE answer is discarded.
+
+**Where the read stops.** Reading continues past the first `docs` when the
+run has more rounds: with `depth > 1` the follow-up stage rewrites the query
+set and a later round's `docs` is the final ranking. The gateway therefore
+stops at the run's *final* `docs`, recognised by any of: the `rounds` event
+with `run >= of`, a `call_start` with `kind:"synthesize"`, or `run_done`. It
+never reads the synthesis deltas. A body that closes before any `docs` is
+`upstream_stream_error`, never an empty success; a body that closes after one
+is complete, because `docs` is the product.
 
 **Titles** are raw upstream text with newlines and tab runs
 (`"\n\tFour-day work week\n \n – …"`); they are whitespace-collapsed and
-trimmed. Entries with an empty `url` are dropped. `cite_index` is assigned
+trimmed. Entries with a non-absolute `http`/`https` URL, or one carrying
+control characters, are dropped — the documented consumer renders results as
+links, so `javascript:`/`data:` must not reach it. `cite_index` is assigned
 `1..N` in `docs` rank order, matching the bracket citations `[1][2][3]` in the
 upstream's synthesized answer.
+
+**Bounds.** Because the upstream is not trusted to be well-behaved, one run
+retains at most 32 queries, 50 sources, 2000 runes per query, 512 per title,
+and 4096 per URL. On top of the sliding watchdog, a whole run is capped at
+ten idle windows (600 s with the default 60 s), so an upstream emitting one
+keep-alive line per window cannot pin a request forever.
 
 ## 3. Wire format — OpenAI Chat Completions
 
@@ -404,14 +420,15 @@ Response (200):
 - No results is `200` with `"results":[]` — an honest empty list, not an
   error and not a retry.
 - The endpoint is stateless and never streams; the whole NDJSON run is
-  consumed under one request.
+  consumed under one request. The 200 response carries `Cache-Control:
+  no-store` (results derive from the caller's query).
 
 Error mapping (same envelope and codes as chat):
 
 | Condition | HTTP | code |
 |---|---|---|
-| malformed JSON / missing / empty / over-long `query` / bad `config` | 400 | `invalid_request_error` (`unsupported_parameter` for unknown keys) |
-| method not allowed | 405 | `method_not_allowed` |
+| malformed JSON / missing / empty / over-long `query` / bad `config` / duplicate or trailing JSON | 400 | `invalid_request_error` (`unsupported_parameter` for unknown keys) |
+| method not allowed | 405 | `method_not_allowed` (`Allow: POST`) |
 | pool empty | 503 | `upstream_unavailable` |
 | `retrievalAvailable:false` (cached config probe) | 503 | `search_unavailable` |
 | upstream non-200 | 502 | `upstream_error` |

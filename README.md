@@ -37,9 +37,14 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
 - **滑动空闲看门狗**：上游 60 秒没有任何事件才判超时（每行事件都会重置），
   不是按总耗时砍断长回答；流中断后必定补发 error 帧 + `[DONE]`，绝不裸关闭。
 - **可选 API Key**：`IL2API_API_KEY` 为空即开放访问；`OPTIONS` 预检与 CORS 头已处理。
+- **独立联网搜索**：`POST /v1/web_search` 对接上游 `/search` 实验台的检索流水线
+  （`/api/search-lab/run` 的 NDJSON 流），返回重写后的查询与实际命中的来源，
+  响应结构与 [simple-chat](https://github.com/Sliverkiss/simple-chat) 完全一致；
+  `/healthz` 用 `search.available` 报告上游是否开放检索。
 
-范围之外（刻意不做）：usage/token 统计、工具调用、Web 搜索、管理面板。
-设计细节见 [docs/SPEC.md](docs/SPEC.md)。
+范围之外（刻意不做）：usage/token 统计、工具调用、聊天内联搜索
+（`webSearchEnabled` 固定关闭，`source-url` 一律忽略）、搜索答案正文（只桥接来源）、
+管理面板。设计细节见 [docs/SPEC.md](docs/SPEC.md)。
 
 ## 快速开始
 
@@ -94,6 +99,9 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `IL2API_IDLE_TIMEOUT` | `60s` | 滑动空闲看门狗（每个上游事件都会重置） |
 | `IL2API_CONTEXT_CHARS` | `250000` | 输入字符上限；`-1` 关闭守卫 |
 | `IL2API_SESSION_TIMEOUT` | `15s` | 单次 `/api/session` 请求超时 |
+| `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` 的滑动空闲看门狗（每个 NDJSON 行都会重置） |
+| `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`，是否在启动时后台探测一次 `/api/search-lab/config`；`off` 时 `search.available` 恒为 `null` |
+| `IL2API_SEARCH_PROBE_TIMEOUT` | `15s` | 单次启动探测的超时上限 |
 
 完整注释版示例见 [`app/.env.example`](app/.env.example)。
 
@@ -102,6 +110,7 @@ curl -N http://localhost:3000/v1/chat/completions \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI 兼容，`stream` 可选 |
+| `POST` | `/v1/web_search` | 独立联网搜索，返回查询与来源（见下） |
 | `GET` | `/v1/models` | 返回配置的模型列表 |
 | `OPTIONS` | `/v1/*` | CORS 预检（返回 204） |
 | `GET` | `/healthz` | 存活探针 + 会话池大小 + 请求计数 |
@@ -146,6 +155,55 @@ data: [DONE]
 }
 ```
 
+### 独立联网搜索 `POST /v1/web_search`
+
+上游 `/search` 实验台背后是一条独立的检索流水线：`POST /api/search-lab/run`
+以 NDJSON 逐行推送 `plan → retrieve → rerank → followup → synthesize` 各阶段，
+其中 `docs` 事件携带按相关度排序的 `sources:[{title,url,score}]`。本接口把这条流
+桥接成 [simple-chat](https://github.com/Sliverkiss/simple-chat) 的 `web_search`
+响应形状，客户端换 base URL 即可复用同一套解析：
+
+```bash
+curl http://localhost:3000/v1/web_search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"最近有哪些国家试行四天工作制？",
+       "config":{"fanout":3,"depth":1,"keep_top_k":10,"effort":"instant"}}'
+```
+
+```jsonc
+{"object": "web_search",
+ "queries": ["four-day workweek trial results countries"],   // 上游重写出的实际查询
+ "results": [
+   {"url": "https://www.aph.gov.au/...", "title": "Four-day work week – Parliament of Australia",
+    "snippet": "", "cite_index": 1},
+   {"url": "https://www.4dayweek.com/research", "title": "4 Day Week Research Reports", "cite_index": 2}
+ ]}
+```
+
+- `config` 可省略：`fanout` 默认 3、`depth` 默认 1、`keep_top_k` 默认 10、`effort`
+  默认 `instant`；`fanout`/`depth` 会按上游公布的范围（1–5 / 1–3）收敛，
+  `keep_top_k` 收敛到 1–50，`effort` 只接受 `instant`/`fast`/`deep`。
+- `queries` 收集自所有 `queries` 事件（含多轮 follow-up），去重后按出现顺序返回。
+- `results` 是最终一轮 `docs` 的名称/链接/名次，`cite_index` 为 1..N；
+  **`snippet` 恒为空**——上游 NDJSON 里根本没有逐条摘要，本网关不编造。
+- 读到最后一轮 `docs` 就停止，不等待 `synthesize`：答案正文不属于本接口，
+  提前停止可省下数秒与多次 LLM 调用。
+- 只返回绝对的 `http(s)` 链接；`javascript:`、`data:`、相对路径与含控制字符的
+  URL 会被丢弃（消费方通常直接把它们渲染成可点击链接）。
+- 空查询、超长查询（>2000 字符）、未知字段（含 `config` 内未知字段）、
+  重复键、JSON 尾部多余内容一律 400，并在错误信息里指出具体字段。
+- 上游没有结果时返回 `200` + `"results":[]`，这是诚实的空列表，不重试。
+- 响应带 `Cache-Control: no-store`；本接口不流式，整次检索完成后一次性返回。
+
+错误映射与聊天接口一致：会话池为空 `503 upstream_unavailable`；上游配置
+`retrievalAvailable:false` 时 `503 search_unavailable`；上游非 200 或流内出现
+终止 `error` 事件 `502 upstream_error`；`docs` 之前流被截断
+`502 upstream_stream_error`；滑动空闲窗口（默认 60 秒，每行重置）超时
+`504 upstream_idle_timeout`，整次运行另有 10 个空闲窗口的绝对上限。
+
+> 上游对 NDJSON 默认做 Brotli 压缩，而 Go 的 `net/http` 不会自动解压。
+> 网关发送 `Accept-Encoding: identity`，并对 `br`/`gzip` 响应做防御性解码。
+
 ### 错误码
 
 | HTTP | code | 场景 |
@@ -159,6 +217,7 @@ data: [DONE]
 | 404 | `model_not_found` | 模型不在 `IL2API_MODELS` |
 | 502 | `upstream_error` / `upstream_stream_error` / `upstream_auth_failed` | 上游异常或流被截断 |
 | 503 | `upstream_unavailable` | 会话池为空（通常是出口 IP 被 Vercel 挑战） |
+| 503 | `search_unavailable` | 上游 `/api/search-lab/config` 明确报告 `retrievalAvailable:false` |
 | 504 | `upstream_idle_timeout` | 上游超过空闲窗口没有任何事件 |
 
 流式响应一旦发出头部就无法改状态码：中途失败会改为发送一个
@@ -189,6 +248,8 @@ docker compose up -d --build      # 3000:3000，distroless nonroot (uid 65532)
 > 服务仍能启动（不会崩溃），但 `/healthz` 的 `pool.size` 会一直是 0，
 > 聊天接口返回 `503 upstream_unavailable`，日志里会出现
 > `pool: refill failed ... status 429 ... Vercel Security Checkpoint`。
+> 搜索同理：启动探测失败时 `search.available` 保持 `null`（不会因此禁用接口），
+> 真正调用 `/v1/web_search` 时会返回 503。
 > 此时给容器设置 `IL2API_PROXY` 走一个未被挑战的出口即可，例如
 > `IL2API_PROXY=http://10.0.0.2:3128`。**部署环境的出口与本地探测环境可能不同**，
 > 请以部署后 `/healthz` 的 `pool.size` 为准。
@@ -198,6 +259,7 @@ docker compose up -d --build      # 3000:3000，distroless nonroot (uid 65532)
 ```bash
 curl -s http://localhost:3000/healthz | jq
 # {"ok":true,"pool":{"size":2,"min":2,"max":8,"expired":0},
+#  "search":{"available":true},
 #  "counters":{"requests":12,"streams":9,"errors":0,"upstream_errors":0}}
 ```
 
@@ -210,8 +272,11 @@ go test ./... -race -cover                              # 竞态 + 覆盖率（�
 ```
 
 测试策略：全部针对 `httptest` / 本地 TLS 监听器上的模拟上游，不访问真实的
-Vercel；utls 拨号器只用本地证书与本地 CONNECT 代理验证。仓库根目录的
-`Makefile` 提供 `make test` / `make race` / `make cover` / `make docker`。
+Vercel；utls 拨号器只用本地证书与本地 CONNECT 代理验证。搜索链路由模拟的
+NDJSON 上游覆盖：完整流水线、多轮 follow-up、Brotli/gzip 编码、缺失 `docs`、
+终止 `error`、流截断、非 200、`retrievalAvailable:false`、空闲超时、启动探测
+（成功/失败/关闭）以及恶意来源清洗。仓库根目录的 `Makefile` 提供 `make test` /
+`make race` / `make cover` / `make docker`。
 
 ## 许可
 
