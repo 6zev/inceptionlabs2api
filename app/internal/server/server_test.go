@@ -659,3 +659,31 @@ func TestCountersAccumulate(t *testing.T) {
 		t.Fatalf("counters = %+v", body.Counters)
 	}
 }
+
+func TestCORSPreflight(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(&fakeChatter{})
+	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("missing allow-origin")
+	}
+	if !strings.Contains(rec.Header().Get("Access-Control-Allow-Headers"), "Authorization") {
+		t.Fatalf("allow-headers = %q", rec.Header().Get("Access-Control-Allow-Headers"))
+	}
+}
+
+func TestCORSHeadersOnResponse(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) { return streamOf(hardStream), nil }}
+	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","messages":[{"role":"user","content":"q"}]}`)
+	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatal("CORS header missing on a normal response")
+	}
+}
