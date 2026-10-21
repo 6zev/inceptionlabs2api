@@ -4,7 +4,6 @@ package upstream
 // (x-vercel-ai-ui-message-stream: v1).
 type Event struct {
 	Type string `json:"type"`
-	ID   string `json:"id"`
 	// Delta is the incremental text for reasoning-delta and text-delta.
 	Delta string `json:"delta"`
 	// Snapshot is the full text carried by some text-start events, which

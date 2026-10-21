@@ -546,18 +546,21 @@ func TestStatusErrorString(t *testing.T) {
 	}
 }
 
-func TestClientLogfAndBindPool(t *testing.T) {
+func TestNewClientAttachesPoolAndBindPool(t *testing.T) {
 	t.Parallel()
-	c, _ := NewClient(Config{BaseURL: "https://x"})
-	if c.Logf() == nil {
-		t.Fatal("Logf() = nil")
-	}
 	p := pool.New(pool.Config{Min: 0, Max: 1, TTL: time.Minute}, func(context.Context) (string, error) {
 		return writeSessionTokenValue(1), nil
 	})
 	defer p.Close()
-	c.BindPool(p)
+	// The pool is injectable at construction (the startup path) or afterwards
+	// (tests that must build the fetcher first).
+	c, _ := NewClient(Config{BaseURL: "https://x", Pool: p})
 	if c.pool != p {
+		t.Fatal("Config.Pool was not attached")
+	}
+	c2, _ := NewClient(Config{BaseURL: "https://x"})
+	c2.BindPool(p)
+	if c2.pool != p {
 		t.Fatal("BindPool did not attach the pool")
 	}
 }

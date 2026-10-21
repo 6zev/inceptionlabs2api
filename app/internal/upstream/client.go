@@ -17,11 +17,6 @@ import (
 	"inceptionlabs2api/internal/pool"
 )
 
-// ChromeUA is the browser user agent every upstream request carries. It is
-// the same constant clearance acquisition uses: the _vcrcs cookie is bound to
-// (egress IP, UA, HTTP/2), so the two must never diverge.
-const ChromeUA = clear.UserAgent
-
 // maxErrorBody caps how much of a non-200 upstream body is read (and logged).
 const maxErrorBody = 4096
 
@@ -157,9 +152,6 @@ func NewClient(cfg Config) (*Client, pool.Fetcher) {
 // BindPool attaches the token pool the client draws from. It is called once
 // at startup because the pool itself depends on the client's Fetcher.
 func (c *Client) BindPool(p *pool.Pool) { c.pool = p }
-
-// Logf returns the client's logger, used by the server for upstream diagnosis.
-func (c *Client) Logf() func(format string, args ...any) { return c.logf }
 
 // Clearance exposes the clearance state for /healthz.
 func (c *Client) Clearance() *clear.Clearance { return c.clear }

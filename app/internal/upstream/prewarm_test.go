@@ -14,7 +14,7 @@ import (
 // prewarmServer is a minimal challenge endpoint: it challenges until the
 // _vcrcs cookie is presented, then answers /api/session with a valid token.
 type prewarmServer struct {
-	srv      *httptest.Server
+	srv        *httptest.Server
 	challenges int
 }
 
