@@ -32,34 +32,33 @@ type CitationCollector struct {
 
 // Observe inspects one event. Sentinels and unusable sources are dropped;
 // __search_error__ is reported through logf (which may be nil) and never
-// aborts the stream. The error return is reserved for callers that stop a
-// stream from the callback; it is always nil today.
-func (c *CitationCollector) Observe(ev Event, logf func(format string, args ...any)) error {
+// aborts the stream.
+func (c *CitationCollector) Observe(ev Event, logf func(format string, args ...any)) {
 	if ev.Type != EventSourceURL {
-		return nil
+		return
 	}
 	if ev.Title == SentinelSearching || ev.SourceID == SentinelSearching {
-		return nil
+		return
 	}
 	if ev.Title == SentinelSearchError || ev.SourceID == SentinelSearchError {
 		if logf != nil {
 			logf("upstream: web search failed mid-answer (__search_error__); the answer continues without its sources")
 		}
-		return nil
+		return
 	}
 
 	url := strings.TrimSpace(ev.URL)
 	if !isHTTPURL(url) || len([]rune(url)) > maxURLRunes || hasControl(url) {
-		return nil
+		return
 	}
 	if c.seen == nil {
 		c.seen = make(map[string]struct{})
 	}
 	if _, dup := c.seen[url]; dup {
-		return nil
+		return
 	}
 	if len(c.cites) >= maxCitations {
-		return nil
+		return
 	}
 	c.seen[url] = struct{}{}
 
@@ -72,7 +71,6 @@ func (c *CitationCollector) Observe(ev Event, logf func(format string, args ...a
 		StartIndex: 0,
 		EndIndex:   0,
 	})
-	return nil
 }
 
 // Citations returns the collected annotations in arrival order, or nil when

@@ -65,9 +65,7 @@ func TestCollectCitationsRanksSourcesByArrival(t *testing.T) {
 	var c CitationCollector
 	var logLines []string
 	for _, ev := range events {
-		if err := c.Observe(ev, func(format string, args ...any) { logLines = append(logLines, format) }); err != nil {
-			t.Fatalf("Observe: %v", err)
-		}
+		c.Observe(ev, func(format string, args ...any) { logLines = append(logLines, format) })
 	}
 	cites := c.Citations()
 	// The capture has one __searching__ sentinel and 12 real sources.
@@ -103,12 +101,8 @@ func TestCollectCitationsSentinelSemantics(t *testing.T) {
 	var logs []string
 	logf := func(format string, args ...any) { logs = append(logs, format) }
 
-	if err := c.Observe(Event{Type: EventSourceURL, SourceID: "__searching__", URL: "", Title: "__searching__"}, logf); err != nil {
-		t.Fatalf("searching sentinel: %v", err)
-	}
-	if err := c.Observe(Event{Type: EventSourceURL, SourceID: "__search_error__", URL: "", Title: "__search_error__"}, logf); err != nil {
-		t.Fatalf("search_error sentinel must not abort the stream: %v", err)
-	}
+	c.Observe(Event{Type: EventSourceURL, SourceID: "__searching__", URL: "", Title: "__searching__"}, logf)
+	c.Observe(Event{Type: EventSourceURL, SourceID: "__search_error__", URL: "", Title: "__search_error__"}, logf)
 	if got := c.Citations(); len(got) != 0 {
 		t.Fatalf("sentinels produced citations: %+v", got)
 	}
@@ -117,9 +111,7 @@ func TestCollectCitationsSentinelSemantics(t *testing.T) {
 	}
 	// A real source after the sentinels starts at rank 1: __searching__ does
 	// not consume a rank and __search_error__ does not either.
-	if err := c.Observe(Event{Type: EventSourceURL, SourceID: "u", URL: "https://a.example", Title: " A "}, logf); err != nil {
-		t.Fatalf("source: %v", err)
-	}
+	c.Observe(Event{Type: EventSourceURL, SourceID: "u", URL: "https://a.example", Title: " A "}, logf)
 	got := c.Citations()
 	if len(got) != 1 || got[0].Index != 1 || got[0].Title != "A" {
 		t.Fatalf("citations = %+v, want one at rank 1 with a trimmed title", got)
@@ -140,9 +132,7 @@ func TestCollectCitationsDropsUnusableSources(t *testing.T) {
 		{Type: EventSourceURL, SourceID: "h", URL: "https://ok.example", Title: "duplicate"},
 	}
 	for _, ev := range inputs {
-		if err := c.Observe(ev, nil); err != nil {
-			t.Fatalf("Observe: %v", err)
-		}
+		c.Observe(ev, nil)
 	}
 	got := c.Citations()
 	if len(got) != 1 {
@@ -158,9 +148,7 @@ func TestCollectCitationsBoundsCount(t *testing.T) {
 	var c CitationCollector
 	for i := 0; i < maxCitations+10; i++ {
 		url := "https://example.com/" + strings.Repeat("x", i+1)
-		if err := c.Observe(Event{Type: EventSourceURL, SourceID: url, URL: url, Title: "t"}, nil); err != nil {
-			t.Fatalf("Observe: %v", err)
-		}
+		c.Observe(Event{Type: EventSourceURL, SourceID: url, URL: url, Title: "t"}, nil)
 	}
 	if got := len(c.Citations()); got != maxCitations {
 		t.Fatalf("citations = %d, want the %d cap", got, maxCitations)
@@ -174,9 +162,7 @@ func TestCollectCitationsIgnoresOtherEvents(t *testing.T) {
 		{Type: EventTextDelta, Delta: "https://example.com is a url"},
 		{Type: EventReasoningDelta, Delta: "source-url"},
 	} {
-		if err := c.Observe(ev, nil); err != nil {
-			t.Fatalf("Observe: %v", err)
-		}
+		c.Observe(ev, nil)
 	}
 	if len(c.Citations()) != 0 {
 		t.Fatal("non-source events must not create citations")

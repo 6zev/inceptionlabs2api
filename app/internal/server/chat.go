@@ -125,9 +125,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 	// so no earlier chunk is known to be the last one.
 	var cites upstream.CitationCollector
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
-		if err := cites.Observe(ev, s.logf); err != nil {
-			return err
-		}
+		cites.Observe(ev, s.logf)
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
 			if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
@@ -188,9 +186,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, ureq *upstream
 	var content, reasoning strings.Builder
 	var cites upstream.CitationCollector
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
-		if err := cites.Observe(ev, s.logf); err != nil {
-			return err
-		}
+		cites.Observe(ev, s.logf)
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
 			reasoning.WriteString(ev.Reasoning())
