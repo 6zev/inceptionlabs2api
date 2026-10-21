@@ -174,8 +174,14 @@ must verify offline).
 - `Header() (ua, cookie)` is consulted on every upstream request; empty cookie
   means "none held yet".
 - `Refresh(ctx)` runs `GET → solve → POST` and stores the cookie with its
-  issue time. It refuses to start another refresh within a 15 s cooldown per
-  client, so a challenged burst cannot become a solve storm.
+  issue time. A **failed** acquisition opens a 15 s cooldown per client, so a
+  challenged burst — or a checkpoint that keeps refusing — cannot become a
+  solve storm. Inside the window a held cookie is reused, and a caller without
+  one receives the recorded failure rather than a silent success. A successful
+  solve never opens a window, so the replay after a 429 is never blocked.
+- An egress the edge does not challenge is recorded as such (with its
+  timestamp) instead of being probed before every request; it is re-probed on
+  the same schedule a cookie would be refreshed.
 - The cookie is refreshed **proactively at 45 min of its 60 min TTL**, and
   that cycle starts at boot (§ acquisition above), not at first traffic.
 - On a `429` carrying `x-vercel-mitigated: challenge` (or a challenge token
@@ -460,9 +466,12 @@ Names are case-insensitive on input and sent lowercased. An absent or empty
 chars client-side; the upstream was not probed above 155 chars, so >5 000 is
 undefined and the gateway does not invent a limit.
 
-**Body read.** Complete body, bounded by `IL2API_AUDIO_TIMEOUT` on the
-pre-header phase and a whole-body read cap of 32 MiB. Body bytes are proxied
-unchanged — no re-encoding, no ID3 rewriting.
+**Body read.** Complete body, bounded by `IL2API_AUDIO_TIMEOUT` on the whole
+call — headers *and* body, because the upstream answers `200` and then streams
+— plus a whole-body read cap of 32 MiB. An expiry during the body read is
+reported as `upstream_idle_timeout` (504), the audio analogue of the chat
+idle window. Body bytes are proxied unchanged — no re-encoding, no ID3
+rewriting.
 
 #### 2.5.2 STT — `POST /api/stt`
 
@@ -715,8 +724,9 @@ Token = `{unix_ts}.{32 hex}.{64 hex}`; shape is validated at acquisition.
 ### 7.1 `POST /v1/web_search`
 
 Bridges §2.3 into the response contract used by Sliverkiss/simple-chat
-(`app/internal/server/websearch_endpoint_test.go`), so a client written for
-that gateway can switch base URL without changing its parser:
+(pinned by `TestWebSearchResponseShape` in
+`app/internal/server/search_test.go`), so a client written for that gateway
+can switch base URL without changing its parser:
 
 ```json
 // request
@@ -879,7 +889,7 @@ rides a custom header). CORS runs outside auth so preflights are answerable.
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` sliding idle watchdog (the same window the chat path uses for `IL2API_IDLE_TIMEOUT`) |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`; `off` skips the startup `/api/search-lab/config` probe (`search.available` stays `null`) |
 | `IL2API_SEARCH_PROBE_TIMEOUT` | `15s` | bound on the one startup config probe |
-| `IL2API_AUDIO_TIMEOUT` | `120s` | pre-header timeout for `/api/tts` and `/api/stt` (TTS took ~1 s live; the window is generous for long inputs) |
+| `IL2API_AUDIO_TIMEOUT` | `120s` | whole-call timeout for `/api/tts` and `/api/stt` (headers and body; TTS took ~1 s live, the window is generous for long inputs) |
 | `IL2API_AUDIO_MAX_BYTES` | `26214400` (25 MiB) | upload cap for `/v1/audio/transcriptions`; larger bodies are a 413 without an upstream call |
 
 Invalid values are startup errors with an actionable message.
