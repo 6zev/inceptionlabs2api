@@ -103,6 +103,7 @@ curl -N http://localhost:3000/v1/chat/completions \
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI 兼容，`stream` 可选 |
 | `GET` | `/v1/models` | 返回配置的模型列表 |
+| `OPTIONS` | `/v1/*` | CORS 预检（返回 204） |
 | `GET` | `/healthz` | 存活探针 + 会话池大小 + 请求计数 |
 
 ### 请求字段
