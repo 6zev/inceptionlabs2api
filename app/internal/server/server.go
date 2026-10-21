@@ -65,6 +65,11 @@ type Config struct {
 	// SearchProbeTimeout bounds the one startup /api/search-lab/config probe.
 	// Zero means 15s.
 	SearchProbeTimeout time.Duration
+	// AudioTimeout bounds the pre-header phase of one /api/tts or /api/stt
+	// call. Zero means 120s.
+	AudioTimeout time.Duration
+	// AudioMaxBytes caps a transcription upload. Zero means 25 MiB.
+	AudioMaxBytes int64
 	// Logf is optional; nil means log.Printf.
 	Logf func(format string, args ...any)
 }
@@ -75,6 +80,8 @@ type Counters struct {
 	Streams  uint64 `json:"streams"`
 	Errors   uint64 `json:"errors"`
 	Upstream uint64 `json:"upstream_errors"`
+	TTS      uint64 `json:"tts"`
+	STT      uint64 `json:"stt"`
 }
 
 // Server holds the handler dependencies.
@@ -82,8 +89,9 @@ type Server struct {
 	cfg  Config
 	up   Chatter
 	se   Searcher
-	pool PoolStats
-	clr  ClearanceStats
+	pool  PoolStats
+	clr   ClearanceStats
+	audio Speech
 	now  func() time.Time
 	logf func(format string, args ...any)
 
@@ -97,6 +105,8 @@ type Server struct {
 	streams  atomic.Uint64
 	errors   atomic.Uint64
 	upErrors atomic.Uint64
+	tts      atomic.Uint64
+	stt      atomic.Uint64
 }
 
 // New builds a Server. Models defaults to [Model].
@@ -190,6 +200,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", s.chatCompletions)
 	mux.HandleFunc("/v1/web_search", s.webSearch)
+	mux.HandleFunc("/v1/audio/speech", s.speech)
+	mux.HandleFunc("/v1/audio/transcriptions", s.transcription)
 	mux.HandleFunc("/v1/models", s.models)
 	mux.HandleFunc("/healthz", s.healthz)
 	return cors(s.authenticate(mux))
@@ -329,6 +341,8 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 			Streams:  s.streams.Load(),
 			Errors:   s.errors.Load(),
 			Upstream: s.upErrors.Load(),
+			TTS:      s.tts.Load(),
+			STT:      s.stt.Load(),
 		},
 		"search": map[string]any{"available": s.SearchAvailable()},
 	}

@@ -69,9 +69,12 @@ func run() error {
 		IdleTimeout:        cfg.IdleTimeout,
 		SearchTimeout:      cfg.SearchTimeout,
 		SearchProbeTimeout: cfg.SearchProbeTimeout,
+		AudioTimeout:       cfg.AudioTimeout,
+		AudioMaxBytes:      cfg.AudioMaxBytes,
 		Logf:               logf,
 	}, up, p)
 	srv.SetSearcher(up)
+	srv.SetSpeech(up)
 	srv.SetClearance(up.Clearance())
 	if cfg.SearchConfigCheck {
 		// Background and bounded: a challenged config route must never delay

@@ -34,6 +34,10 @@ type Config struct {
 	SearchConfigCheck bool
 	// SearchProbeTimeout bounds that probe.
 	SearchProbeTimeout time.Duration
+	// AudioTimeout bounds the pre-header phase of one /api/tts or /api/stt call.
+	AudioTimeout time.Duration
+	// AudioMaxBytes caps a /v1/audio/transcriptions upload.
+	AudioMaxBytes int64
 	// ClearanceRefresh is the proactive _vcrcs refresh age (cookie TTL 60m).
 	ClearanceRefresh time.Duration
 	// ClearanceCooldown is the minimum spacing between clearance refreshes.
@@ -56,6 +60,9 @@ func Defaults() Config {
 		SearchTimeout:      60 * time.Second,
 		SearchConfigCheck:  true,
 		SearchProbeTimeout: 15 * time.Second,
+
+		AudioTimeout:  120 * time.Second,
+		AudioMaxBytes: 25 << 20,
 
 		ClearanceRefresh:  45 * time.Minute,
 		ClearanceCooldown: 15 * time.Second,
@@ -130,6 +137,12 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if c.SearchProbeTimeout, err = envDuration(getenv, "IL2API_SEARCH_PROBE_TIMEOUT", c.SearchProbeTimeout); err != nil {
 		return Config{}, err
 	}
+	if c.AudioTimeout, err = envDuration(getenv, "IL2API_AUDIO_TIMEOUT", c.AudioTimeout); err != nil {
+		return Config{}, err
+	}
+	if c.AudioMaxBytes, err = envInt64(getenv, "IL2API_AUDIO_MAX_BYTES", c.AudioMaxBytes); err != nil {
+		return Config{}, err
+	}
 	if c.ClearanceRefresh, err = envDuration(getenv, "IL2API_CLEARANCE_REFRESH", c.ClearanceRefresh); err != nil {
 		return Config{}, err
 	}
@@ -180,6 +193,12 @@ func (c Config) validate() error {
 	}
 	if c.ContextChars < -1 {
 		return fmt.Errorf("config: IL2API_CONTEXT_CHARS must be positive or -1, got %d", c.ContextChars)
+	}
+	if c.AudioTimeout <= 0 {
+		return fmt.Errorf("config: IL2API_AUDIO_TIMEOUT must be positive, got %s", c.AudioTimeout)
+	}
+	if c.AudioMaxBytes <= 0 {
+		return fmt.Errorf("config: IL2API_AUDIO_MAX_BYTES must be positive, got %d", c.AudioMaxBytes)
 	}
 	if c.ClearanceRefresh <= 0 {
 		return fmt.Errorf("config: IL2API_CLEARANCE_REFRESH must be positive, got %s", c.ClearanceRefresh)
@@ -246,6 +265,18 @@ func envInt(getenv func(string) string, key string, def int) (int, error) {
 		return def, nil
 	}
 	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be an integer, got %q", key, raw)
+	}
+	return n, nil
+}
+
+func envInt64(getenv func(string) string, key string, def int64) (int64, error) {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("config: %s must be an integer, got %q", key, raw)
 	}

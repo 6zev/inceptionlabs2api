@@ -244,3 +244,53 @@ func TestSearchConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestAudioDefaults(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(envMap(nil))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.AudioTimeout != 120*time.Second {
+		t.Errorf("AudioTimeout = %s, want 120s", cfg.AudioTimeout)
+	}
+	if cfg.AudioMaxBytes != 25<<20 {
+		t.Errorf("AudioMaxBytes = %d, want 26214400", cfg.AudioMaxBytes)
+	}
+}
+
+func TestAudioOverrides(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(envMap(map[string]string{
+		"IL2API_AUDIO_TIMEOUT":   "45s",
+		"IL2API_AUDIO_MAX_BYTES": "1048576",
+	}))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.AudioTimeout != 45*time.Second || cfg.AudioMaxBytes != 1<<20 {
+		t.Fatalf("audio settings not applied: %+v", cfg)
+	}
+}
+
+func TestAudioConfigValidation(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"zero timeout", map[string]string{"IL2API_AUDIO_TIMEOUT": "0s"}, "AUDIO_TIMEOUT"},
+		{"zero bytes", map[string]string{"IL2API_AUDIO_MAX_BYTES": "0"}, "AUDIO_MAX_BYTES"},
+		{"non-numeric bytes", map[string]string{"IL2API_AUDIO_MAX_BYTES": "big"}, "AUDIO_MAX_BYTES"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := FromEnv(envMap(tc.env))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}

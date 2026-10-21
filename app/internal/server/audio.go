@@ -1,0 +1,305 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"inceptionlabs2api/internal/openai"
+	"inceptionlabs2api/internal/upstream"
+)
+
+// Speech is the upstream audio abstraction the handlers depend on. It is
+// separate from Chatter so a deployment can wire audio independently.
+type Speech interface {
+	Speech(ctx context.Context, req upstream.SpeechRequest, timeout time.Duration) ([]byte, error)
+	Transcribe(ctx context.Context, up upstream.AudioUpload, timeout time.Duration) (string, error)
+}
+
+// defaultAudioMaxBytes is OpenAI's own upload limit. It is far above the 6 MiB
+// JSON cap because recordings legitimately run to tens of megabytes.
+const defaultAudioMaxBytes = 25 << 20
+
+// defaultAudioTimeout bounds the pre-header phase of one audio call. The live
+// TTS answered in about a second; the window is generous for long inputs.
+const defaultAudioTimeout = 120 * time.Second
+
+// SetSpeech attaches the audio backend. Without one both audio routes answer
+// 503 rather than panicking.
+func (s *Server) SetSpeech(sp Speech) { s.audio = sp }
+
+// audioTimeout returns the configured audio timeout or its default.
+func (s *Server) audioTimeout() time.Duration {
+	if s.cfg.AudioTimeout > 0 {
+		return s.cfg.AudioTimeout
+	}
+	return defaultAudioTimeout
+}
+
+// audioMaxBytes returns the configured upload cap or its default.
+func (s *Server) audioMaxBytes() int64 {
+	if s.cfg.AudioMaxBytes > 0 {
+		return s.cfg.AudioMaxBytes
+	}
+	return defaultAudioMaxBytes
+}
+
+// voiceAliases maps OpenAI's standard voice names onto the four upstream
+// voices (SPEC §2.5.1). The upstream does not validate voice names: an unknown
+// one answers 200 with a 0.44 s nonsense clip, so the gateway must resolve
+// every accepted name to a real one rather than forward it.
+var voiceAliases = map[string]string{
+	"alloy":   "sarah",
+	"echo":    "chris",
+	"fable":   "charlie",
+	"onyx":    "chris",
+	"nova":    "jessica",
+	"shimmer": "jessica",
+}
+
+// upstreamVoices is the discovered whitelist in a stable order for messages.
+var upstreamVoices = []string{"charlie", "chris", "jessica", "sarah"}
+
+// resolveVoice maps an OpenAI or upstream voice name onto an upstream voice.
+// An empty name means "the upstream default" and returns "".
+func resolveVoice(name string) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(name))
+	if v == "" {
+		return "", true
+	}
+	if _, ok := voiceAliases[v]; ok {
+		return voiceAliases[v], true
+	}
+	for _, u := range upstreamVoices {
+		if v == u {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// speechRequest is the POST /v1/audio/speech body. Only the structurally
+// required field is typed; model, response_format, speed and every other key
+// are dropped (SPEC §1.1).
+type speechRequest struct {
+	Input string `json:"input"`
+	Voice string `json:"voice"`
+}
+
+// transcriptionResponse is OpenAI's `json` transcription shape.
+type transcriptionResponse struct {
+	Object string `json:"object"`
+	Text   string `json:"text"`
+}
+
+// speech bridges OpenAI's speech request onto /api/tts. The upstream body is
+// read to completion before headers are committed, so an upstream failure
+// still produces a JSON error envelope instead of a truncated audio stream.
+func (s *Server) speech(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
+			"method not allowed; use POST"))
+		return
+	}
+	s.requests.Add(1)
+	s.tts.Add(1)
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.fail(w, readBodyError(err))
+		return
+	}
+	req, re := decodeSpeech(body)
+	if re != nil {
+		s.fail(w, re)
+		return
+	}
+	if s.audio == nil {
+		s.fail(w, errNoAudioBackend)
+		return
+	}
+	voice, ok := resolveVoice(req.Voice)
+	if !ok {
+		s.fail(w, unknownVoice(req.Voice))
+		return
+	}
+
+	audio, err := s.audio.Speech(r.Context(), upstream.SpeechRequest{Text: req.Input, Voice: voice}, s.audioTimeout())
+	if err != nil {
+		if clientGone(r, err) {
+			return
+		}
+		s.fail(w, s.upstreamError(err))
+		return
+	}
+	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(audio)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(audio)
+}
+
+// transcription bridges OpenAI's multipart upload onto /api/stt. The file is
+// forwarded byte-for-byte with a sniffed part type; nothing is transcoded
+// (SPEC §2.5.2).
+func (s *Server) transcription(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		openai.WriteError(w, openai.New(http.StatusMethodNotAllowed, "invalid_request_error", openai.CodeMethodNotAllowed, "",
+			"method not allowed; use POST"))
+		return
+	}
+	s.requests.Add(1)
+	s.stt.Add(1)
+
+	limit := s.audioMaxBytes()
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	up, re := readAudioUpload(w, r, limit)
+	if re != nil {
+		s.fail(w, re)
+		return
+	}
+	if s.audio == nil {
+		s.fail(w, errNoAudioBackend)
+		return
+	}
+
+	text, err := s.audio.Transcribe(r.Context(), up, s.audioTimeout())
+	if err != nil {
+		if clientGone(r, err) {
+			return
+		}
+		s.fail(w, s.upstreamError(err))
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, transcriptionResponse{Object: "transcription", Text: text})
+}
+
+// errNoAudioBackend is what both routes answer when no Speech backend is
+// attached; it is a configuration fault, not an upstream one.
+var errNoAudioBackend = openai.New(http.StatusServiceUnavailable, "server_error", openai.CodeUpstreamUnavailable, "",
+	"audio backend is not configured")
+
+// clientGone reports whether err is just the caller hanging up: writing an
+// envelope to a closed socket would only log a spurious upstream error.
+func clientGone(r *http.Request, err error) bool {
+	return errors.Is(err, context.Canceled) && r.Context().Err() != nil
+}
+
+// readBodyError maps an io.ReadAll failure on the request body.
+func readBodyError(err error) *openai.RequestError {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		return openai.New(http.StatusRequestEntityTooLarge, "invalid_request_error", openai.CodeRequestTooLarge, "",
+			fmt.Sprintf("request body exceeds %d bytes", maxBodyBytes))
+	}
+	return openai.Invalid(fmt.Sprintf("read request body: %v", err))
+}
+
+// unknownVoice builds the 400 for a voice the upstream cannot produce. The
+// accepted list is in the message because the error is the only discovery
+// surface OpenAI clients have.
+func unknownVoice(name string) *openai.RequestError {
+	names := append([]string(nil), upstreamVoices...)
+	sort.Strings(names)
+	openaiNames := make([]string, 0, len(voiceAliases))
+	for a := range voiceAliases {
+		openaiNames = append(openaiNames, a)
+	}
+	sort.Strings(openaiNames)
+	return &openai.RequestError{
+		Status: http.StatusBadRequest, Type: "invalid_request_error", Code: openai.CodeInvalidRequest, Param: "voice",
+		Message: fmt.Sprintf("unknown voice %q; OpenAI voices: %s; upstream voices: %s",
+			name, strings.Join(openaiNames, ", "), strings.Join(names, ", ")),
+	}
+}
+
+// decodeSpeech accepts only what the upstream call cannot express: malformed
+// JSON, trailing data, a non-object body, and an empty or non-string input.
+// Everything else is dropped (SPEC §7.2).
+func decodeSpeech(body []byte) (*speechRequest, *openai.RequestError) {
+	var raw map[string]json.RawMessage
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if err := dec.Decode(&raw); err != nil {
+		return nil, openai.Invalid(fmt.Sprintf("invalid JSON body: %v", err))
+	}
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		return nil, openai.Invalid("invalid JSON body: unexpected data after the request object")
+	}
+	if raw == nil {
+		return nil, openai.Invalid("request body must be a JSON object")
+	}
+
+	var req speechRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		// A non-string input (number, array, object) lands here.
+		return nil, &openai.RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error",
+			Code: openai.CodeInvalidRequest, Param: "input", Message: `field "input" must be a string`}
+	}
+	if strings.TrimSpace(req.Input) == "" {
+		return nil, &openai.RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error",
+			Code: openai.CodeInvalidRequest, Param: "input", Message: `field "input" must be a non-empty string`}
+	}
+	return &req, nil
+}
+
+// readAudioUpload reads the multipart body's `file` part. Missing parts,
+// unreadable bodies, and empty files are structural 400s; an oversized body
+// is a 413. The bytes are returned unchanged.
+func readAudioUpload(w http.ResponseWriter, r *http.Request, limit int64) (upstream.AudioUpload, *openai.RequestError) {
+	badRequest := func(msg string) (upstream.AudioUpload, *openai.RequestError) {
+		return upstream.AudioUpload{}, &openai.RequestError{Status: http.StatusBadRequest, Type: "invalid_request_error",
+			Code: openai.CodeInvalidRequest, Param: "file", Message: msg}
+	}
+
+	reader, err := r.MultipartReader()
+	if err != nil {
+		return badRequest("request must be multipart/form-data with a \"file\" part")
+	}
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			return badRequest(`missing required part "file"`)
+		}
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				return upstream.AudioUpload{}, openai.New(http.StatusRequestEntityTooLarge, "invalid_request_error",
+					openai.CodeRequestTooLarge, "file", fmt.Sprintf("upload exceeds %d bytes", limit))
+			}
+			return badRequest(fmt.Sprintf("read multipart body: %v", err))
+		}
+		if part.FormName() != "file" {
+			part.Close()
+			continue
+		}
+		data, err := io.ReadAll(part)
+		part.Close()
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				return upstream.AudioUpload{}, openai.New(http.StatusRequestEntityTooLarge, "invalid_request_error",
+					openai.CodeRequestTooLarge, "file", fmt.Sprintf("upload exceeds %d bytes", limit))
+			}
+			return badRequest(fmt.Sprintf("read file part: %v", err))
+		}
+		if len(data) == 0 {
+			return badRequest(`part "file" is empty`)
+		}
+		name := part.FileName()
+		if name == "" {
+			name = "audio.mp3"
+		}
+		return upstream.AudioUpload{Filename: name, Data: data}, nil
+	}
+}
