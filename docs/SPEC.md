@@ -1087,7 +1087,7 @@ never a request path.
 | Challenge retire + one replay | `Client.Send` | — |
 | Sliding idle watchdog (SSE / NDJSON) | `upstream.lines` (`reader.go`) — one scanner goroutine + one sliding timer, parameterised by the "is this a data line" predicate and the per-line parser | chat: `data:` framing; search: NDJSON framing |
 | Absolute run cap | `upstream.lines` caller passes a `hardCap` (search: 10 idle windows; chat: none) | search only |
-| Whole-call timeout (audio, decisions) | `upstream.withCallTimeout` | timeout |
+| Whole-call deadline (audio, decisions) | `upstream/deadline.go`: `withCallTimeout`, `bodyReadError`, `cutByDeadline`, `idleTimeout` | timeout |
 | Upstream → envelope mapping (non-stream) | `server.upstreamError` | — |
 | Upstream → SSE error frame | `server.streamError` (same switch, same codes) | — |
 | Text-shape rules (http URL, control chars, whitespace, rune truncation, rune length) | `upstream/text.go`: `isHTTPURL`, `hasControl`, `collapseSpace`, `truncateRunes` | search and citations share them |

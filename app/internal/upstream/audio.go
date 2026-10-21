@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -63,7 +62,7 @@ func (c *Client) Speech(ctx context.Context, req SpeechRequest, timeout time.Dur
 
 	audio, err := io.ReadAll(io.LimitReader(resp.Body, maxAudioBytes+1))
 	if err != nil {
-		return nil, audioReadError(ctx, "speech", err)
+		return nil, bodyReadError(ctx, "speech", err)
 	}
 	if cutByDeadline(ctx) {
 		// The deadline cancelled the request and the transport handed back a
@@ -132,7 +131,7 @@ func (c *Client) Transcribe(ctx context.Context, up AudioUpload, timeout time.Du
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxTranscriptBytes))
 	if err != nil {
-		return "", audioReadError(ctx, "transcript", err)
+		return "", bodyReadError(ctx, "transcript", err)
 	}
 	if cutByDeadline(ctx) {
 		return "", idleTimeout("transcript")
@@ -144,40 +143,6 @@ func (c *Client) Transcribe(ctx context.Context, up AudioUpload, timeout time.Du
 		return "", fmt.Errorf("upstream: parse transcript: %w (body %q)", err, truncate(string(raw), 200))
 	}
 	return out.Text, nil
-}
-
-// withCallTimeout bounds a whole audio call. A zero or negative timeout leaves
-// the caller's context untouched.
-func withCallTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if timeout <= 0 {
-		return ctx, func() {}
-	}
-	return context.WithTimeout(ctx, timeout)
-}
-
-// audioReadError classifies a body-read failure. The call timeout expiring
-// mid-body is the audio suite's idle window (SPEC §7.2), so it is reported as
-// ErrIdleTimeout and mapped to 504 like chat; a caller cancellation stays the
-// caller's.
-func audioReadError(ctx context.Context, what string, err error) error {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return idleTimeout(what)
-	}
-	return fmt.Errorf("upstream: read %s body: %w", what, err)
-}
-
-// cutByDeadline reports whether this call's own timeout expired. Unlike
-// audioReadError it applies after a *successful* read: a body cut by the
-// deadline can arrive as a clean EOF (the peer closes END_STREAM when the
-// request is cancelled), and an empty or partial body must not then be
-// reported as "the upstream sent nothing"/"unparseable" (SPEC §7.2).
-func cutByDeadline(ctx context.Context) bool {
-	return errors.Is(ctx.Err(), context.DeadlineExceeded)
-}
-
-// idleTimeout is the typed audio timeout error, mapped to 504.
-func idleTimeout(what string) error {
-	return fmt.Errorf("%w: %s body did not complete before the call deadline", ErrIdleTimeout, what)
 }
 
 // escapeQuotes escapes a filename for a quoted Content-Disposition parameter.

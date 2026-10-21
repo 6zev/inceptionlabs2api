@@ -37,7 +37,7 @@ func (c *Client) Decide(ctx context.Context, body []byte, timeout time.Duration)
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxDecideBytes+1))
 	if err != nil {
-		return nil, audioReadError(ctx, "decision", err)
+		return nil, bodyReadError(ctx, "decision", err)
 	}
 	if cutByDeadline(ctx) {
 		// The deadline cancelled the request and the transport handed back a
