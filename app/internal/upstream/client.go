@@ -107,7 +107,7 @@ func (c *Client) FetchSession(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer tr.CloseIdleConnections()
-	hc := &http.Client{Transport: tr}
+	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/session", nil)
 	if err != nil {
@@ -140,6 +140,23 @@ func (c *Client) FetchSession(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("upstream: malformed session token %q", truncate(p.Token, 16))
 	}
 	return p.Token, nil
+}
+
+// checkRedirect rejects redirects that leave the configured origin or
+// downgrade HTTPS. The session token travels as a custom header, which Go
+// would otherwise copy to a cross-host redirect target.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 3 {
+		return fmt.Errorf("upstream: stopped after %d redirects", len(via))
+	}
+	orig := via[0].URL
+	if req.URL.Host != orig.Host {
+		return fmt.Errorf("upstream: refusing cross-host redirect to %s", req.URL.Host)
+	}
+	if orig.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("upstream: refusing HTTPS downgrade on redirect")
+	}
+	return nil
 }
 
 // Stream is an opened upstream SSE stream. Close releases the connection and
@@ -206,7 +223,7 @@ func (c *Client) post(ctx context.Context, token string, body []byte, headerTime
 	}
 	// No http.Client.Timeout: a wall-clock cap would kill legitimately long
 	// diffusion generations. The sliding idle watchdog lives in Reader.
-	hc := &http.Client{Transport: tr}
+	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/api/chat", bytes.NewReader(body))
 	if err != nil {

@@ -4,7 +4,7 @@
 
 一个二进制、一个模型、零外部存储。匿名会话池自动续期，流式响应按 OpenAI 协议逐帧输出。
 
-[![Go](https://img.shields.io/badge/Go-1.23-00ADD8?style=flat-square&logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.24-00ADD8?style=flat-square&logo=go)](https://go.dev)
 [![OpenAI-Compatible](https://img.shields.io/badge/OpenAI-Compatible-412991?style=flat-square&logo=openai)](https://platform.openai.com/docs/api-reference/chat)
 [![Docker](https://img.shields.io/badge/Docker-distroless-2496ED?style=flat-square&logo=docker)](Dockerfile)
 [![Streaming](https://img.shields.io/badge/Streaming-SSE-2ea44f?style=flat-square&logo=serverless)](docs/SPEC.md)
@@ -87,7 +87,7 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `IL2API_UPSTREAM_BASE` | `https://chat.inceptionlabs.ai` | 上游地址 |
 | `IL2API_MODEL` | `mercury-3` | 默认/主模型名 |
 | `IL2API_MODELS` | 同 `IL2API_MODEL` | 逗号分隔的可接受模型列表（`/v1/models` 返回） |
-| `IL2API_PROXY` | 回退 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | 出站 HTTP CONNECT 代理，支持 `http://host:port`、`host:port`、`https://` |
+| `IL2API_PROXY` | 回退 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | 出站 HTTP CONNECT 代理，支持 `http://host:port`、`host:port`、`https://`；可带 `user:pass@`（以 Basic 方式发送，日志与错误里会脱敏） |
 | `IL2API_POOL_MIN` | `2` | 会话池最小 token 数 |
 | `IL2API_POOL_MAX` | `8` | 会话池最大 token 数 |
 | `IL2API_POOL_TTL` | `30m` | token 寿命，到期销毁重建 |
@@ -182,7 +182,7 @@ belmo 的部署引擎总会扫描仓库的 **`app/` 子目录**，这正是 Go �
 docker compose up -d --build      # 3000:3000，distroless nonroot (uid 65532)
 ```
 
-镜像为 `golang:1.23-alpine` 构建 → `gcr.io/distroless/static-debian12:nonroot` 运行，
+镜像为 `golang:1.24-alpine` 构建 → `gcr.io/distroless/static-debian12:nonroot` 运行，
 静态二进制、无 shell、无外部依赖。
 
 > **出口 IP 很重要。** 上游的 Vercel 风控按 IP 挑战。如果部署机被挑战，

@@ -73,7 +73,7 @@ func run() error {
 
 	go func() {
 		logf("inceptionlabs2api listening on %s (upstream=%s proxy=%q models=%v)",
-			cfg.Addr, cfg.UpstreamBase, cfg.Proxy, cfg.Models)
+			cfg.Addr, cfg.UpstreamBase, config.RedactProxy(cfg.Proxy), cfg.Models)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server: %v", err)
 		}

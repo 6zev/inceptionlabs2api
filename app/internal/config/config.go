@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -154,15 +155,36 @@ func normalizeProxy(raw string) (string, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("config: invalid proxy %q: %w", raw, err)
+		return "", fmt.Errorf("config: invalid proxy URL: %w", redactURLError(err, raw))
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", fmt.Errorf("config: proxy scheme must be http or https, got %q", u.Scheme)
 	}
 	if u.Host == "" {
-		return "", fmt.Errorf("config: proxy %q has no host", raw)
+		return "", fmt.Errorf("config: proxy %q has no host", RedactProxy(raw))
 	}
 	return u.String(), nil
+}
+
+// RedactProxy removes any userinfo (proxy credentials) from a proxy URL for
+// logs and error messages.
+func RedactProxy(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid proxy URL>"
+	}
+	u.User = nil
+	return u.String()
+}
+
+// redactURLError strips the raw string from a url.Parse error so a password
+// embedded in userinfo never reaches the logs.
+func redactURLError(err error, raw string) error {
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err
+	}
+	return errors.New("malformed URL")
 }
 
 func envInt(getenv func(string) string, key string, def int) (int, error) {

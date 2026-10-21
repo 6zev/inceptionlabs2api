@@ -9,7 +9,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -94,7 +97,22 @@ type proxyAddr struct {
 	// tlsProxy is true when the proxy itself is reached over TLS
 	// (an https:// proxy URL).
 	tlsProxy bool
+	// auth is the Proxy-Authorization header value, empty for open proxies.
+	auth string
 }
+
+// proxyAuthHeader renders basic proxy credentials from the URL userinfo.
+func proxyAuthHeader(u *url.URL) string {
+	if u.User == nil {
+		return ""
+	}
+	password, _ := u.User.Password()
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+password))
+}
+
+// maxProxyLineBytes caps the proxy status line and each header line. A
+// hostile or broken proxy must not be able to grow gateway memory.
+const maxProxyLineBytes = 8 << 10
 
 func parseProxy(raw string) (*proxyAddr, error) {
 	raw = strings.TrimSpace(raw)
@@ -106,15 +124,19 @@ func parseProxy(raw string) (*proxyAddr, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("fp: parse proxy %q: %w", raw, err)
+		return nil, fmt.Errorf("fp: invalid proxy URL")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("fp: unsupported proxy scheme %q", u.Scheme)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("fp: proxy %q has no host", raw)
+		return nil, fmt.Errorf("fp: proxy URL has no host")
 	}
-	return &proxyAddr{host: u.Host, tlsProxy: u.Scheme == "https"}, nil
+	return &proxyAddr{
+		host:     u.Host,
+		tlsProxy: u.Scheme == "https",
+		auth:     proxyAuthHeader(u),
+	}, nil
 }
 
 func dialTLS(ctx context.Context, addr string, proxy *proxyAddr, roots *x509.CertPool) (net.Conn, error) {
@@ -147,7 +169,7 @@ func dialTLS(ctx context.Context, addr string, proxy *proxyAddr, roots *x509.Cer
 			}
 			raw = tlsConn
 		}
-		tunnelled, err := connectTunnel(ctx, raw, addr)
+		tunnelled, err := connectTunnel(ctx, raw, addr, proxy.auth)
 		if err != nil {
 			raw.Close()
 			return nil, err
@@ -187,18 +209,24 @@ func proxyHostname(hostport string) string {
 // connectTunnel performs the HTTP CONNECT handshake through raw and returns
 // a connection that preserves any TLS bytes the proxy sent ahead of the
 // response head the reader consumed.
-func connectTunnel(ctx context.Context, raw net.Conn, target string) (net.Conn, error) {
+func connectTunnel(ctx context.Context, raw net.Conn, target, auth string) (net.Conn, error) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := raw.SetDeadline(deadline); err != nil {
 			return nil, fmt.Errorf("fp: set CONNECT deadline: %w", err)
 		}
 		defer raw.SetDeadline(time.Time{})
 	}
-	if _, err := fmt.Fprintf(raw, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+	var head strings.Builder
+	fmt.Fprintf(&head, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
+	if auth != "" {
+		fmt.Fprintf(&head, "Proxy-Authorization: %s\r\n", auth)
+	}
+	head.WriteString("\r\n")
+	if _, err := io.WriteString(raw, head.String()); err != nil {
 		return nil, fmt.Errorf("fp: write CONNECT: %w", err)
 	}
-	br := bufio.NewReader(raw)
-	line, err := br.ReadString('\n')
+	br := bufio.NewReaderSize(raw, maxProxyLineBytes)
+	line, err := readBoundedLine(br)
 	if err != nil {
 		return nil, fmt.Errorf("fp: read CONNECT response: %w", err)
 	}
@@ -207,7 +235,7 @@ func connectTunnel(ctx context.Context, raw net.Conn, target string) (net.Conn, 
 		return nil, fmt.Errorf("fp: proxy CONNECT to %s failed: %s", target, strings.TrimSpace(line))
 	}
 	for {
-		header, err := br.ReadString('\n')
+		header, err := readBoundedLine(br)
 		if err != nil {
 			return nil, fmt.Errorf("fp: read CONNECT headers: %w", err)
 		}
@@ -219,6 +247,19 @@ func connectTunnel(ctx context.Context, raw net.Conn, target string) (net.Conn, 
 		return &bufferedConn{Conn: raw, r: br}, nil
 	}
 	return raw, nil
+}
+
+// readBoundedLine reads one CRLF-terminated line, rejecting lines longer than
+// maxProxyLineBytes.
+func readBoundedLine(br *bufio.Reader) (string, error) {
+	line, err := br.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return "", fmt.Errorf("proxy response line exceeds %d bytes", maxProxyLineBytes)
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(line), nil
 }
 
 // bufferedConn preserves bytes a bufio.Reader read ahead from the proxy.

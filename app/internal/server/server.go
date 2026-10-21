@@ -19,8 +19,10 @@ import (
 	"inceptionlabs2api/internal/upstream"
 )
 
-// maxBodyBytes caps request bodies before JSON decoding.
-const maxBodyBytes = 16 << 20
+// maxBodyBytes caps request bodies before JSON decoding. The context guard
+// limits inputs to 250k characters (~1 MB of JSON even with heavy escaping),
+// so 2 MiB leaves ample headroom while bounding per-request memory.
+const maxBodyBytes = 2 << 20
 
 // Chatter is the upstream abstraction the handlers depend on.
 type Chatter interface {
@@ -89,12 +91,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", s.chatCompletions)
 	mux.HandleFunc("/v1/models", s.models)
 	mux.HandleFunc("/healthz", s.healthz)
-	return s.authenticate(cors(mux))
+	return cors(s.authenticate(mux))
 }
 
 // cors answers browser preflights and lets browser-based clients call the
 // gateway. The API is keyed, not cookie-based, so a permissive origin is safe
-// and avoids a configuration matrix nobody needs.
+// and avoids a configuration matrix nobody needs. It wraps auth because a
+// browser preflight never carries credentials: answering 401 to OPTIONS would
+// make the documented CORS support unusable whenever a key is set.
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

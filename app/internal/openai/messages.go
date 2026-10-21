@@ -7,6 +7,11 @@ import (
 	"unicode/utf8"
 )
 
+// maxTextParts caps the number of text parts across a request. Empty parts
+// are bytes that never reach the character guard, so an unbounded count would
+// let a caller forward an arbitrarily large body upstream for free.
+const maxTextParts = 4096
+
 // TextMessage is a validated chat message reduced to plain text parts.
 type TextMessage struct {
 	Role  string
@@ -18,7 +23,7 @@ type TextMessage struct {
 // maxChars > 0 enforces the context guard; -1 disables it.
 func NormalizeMessages(msgs []Message, maxChars int) ([]TextMessage, int, *RequestError) {
 	out := make([]TextMessage, 0, len(msgs))
-	total := 0
+	total, parts := 0, 0
 
 	for i, m := range msgs {
 		if hasToolCalls(m.ToolCalls) {
@@ -41,6 +46,16 @@ func NormalizeMessages(msgs []Message, maxChars int) ([]TextMessage, int, *Reque
 		texts, re := contentTexts(m.Content, i)
 		if re != nil {
 			return nil, 0, re
+		}
+		parts += len(texts)
+		if parts > maxTextParts {
+			return nil, 0, &RequestError{
+				Status:  400,
+				Type:    "invalid_request_error",
+				Code:    CodeInvalidRequest,
+				Param:   fmt.Sprintf("messages[%d].content", i),
+				Message: fmt.Sprintf("request has more than %d text parts; merge adjacent text parts and retry", maxTextParts),
+			}
 		}
 		if len(texts) == 0 {
 			return nil, 0, &RequestError{
@@ -124,13 +139,13 @@ func contentTexts(content any, msgIndex int) ([]string, *RequestError) {
 				return nil, mediaUnsupported(msgIndex, j, typ)
 			}
 			text, ok := part["text"].(string)
-			if !ok {
+			if !ok || text == "" {
 				return nil, &RequestError{
 					Status:  400,
 					Type:    "invalid_request_error",
 					Code:    CodeInvalidRequest,
 					Param:   fmt.Sprintf("messages[%d].content[%d].text", msgIndex, j),
-					Message: fmt.Sprintf("messages[%d].content[%d] is a text part without a string \"text\" field", msgIndex, j),
+					Message: fmt.Sprintf("messages[%d].content[%d] is a text part without a non-empty string \"text\" field", msgIndex, j),
 				}
 			}
 			texts = append(texts, text)

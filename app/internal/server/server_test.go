@@ -661,6 +661,23 @@ func TestCountersAccumulate(t *testing.T) {
 	}
 }
 
+func TestCORSPreflightWithAPIKey(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(&fakeChatter{})
+	s.cfg.APIKey = "sekret"
+	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("preflight with a key configured: status = %d, want 204 (preflights carry no credentials)", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatal("missing allow-origin on preflight")
+	}
+}
+
 func TestCORSPreflight(t *testing.T) {
 	t.Parallel()
 	s := newTestServer(&fakeChatter{})
@@ -863,5 +880,56 @@ func TestStreamOnCapturedHardStream(t *testing.T) {
 	}
 	if lastReasoning > firstContent {
 		t.Fatalf("reasoning frame %d arrived after content frame %d", lastReasoning, firstContent)
+	}
+}
+
+func TestBodyTooLarge(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{}
+	big := strings.Repeat("x", maxBodyBytes+1024)
+	rec := postChat(t, newTestServer(up), `{"model":"mercury-3","messages":[{"role":"user","content":"`+big+`"}]}`)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	if up.count() != 0 {
+		t.Fatal("oversized body reached upstream")
+	}
+}
+
+func TestEmptyTextPartsRejected(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{}
+	body := `{"model":"mercury-3","messages":[{"role":"user","content":[{"type":"text","text":""}]}]}`
+	rec := postChat(t, newTestServer(up), body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if up.count() != 0 {
+		t.Fatal("empty part reached upstream")
+	}
+}
+
+func TestTooManyTextPartsRejected(t *testing.T) {
+	t.Parallel()
+	up := &fakeChatter{}
+	var parts strings.Builder
+	for i := 0; i < 5000; i++ {
+		if i > 0 {
+			parts.WriteString(",")
+		}
+		parts.WriteString(`{"type":"text","text":"x"}`)
+	}
+	body := `{"model":"mercury-3","messages":[{"role":"user","content":[` + parts.String() + `]}]}`
+	rec := postChat(t, newTestServer(up), body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var env openai.ErrorResponse
+	json.Unmarshal(rec.Body.Bytes(), &env)
+	if !strings.Contains(env.Error.Message, "text parts") {
+		t.Fatalf("message = %q", env.Error.Message)
+	}
+	if up.count() != 0 {
+		t.Fatal("part-flood reached upstream")
 	}
 }

@@ -134,3 +134,35 @@ func TestValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestRedactProxy(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"http://user:secret@proxy:3128": "http://proxy:3128",
+		"http://proxy:3128":             "http://proxy:3128",
+		"http://user@proxy:3128":        "http://proxy:3128",
+	}
+	for in, want := range cases {
+		if got := RedactProxy(in); got != want {
+			t.Errorf("RedactProxy(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := RedactProxy("://bad"); got != "<invalid proxy URL>" {
+		t.Errorf("RedactProxy(invalid) = %q", got)
+	}
+}
+
+func TestProxyCredentialsDoNotAppearInErrors(t *testing.T) {
+	t.Parallel()
+	_, err := FromEnv(envMap(map[string]string{"IL2API_PROXY": "http://user:supersecret@proxy:3128"}))
+	if err != nil {
+		t.Fatalf("valid proxy rejected: %v", err)
+	}
+	_, err = FromEnv(envMap(map[string]string{"IL2API_PROXY": "ftp://user:supersecret@proxy:3128"}))
+	if err == nil {
+		t.Fatal("expected scheme error")
+	}
+	if strings.Contains(err.Error(), "supersecret") {
+		t.Fatalf("error leaks proxy password: %v", err)
+	}
+}

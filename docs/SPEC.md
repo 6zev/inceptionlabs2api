@@ -116,7 +116,10 @@ honest behaviour requested by the task (the audit found silent drops are
 worse). `tools`, `tool_choice`, `functions`, and `function_call` get an
 additional clause naming tool calling as unsupported.
 
-The request body is capped at 16 MiB (`http.MaxBytesReader`).
+The request body is capped at 2 MiB (`http.MaxBytesReader`); the 250k-character
+guard means real requests stay far below it. Text parts are capped at 4096 per
+request and empty text parts are rejected, so a part flood cannot bypass the
+guard.
 
 ### 3.2 Response — streaming
 
@@ -279,9 +282,10 @@ Auth: when `IL2API_API_KEY` is non-empty, require
 `Authorization: Bearer <key>` or `X-Api-Key: <key>`; comparison is
 constant-time. An empty key disables auth.
 
-Server hardening: `ReadHeaderTimeout` 10 s, request body cap 16 MiB, no
-panic recovery facade (fail loud in tests, standard net/http recovery in
-production).
+Server hardening: `ReadHeaderTimeout` 10 s, request body cap 2 MiB, optional
+proxy credentials redacted from logs, upstream redirects restricted to the
+configured origin (no cross-host or HTTPS→HTTP hops, since the session token
+rides a custom header). CORS runs outside auth so preflights are answerable.
 
 ## 8. Configuration (env only, `IL2API_*`)
 
@@ -292,7 +296,7 @@ production).
 | `IL2API_UPSTREAM_BASE` | `https://chat.inceptionlabs.ai` | upstream origin |
 | `IL2API_MODEL` | `mercury-3` | default/primary model id |
 | `IL2API_MODELS` | value of `IL2API_MODEL` | comma-separated accepted ids |
-| `IL2API_PROXY` | `$HTTPS_PROXY` → `$HTTP_PROXY` → `$ALL_PROXY` | outbound HTTP CONNECT proxy (`http://host:port`, `host:port`, or `https://`) |
+| `IL2API_PROXY` | `$HTTPS_PROXY` → `$HTTP_PROXY` → `$ALL_PROXY` | outbound HTTP CONNECT proxy (`http://host:port`, `host:port`, or `https://`); optional `user:pass@` is sent as Proxy-Authorization and redacted from logs |
 | `IL2API_POOL_MIN` | `2` | minimum live tokens |
 | `IL2API_POOL_MAX` | `8` | maximum live tokens |
 | `IL2API_POOL_TTL` | `30m` | token lifetime |
@@ -319,7 +323,7 @@ Invalid values are startup errors with an actionable message.
 ## 10. Deployment
 
 `app/` is the build root (Nixpacks scans it on belmo). The Dockerfile builds
-with `golang:1.23-alpine` and runs as non-root on
+with `golang:1.24-alpine` and runs as non-root on
 `gcr.io/distroless/static-debian12:nonroot`, exposing port **3000**.
 `docker-compose.yml` maps `3000:3000` and passes `IL2API_*` through.
 `app/nixpacks.toml` pins `go build -o app .` / `./app`.

@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -451,5 +452,51 @@ func TestChatHeaderTimeoutIsBounded(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("waited %s for headers, want the idle bound", elapsed)
+	}
+}
+
+func TestRedirectPolicy(t *testing.T) {
+	t.Parallel()
+	mk := func(raw string) *http.Request {
+		req, _ := http.NewRequest(http.MethodPost, raw, nil)
+		return req
+	}
+	orig := mk("https://chat.inceptionlabs.ai/api/chat")
+
+	if err := checkRedirect(mk("https://chat.inceptionlabs.ai/api/other"), []*http.Request{orig}); err != nil {
+		t.Fatalf("same-host redirect rejected: %v", err)
+	}
+	if err := checkRedirect(mk("https://evil.example/api/chat"), []*http.Request{orig}); err == nil {
+		t.Fatal("cross-host redirect allowed; the session token would leak")
+	}
+	if err := checkRedirect(mk("http://chat.inceptionlabs.ai/api/chat"), []*http.Request{orig}); err == nil {
+		t.Fatal("HTTPS downgrade redirect allowed")
+	}
+	if err := checkRedirect(orig, []*http.Request{orig, orig, orig}); err == nil {
+		t.Fatal("redirect loop not stopped")
+	}
+}
+
+func TestChatDoesNotFollowCrossHostRedirect(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	var leaked atomic.Int32
+	evil := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-session-token") != "" {
+			leaked.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer evil.Close()
+	m.chatHandler = func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evil.URL+"/api/chat", http.StatusFound)
+	}
+	c, _ := newTestClient(t, m, 1)
+	_, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
+	if err == nil {
+		t.Fatal("cross-host redirect was followed")
+	}
+	if leaked.Load() != 0 {
+		t.Fatal("session token leaked to the redirect target")
 	}
 }

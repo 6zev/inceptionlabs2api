@@ -41,7 +41,7 @@ func TestConnectTunnelPreservesReadAhead(t *testing.T) {
 		io.Copy(io.Discard, br)
 	}()
 
-	conn, err := connectTunnel(context.Background(), client, "target.example:443")
+	conn, err := connectTunnel(context.Background(), client, "target.example:443", "")
 	if err != nil {
 		t.Fatalf("connectTunnel: %v", err)
 	}
@@ -124,5 +124,74 @@ func TestDialProxyDialFailure(t *testing.T) {
 	}
 	if !strings.Contains(fmt.Sprint(err), "127.0.0.1:1") {
 		t.Fatalf("err = %v should name the proxy", err)
+	}
+}
+
+func TestConnectTunnelSendsProxyAuth(t *testing.T) {
+	t.Parallel()
+	client, proxy := net.Pipe()
+	defer client.Close()
+
+	gotAuth := make(chan string, 1)
+	go func() {
+		defer proxy.Close()
+		br := bufio.NewReader(proxy)
+		line, _ := br.ReadString('\n')
+		_ = line
+		var auth string
+		for {
+			h, err := br.ReadString('\n')
+			if err != nil {
+				gotAuth <- auth
+				return
+			}
+			if strings.HasPrefix(strings.ToLower(h), "proxy-authorization: ") {
+				auth = strings.TrimSpace(strings.SplitN(h, ":", 2)[1])
+			}
+			if strings.TrimSpace(h) == "" {
+				break
+			}
+		}
+		proxy.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+		gotAuth <- auth
+		io.Copy(io.Discard, br)
+	}()
+
+	p, err := parseProxy("http://user:s3cret@proxy.example:3128")
+	if err != nil {
+		t.Fatalf("parseProxy: %v", err)
+	}
+	conn, err := connectTunnel(context.Background(), client, "target.example:443", p.auth)
+	if err != nil {
+		t.Fatalf("connectTunnel: %v", err)
+	}
+	defer conn.Close()
+	if got := <-gotAuth; got != "Basic dXNlcjpzM2NyZXQ=" {
+		t.Fatalf("Proxy-Authorization = %q", got)
+	}
+}
+
+func TestConnectTunnelRejectsOversizedLine(t *testing.T) {
+	t.Parallel()
+	client, proxy := net.Pipe()
+	defer client.Close()
+	go func() {
+		defer proxy.Close()
+		bufio.NewReader(proxy).ReadString('\n')
+		proxy.Write([]byte("HTTP/1.1 200 OK\r\nX-Huge: " + strings.Repeat("A", 20<<10) + "\r\n\r\n"))
+	}()
+	_, err := connectTunnel(context.Background(), client, "target.example:443", "")
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err = %v, want oversized-line rejection", err)
+	}
+}
+
+func TestParseProxyAuthRedactedInErrors(t *testing.T) {
+	t.Parallel()
+	if _, err := parseProxy("http://user:secret@proxy:1"); err != nil {
+		t.Fatalf("parseProxy: %v", err)
+	}
+	if _, err := parseProxy("socks5://user:secret@proxy:1"); err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("err = %v, must not leak credentials", err)
 	}
 }
