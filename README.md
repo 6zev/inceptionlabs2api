@@ -134,6 +134,7 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `IL2API_SEARCH_PROBE_TIMEOUT` | `15s` | 单次启动探测的超时上限 |
 | `IL2API_AUDIO_TIMEOUT` | `120s` | `/api/tts`、`/api/stt` 单次调用的整体超时（响应头 + 响应体） |
 | `IL2API_AUDIO_MAX_BYTES` | `26214400`（25 MiB） | `/v1/audio/transcriptions` 上传上限，超出直接 413，不调用上游 |
+| `IL2API_DECISIONS_TIMEOUT` | `120s` | `/api/decide/run` 单次调用的整体超时（响应头 + 响应体） |
 
 完整注释版示例见 [`app/.env.example`](app/.env.example)。
 
@@ -145,6 +146,7 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `POST` | `/v1/web_search` | 独立联网搜索，返回查询与来源（见下） |
 | `POST` | `/v1/audio/speech` | OpenAI 语音合成，返回 `audio/mpeg`（见下） |
 | `POST` | `/v1/audio/transcriptions` | OpenAI 语音转写，multipart 上传（见下） |
+| `POST` | `/v1/decisions` | Mercury Decide 结构化判断：按上游网页原格式透传（见下） |
 | `GET` | `/v1/models` | 返回配置的模型列表 |
 | `OPTIONS` | `/v1/*` | CORS 预检（返回 204） |
 | `GET` | `/healthz` | 存活探针 + 会话池大小 + 清关状态 + 请求计数 |
@@ -353,6 +355,39 @@ curl http://localhost:3000/v1/audio/transcriptions \
 - 上游的 `Invalid file type` 等错误会原样翻译为 `502 upstream_error`。
 
 `/healthz` 的 `counters` 新增 `tts` 与 `stt`，分别统计两个音频路由承接的请求数。
+
+### 结构化判断 `POST /v1/decisions`
+
+对接上游 Decide 实验台的 `/api/decide/run`（Mercury Decide，专用分类模型，不是 Mercury 3
+聊天）。**请求与响应都按上游网页格式原样对齐**，网关只翻译鉴权与错误信封：
+
+```bash
+curl http://localhost:3000/v1/decisions \
+  -H "Content-Type: application/json" \
+  -d '{"state":"客户被重复扣款两次，要求退款。",
+       "questions":[{"id":"q-1","name":"wants_refund","type":"noul",
+                     "instructions":"客户是在要求退款吗？","options":[]}],
+       "images":[]}'
+# {"answers":{"wants_refund":{"type":"noul","p":0.999}},"inputTokens":72,"latencyMs":226}
+```
+
+- `questions` 是**数组**（`{id,name,type,instructions,options}`），不是官方公网 API 的
+  映射表 —— 网页路由只接受数组，实测映射表会被它自己的校验器拒绝。
+- `type` 支持 `noul`（是/否）、`choice`（`options:[{id,name,description}]`）、
+  `score`（`options:[{id,name:"",description}]`，按顺序的等级）。
+- 响应里 `noul` 答 `p`；`choice` 答 `choice` + `probabilities` + `confidence`；
+  `score` 答**小数索引** `score` + `levels[{label,p}]` + `confidence`。
+  顶层 `inputTokens`/`latencyMs`，没有 `model`、没有 `usage`。
+- 上游**不流式**：一次 POST、一个完整 JSON。因此网关也只有非流式。
+- `images` 传 base64 data URL；网页路由只认它自带的示例图，其它图片会返回
+  `400 {"error":"Only the public example images are available right now."}` ——
+  那是上游自己的回答，网关原样透传。
+- 上游的校验 4xx（空 questions、state 超 12 000 字符等）按项目统一规则翻译为
+  `502 upstream_error`，正文保留上游原句（例如 `Add at least one question.`）。
+- 整体超时 `IL2API_DECISIONS_TIMEOUT`（默认 120s），与音频路由共用同一套
+  whole-call 截止机制；请求体沿用 6 MiB JSON 读取器。
+
+`/healthz` 的 `counters` 新增 `decisions`。
 
 ### 错误码
 

@@ -326,3 +326,35 @@ func TestAudioConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestDecisionDefaults(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(envMap(nil))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.DecisionTimeout != 120*time.Second {
+		t.Errorf("DecisionTimeout = %s, want 120s", cfg.DecisionTimeout)
+	}
+}
+
+func TestDecisionOverrides(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(envMap(map[string]string{"IL2API_DECISIONS_TIMEOUT": "45s"}))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.DecisionTimeout != 45*time.Second {
+		t.Fatalf("DecisionTimeout = %s, want 45s", cfg.DecisionTimeout)
+	}
+}
+
+func TestDecisionConfigValidation(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{"0s", "-1s", "soon"} {
+		_, err := FromEnv(envMap(map[string]string{"IL2API_DECISIONS_TIMEOUT": raw}))
+		if err == nil || !strings.Contains(err.Error(), "DECISIONS_TIMEOUT") {
+			t.Fatalf("%q: err = %v, want a DECISIONS_TIMEOUT error", raw, err)
+		}
+	}
+}

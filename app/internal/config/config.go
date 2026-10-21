@@ -38,6 +38,8 @@ type Config struct {
 	AudioTimeout time.Duration
 	// AudioMaxBytes caps a /v1/audio/transcriptions upload.
 	AudioMaxBytes int64
+	// DecisionTimeout bounds one whole /api/decide/run call.
+	DecisionTimeout time.Duration
 	// ClearanceRefresh is the proactive _vcrcs refresh age (cookie TTL 60m).
 	ClearanceRefresh time.Duration
 	// ClearanceCooldown is the minimum retry interval after a failed
@@ -64,8 +66,9 @@ func Defaults() Config {
 		SearchConfigCheck:  true,
 		SearchProbeTimeout: 15 * time.Second,
 
-		AudioTimeout:  120 * time.Second,
-		AudioMaxBytes: 25 << 20,
+		AudioTimeout:    120 * time.Second,
+		AudioMaxBytes:   25 << 20,
+		DecisionTimeout: 120 * time.Second,
 
 		ClearanceRefresh:  45 * time.Minute,
 		ClearanceCooldown: 15 * time.Second,
@@ -147,6 +150,9 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if c.AudioMaxBytes, err = envInt64(getenv, "IL2API_AUDIO_MAX_BYTES", c.AudioMaxBytes); err != nil {
 		return Config{}, err
 	}
+	if c.DecisionTimeout, err = envDuration(getenv, "IL2API_DECISIONS_TIMEOUT", c.DecisionTimeout); err != nil {
+		return Config{}, err
+	}
 	if c.ClearanceRefresh, err = envDuration(getenv, "IL2API_CLEARANCE_REFRESH", c.ClearanceRefresh); err != nil {
 		return Config{}, err
 	}
@@ -206,6 +212,9 @@ func (c Config) validate() error {
 	}
 	if c.AudioMaxBytes <= 0 {
 		return fmt.Errorf("config: IL2API_AUDIO_MAX_BYTES must be positive, got %d", c.AudioMaxBytes)
+	}
+	if c.DecisionTimeout <= 0 {
+		return fmt.Errorf("config: IL2API_DECISIONS_TIMEOUT must be positive, got %s", c.DecisionTimeout)
 	}
 	if c.ClearanceRefresh <= 0 {
 		return fmt.Errorf("config: IL2API_CLEARANCE_REFRESH must be positive, got %s", c.ClearanceRefresh)
