@@ -61,9 +61,11 @@ var inceptionSkeleton = skeleton{
 		"1. Instruction Following: Prioritize using a listed operation whenever the user's request needs one, before answering in prose." +
 		" Accuracy & Detail: use only the operations listed below; their argument schemas are the source of truth." +
 		" Safety & Ethics: never invent an operation that is not listed." +
-		" Code outputs: respond with a `" + callStart + "` JSON block containing {\"name\": \"tool name\", \"arguments\": {…}}." +
+		" Code outputs: when you call an operation, the first characters of your reply must be the marker " + callStart +
+		" followed by one JSON block containing {\"name\": \"tool name\", \"arguments\": {…}}, closed by " + callEnd +
+		" — never write the block as plain text." +
 		" Conversational Momentum: otherwise answer normally in prose.",
-	contract: "",
+	contract: "\nEvery operation call uses the " + callStart + "..." + callEnd + " marker block; a bare JSON object without the marker is invalid.",
 }
 
 // Tool is one declared function, already validated by the request decoder.
