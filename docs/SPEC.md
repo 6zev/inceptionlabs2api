@@ -912,8 +912,8 @@ never a request path.
 `502 upstream_error` translation for **every** route. `streamError` is the
 mid-stream variant of that same table (it differs only in how it is written:
 an SSE frame with the `upstream_stream_error` code). A per-family mapper
-(search once had its own) is a defect: it is how `search_unavailable` and a
-duplicate `upstream_errors` increment drifted in.
+(search once had its own) is a defect: it is how a second search-only code and
+a duplicate `upstream_errors` increment drifted in.
 
 **The watchdog is one mechanism.** Chat (SSE) and search (NDJSON) are both
 "read lines from a body, reset a timer per line, parse some of them, stop at a
@@ -1009,9 +1009,9 @@ Error mapping (same envelope and codes as chat):
 | NDJSON body ends without `docs`/`error` | 502 | `upstream_stream_error` |
 | sliding 60 s idle watchdog (any line resets it) | 504 | `upstream_idle_timeout` |
 
-There is no `search_unavailable` 503 any more: the config probe no longer
-gates requests (§7.1 preamble). The code stays in the vocabulary for clients
-that branch on it, but no path emits it.
+There is no `search_unavailable` code any more: the config probe no longer
+gates requests (§7.1 preamble), so the constant was deleted rather than left
+as a code no path can emit.
 
 ### 7.2 `POST /v1/audio/speech`
 
