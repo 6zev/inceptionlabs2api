@@ -24,6 +24,9 @@ type Config struct {
 	PoolMax      int
 	PoolTTL      time.Duration
 	IdleTimeout  time.Duration
+	// PreambleStyle selects the tool preamble skeleton ("hermes" or
+	// "inception"); wired to tools.PreStyle at boot.
+	PreambleStyle string
 	// ContextChars is a deprecated no-op, retained so existing deployments do
 	// not fail to boot. There is no client-side length guard (SPEC §1.1).
 	ContextChars   int
@@ -93,6 +96,7 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	setString("IL2API_API_KEY", &c.APIKey)
 	setString("IL2API_UPSTREAM_BASE", &c.UpstreamBase)
 	setString("IL2API_MODEL", &c.Model)
+	setString("IL2API_PREAMBLE_STYLE", &c.PreambleStyle)
 
 	if v := strings.TrimSpace(getenv("IL2API_MODELS")); v != "" {
 		for _, part := range strings.Split(v, ",") {

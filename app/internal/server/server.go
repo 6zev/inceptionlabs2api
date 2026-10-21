@@ -16,6 +16,7 @@ import (
 	"inceptionlabs2api/internal/clear"
 	"inceptionlabs2api/internal/openai"
 	"inceptionlabs2api/internal/pool"
+	"inceptionlabs2api/internal/tools"
 	"inceptionlabs2api/internal/upstream"
 )
 
@@ -67,6 +68,9 @@ type Config struct {
 	AudioMaxBytes int64
 	// DecisionTimeout bounds one whole /api/decide/run call. Zero means 120s.
 	DecisionTimeout time.Duration
+	// PreambleStyle selects the tool preamble skeleton ("hermes" or
+	// "inception"). Empty keeps the measured hermes default.
+	PreambleStyle string
 	// Logf is optional; nil means log.Printf.
 	Logf func(format string, args ...any)
 }
@@ -113,6 +117,11 @@ type Server struct {
 func New(cfg Config, up Chatter, p PoolStats) *Server {
 	if len(cfg.Models) == 0 {
 		cfg.Models = []string{cfg.Model}
+	}
+	// Wire the configured preamble skeleton into the tools package once at
+	// boot; empty keeps the measured hermes default.
+	if cfg.PreambleStyle != "" {
+		tools.PreStyle = cfg.PreambleStyle
 	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 60 * time.Second

@@ -21,6 +21,53 @@ const toolSchemaName = "tool_schema"
 // ask for the whole catalogue at once and defeat the point of tiering.
 const maxExpand = 10
 
+// PreStyle selects the preamble skeleton. "hermes" is the measured 7/8
+// hermes-compact skeleton; "inception" is the reconstructed AI-SDK v5 style
+// the upstream chat itself runs under (probes outX/X1 first-words + outZ2/Z4
+// verbatim identity line + outAA confirmed headings): identity sentence,
+// numbered behavioral items with the call contract as item 1, and the
+// code-outputs clause styled after the upstream's own item 4.
+var PreStyle = "hermes"
+
+// skeleton is one preamble wording option. Both skeletons render the same
+// definition lines; only the prose differs.
+type skeleton struct {
+	lead      string // opening sentence before the definition lines
+	contract  string // the call-contract sentence after the definitions
+	expanded  string // opening sentence used by Expand (tiered rebuild)
+}
+
+// hermesSkeleton is the hermes-compact skeleton from the 14-probe wording
+// matrix (7/8 live hit rate; probe/outP1..C). The previous "You have access
+// to N operations..." draft missed 3/3 locally — do not reword without a new
+// live matrix (DESIGN-TOOLS.md §1.1).
+var hermesSkeleton = skeleton{
+	lead:     "You are a helpful assistant with access to the following tools:",
+	contract: "\nIf you need to use a tool, respond with a " + callStart + " JSON block " +
+		"containing {\"name\": \"tool name\", \"arguments\": {…}}. " +
+		"Use only the tools listed; never invent one. Otherwise answer normally.",
+}
+
+// inceptionSkeleton mirrors the AI-SDK v5 structure the upstream chat itself
+// runs under — measured reconstruction: identity sentence (outZ2/Z4 verbatim,
+// "You are an AI assistant trained by Inception."), numbered behavioral items
+// (outX/X1 first-words verbatim), no JSON blocks in prose, code-outputs clause
+// styled after the upstream's item 4. The call contract replaces item 1 with
+// the same "Prioritize." imperative cadence.
+// NB: item text uses upstream-confirmed openers; bodies are ours. Not a copy
+// of the upstream prompt — only its genre, numbering style and cadence.
+var inceptionSkeleton = skeleton{
+	lead: "# Tool Operations\n\n" +
+		"1. Instruction Following: Prioritize using a listed operation whenever the user's request needs one, before answering in prose." +
+		" Accuracy & Detail: use only the operations listed below; their argument schemas are the source of truth." +
+		" Safety & Ethics: never invent an operation that is not listed." +
+		" Code outputs: when you call an operation, the first characters of your reply must be the marker " + callStart +
+		" followed by one JSON block containing {\"name\": \"tool name\", \"arguments\": {…}}, closed by " + callEnd +
+		" — never write the block as plain text." +
+		" Conversational Momentum: otherwise answer normally in prose.",
+	contract: "\nEvery operation call uses the " + callStart + "..." + callEnd + " marker block; a bare JSON object without the marker is invalid.",
+}
+
 // Tool is one declared function, already validated by the request decoder.
 type Tool struct {
 	Name        string
@@ -95,11 +142,18 @@ const tierNote = "\nSome argument details are omitted to save context. If you ne
 // suspected first and later disproved as deterministic triggers. The exact
 // phrasing is therefore part of the protocol, not copy: re-probe before
 // rewording (DESIGN-TOOLS.md §1.1).
+// activeSkeleton returns the skeleton selected by PreStyle, defaulting to
+// hermes for any unknown value.
+func activeSkeleton() skeleton {
+	if PreStyle == "inception" {
+		return inceptionSkeleton
+	}
+	return hermesSkeleton
+}
+
 func (m *Manifest) header() string {
-	// The hermes-compact skeleton from the 14-probe wording matrix (7/8 live
-	// hit rate; probe/outP1..C). The previous "You have access to N
-	// operations..." draft missed 3/3 locally — do not reword without a new
-	// live matrix (DESIGN-TOOLS.md §1.1).
+	// The skeleton is selected by PreStyle; the hermes variant is the
+	// measured 7/8 baseline (see hermesSkeleton).
 	var defs strings.Builder
 	if m.Tiered {
 		for _, t := range m.tools {
@@ -119,11 +173,8 @@ func (m *Manifest) header() string {
 				quoteJSON(t.Name), params, compactParams(t.Parameters))
 		}
 	}
-	preamble := "You are a helpful assistant with access to the following tools:\n\n" +
-		defs.String() +
-		"\nIf you need to use a tool, respond with a " + callStart + " JSON block " +
-		"containing {\"name\": \"tool name\", \"arguments\": {…}}. " +
-		"Use only the tools listed; never invent one. Otherwise answer normally.\n"
+	sk := activeSkeleton()
+	preamble := sk.lead + "\n\n" + defs.String() + sk.contract + "\n"
 	if m.Tiered {
 		preamble += tierNote
 	}
@@ -314,9 +365,10 @@ func (m *Manifest) Expanded(extra []Tool) *Manifest {
 	}
 
 	var b strings.Builder
-	// Rebuild with the same skeleton the BuildManifest preamble uses; the
-	// tier note replaces the full definitions for un-expanded tools.
-	b.WriteString("You are a helpful assistant with access to the following tools:\n\n")
+	// Rebuild with the same skeleton BuildManifest used (PreStyle-selectable);
+	// the tier note replaces the full definitions for un-expanded tools.
+	sk := activeSkeleton()
+	b.WriteString(sk.lead + "\n\n")
 	for _, t := range m.tools {
 		if full, ok := loaded[t.Name]; ok {
 			params := ""
@@ -333,9 +385,7 @@ func (m *Manifest) Expanded(extra []Tool) *Manifest {
 		}
 		fmt.Fprintf(&b, `{"name":%s%s}`+"\n", quoteJSON(t.Name), params)
 	}
-	b.WriteString("\nIf you need to use a tool, respond with a " + callStart + " JSON block " +
-		"containing {\"name\": \"tool name\", \"arguments\": {…}}. " +
-		"Use only the tools listed; never invent one. Otherwise answer normally.\n")
+	b.WriteString(sk.contract + "\n")
 	b.WriteString(tierNote)
 
 	declared := make([]string, 0, len(m.tools)+1)
