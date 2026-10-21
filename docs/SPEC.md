@@ -221,9 +221,10 @@ Conclusions the ring is built on:
   **round-robin, rotating once per request** — not once per token or per
   retry — together with the shared UA. A slot past `IL2API_CLEARANCE_REFRESH`
   is skipped if another live slot exists; a request never blocks on the ring.
-- `Ensure(ctx)` acquires only when **no** slot is live. The boot prewarm fills
-  empty slots to the configured size; a partially filled ring serves
-  immediately and fills the rest lazily.
+- `Ensure(ctx)` acquires when **no** slot is live, or replaces the oldest slot
+  when every slot is past the refresh margin. It never tops the ring up: the
+  boot prewarm fills empty slots to the configured size, and a partially
+  filled ring serves immediately with the slots it has.
 - The background `RefreshLoop` checks every slot and replaces the ones at the
   refresh margin, one per tick, so a 3-slot ring re-solves three times across
   three ticks rather than in one burst.
@@ -902,7 +903,7 @@ never a request path.
 | Upstream → envelope mapping (non-stream) | `server.upstreamError` | — |
 | Upstream → SSE error frame | `server.streamError` (same switch, same codes) | — |
 | Text-shape rules (http URL, control chars, whitespace, rune truncation, rune length) | `upstream/text.go`: `isHTTPURL`, `hasControl`, `collapseSpace`, `truncateRunes` | search and citations share them |
-| Source acceptance (URL scheme, title cleanup, count cap) | `upstream.normalizeSources`, used by both the search collector and the citation collector's source path | different caps |
+| Source acceptance (http(s)-only, control chars, title cleanup, rune bounds) | `upstream/text.go`: `usableSource` + `sourceTitle`, called by both `normalizeSources` (search) and `CitationCollector.Observe` | each keeps its own **count** cap |
 | SSE/JSON writing | `server.writeEvent`, `server.writeJSON` | — |
 | Envelope construction | `openai.New` / `openai.Invalid` / `openai.WriteError` | — |
 | Constants | `openai.Code*` for every `code`; per-package numeric constants live next to the rule they bound | — |
