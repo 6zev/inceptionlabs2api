@@ -10,6 +10,12 @@ type Event struct {
 	// Snapshot is the full text carried by some text-start events, which
 	// Mercury sends as whole blocks rather than increments.
 	Snapshot string `json:"text"`
+	// SourceID, URL, and Title are carried by source-url events only. The
+	// upstream publishes no per-source index (SPEC §2.4), and for a real
+	// source sourceId repeats the URL.
+	SourceID string `json:"sourceId"`
+	URL      string `json:"url"`
+	Title    string `json:"title"`
 }
 
 // Event types the gateway understands. Anything else is ignored.

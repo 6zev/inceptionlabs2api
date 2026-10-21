@@ -61,9 +61,23 @@ type ChunkChoice struct {
 // Delta is the incremental payload of a streaming frame. Empty fields are
 // omitted.
 type Delta struct {
-	Role             string `json:"role,omitempty"`
-	Content          string `json:"content,omitempty"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	Annotations      []Citation `json:"annotations,omitempty"`
+}
+
+// Citation is one OpenAI url_citation annotation. Index is the 1-based
+// citation number the answer text refers to; StartIndex/EndIndex are character
+// offsets into the answer and are 0 when the upstream does not provide them
+// (it does not — SPEC §2.4).
+type Citation struct {
+	Type       string `json:"type"`
+	Index      int    `json:"index"`
+	URL        string `json:"url"`
+	Title      string `json:"title"`
+	StartIndex int    `json:"start_index"`
+	EndIndex   int    `json:"end_index"`
 }
 
 // Completion is a non-streaming response (object "chat.completion").
@@ -87,9 +101,10 @@ type CompletionChoice struct {
 // intentionally absent: the upstream publishes no token counts and the
 // gateway does not fabricate them.
 type CompletionMessage struct {
-	Role             string `json:"role"`
-	Content          string `json:"content"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	Annotations      []Citation `json:"annotations,omitempty"`
 }
 
 // ErrorResponse is OpenAI's error envelope.
