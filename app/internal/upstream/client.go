@@ -179,23 +179,40 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration,
 	if err != nil {
 		return nil, fmt.Errorf("upstream: marshal chat request: %w", err)
 	}
+	resp, err := c.postAuthed(ctx, "/api/chat", "chat", body, idle, func(req *http.Request) {
+		req.Header.Set("Accept", "text/event-stream, application/json")
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Stream{
+		Body:   resp.Body,
+		Reader: NewReader(resp.Body, idle, onMalformed),
+	}, nil
+}
 
+// postAuthed POSTs body to path with a pooled token, retrying with a fresh
+// token on 401/403 at most maxAuthRetries times. It returns a 200 response
+// whose body the caller owns. A 401/403 discards that token; other non-200
+// statuses are a typed *StatusError and keep the token, since the pool never
+// poisons a token for an upstream fault. prepare may customise headers.
+func (c *Client) postAuthed(ctx context.Context, path, label string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
+	if c.pool == nil {
+		return nil, fmt.Errorf("%w: no pool bound", ErrUnavailable)
+	}
 	var lastErr error
 	for attempt := 0; attempt <= maxAuthRetries; attempt++ {
 		token, err := c.pool.Get(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		}
-		resp, err := c.post(ctx, token, body, idle)
+		resp, err := c.post(ctx, path, token, body, headerTimeout, prepare)
 		if err != nil {
 			return nil, err
 		}
 		switch {
 		case resp.StatusCode == http.StatusOK:
-			return &Stream{
-				Body:   resp.Body,
-				Reader: NewReader(resp.Body, idle, onMalformed),
-			}, nil
+			return resp, nil
 		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
 			resp.Body.Close()
@@ -206,14 +223,16 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration,
 		default:
 			bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 			resp.Body.Close()
-			c.logf("upstream: chat status %d: %s", resp.StatusCode, truncate(string(bodyText), 500))
+			c.logf("upstream: %s status %d: %s", label, resp.StatusCode, truncate(string(bodyText), 500))
 			return nil, &StatusError{Status: resp.StatusCode, Body: string(bodyText)}
 		}
 	}
 	return nil, lastErr
 }
 
-func (c *Client) post(ctx context.Context, token string, body []byte, headerTimeout time.Duration) (*http.Response, error) {
+// post issues one authenticated POST to path and returns the response. The
+// caller owns the body. prepare may add endpoint-specific headers.
+func (c *Client) post(ctx context.Context, path, token string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
 	if headerTimeout <= 0 {
 		headerTimeout = 60 * time.Second
 	}
@@ -234,16 +253,18 @@ func (c *Client) post(ctx context.Context, token string, body []byte, headerTime
 	timer := time.AfterFunc(headerTimeout, cancelHeader)
 	defer timer.Stop()
 
-	req, err := http.NewRequestWithContext(hctx, http.MethodPost, c.base+"/api/chat", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(hctx, http.MethodPost, c.base+path, bytes.NewReader(body))
 	if err != nil {
 		cancelHeader()
 		tr.CloseIdleConnections()
-		return nil, fmt.Errorf("upstream: build chat request: %w", err)
+		return nil, fmt.Errorf("upstream: build %s request: %w", path, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-session-token", token)
 	req.Header.Set("User-Agent", ChromeUA)
-	req.Header.Set("Accept", "text/event-stream, application/json")
+	if prepare != nil {
+		prepare(req)
+	}
 
 	resp, err := hc.Do(req)
 	if err != nil {
@@ -253,13 +274,58 @@ func (c *Client) post(ctx context.Context, token string, body []byte, headerTime
 		if timedOut {
 			return nil, fmt.Errorf("%w: no response headers within %s", ErrIdleTimeout, headerTimeout)
 		}
-		return nil, fmt.Errorf("upstream: chat request: %w", err)
+		return nil, fmt.Errorf("upstream: %s request: %w", path, err)
 	}
 	timer.Stop()
 	// Release the per-request transport (and the header context) when the
 	// body is closed.
 	resp.Body = &closeHook{ReadCloser: resp.Body, hook: func() {
 		cancelHeader()
+		tr.CloseIdleConnections()
+	}}
+	return resp, nil
+}
+
+// get issues an unauthenticated GET bounded by its own timeout. It is used
+// only for capability probes (/api/search-lab/config), which do not need a
+// session token.
+func (c *Client) get(ctx context.Context, path, label string) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	tr, err := fp.Transport(fp.Options{Proxy: c.proxy, RootCAs: c.roots, ResponseHeaderTimeout: c.timeout})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
+	if err != nil {
+		cancel()
+		tr.CloseIdleConnections()
+		return nil, fmt.Errorf("upstream: build %s request: %w", label, err)
+	}
+	req.Header.Set("User-Agent", ChromeUA)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		cancel()
+		tr.CloseIdleConnections()
+		if ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: no response headers within %s", ErrIdleTimeout, c.timeout)
+		}
+		return nil, fmt.Errorf("upstream: %s request: %w", label, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		resp.Body.Close()
+		cancel()
+		tr.CloseIdleConnections()
+		c.logf("upstream: %s status %d: %s", label, resp.StatusCode, truncate(string(bodyText), 300))
+		return nil, &StatusError{Status: resp.StatusCode, Body: string(bodyText)}
+	}
+	resp.Body = &closeHook{ReadCloser: resp.Body, hook: func() {
+		cancel()
 		tr.CloseIdleConnections()
 	}}
 	return resp, nil

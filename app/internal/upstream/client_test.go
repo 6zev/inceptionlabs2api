@@ -81,6 +81,13 @@ type mockUpstream struct {
 	sessionBody   string
 	// chatHandler, when set, handles /api/chat; default emits one text block.
 	chatHandler func(w http.ResponseWriter, r *http.Request)
+
+	// Search-lab fixtures. When the handlers are nil the routes answer 404.
+	searchHandler  func(w http.ResponseWriter, r *http.Request)
+	configHandler  func(w http.ResponseWriter, r *http.Request)
+	searchTokens   []string
+	searchBodies   []string
+	searchEncodings []string
 }
 
 func startUpstream(t *testing.T) *mockUpstream {
@@ -97,6 +104,8 @@ func startUpstream(t *testing.T) *mockUpstream {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/session", m.handleSession)
 	mux.HandleFunc("/api/chat", m.handleChat)
+	mux.HandleFunc("/api/search-lab/config", m.handleConfig)
+	mux.HandleFunc("/api/search-lab/run", m.handleSearchRun)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
@@ -155,6 +164,32 @@ func (m *mockUpstream) handleChat(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "data: [DONE]\n\n")
 }
 
+func (m *mockUpstream) handleConfig(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	h := m.configHandler
+	m.mu.Unlock()
+	if h == nil {
+		http.NotFound(w, r)
+		return
+	}
+	h(w, r)
+}
+
+func (m *mockUpstream) handleSearchRun(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	m.searchTokens = append(m.searchTokens, r.Header.Get("x-session-token"))
+	m.searchEncodings = append(m.searchEncodings, r.Header.Get("Accept-Encoding"))
+	body, _ := io.ReadAll(r.Body)
+	m.searchBodies = append(m.searchBodies, string(body))
+	h := m.searchHandler
+	m.mu.Unlock()
+	if h == nil {
+		http.NotFound(w, r)
+		return
+	}
+	h(w, r)
+}
+
 func (m *mockUpstream) tokens() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -165,6 +200,14 @@ func (m *mockUpstream) bodies() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]string(nil), m.chatBodies...)
+}
+
+func (m *mockUpstream) searchRequests() (tokens, bodies, encodings []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.searchTokens...),
+		append([]string(nil), m.searchBodies...),
+		append([]string(nil), m.searchEncodings...)
 }
 
 func (m *mockUpstream) sessions() int {
@@ -543,7 +586,7 @@ func TestChatHeaderPhaseCoversDial(t *testing.T) {
 	}
 	c.base = "https://" + silent.Addr().String()
 	start := time.Now()
-	_, err = c.post(context.Background(), writeSessionTokenValue(1), []byte(`{}`), 200*time.Millisecond)
+	_, err = c.post(context.Background(), "/api/chat", writeSessionTokenValue(1), []byte(`{}`), 200*time.Millisecond, nil)
 	if err == nil {
 		t.Fatal("expected a pre-header timeout")
 	}
