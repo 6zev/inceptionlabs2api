@@ -21,6 +21,7 @@ const (
 	CodeUpstreamIdle        = "upstream_idle_timeout"
 	CodeUpstreamStream      = "upstream_stream_error"
 	CodeUpstreamAuth        = "upstream_auth_failed"
+	CodeUpstreamClearance   = "upstream_clearance_failed"
 	CodeRequestTooLarge     = "request_too_large"
 	CodeSearchUnavailable   = "search_unavailable"
 )

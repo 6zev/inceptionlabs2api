@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"inceptionlabs2api/internal/clear"
 	"inceptionlabs2api/internal/openai"
 	"inceptionlabs2api/internal/pool"
 )
@@ -82,11 +83,23 @@ type mockUpstream struct {
 	// chatHandler, when set, handles /api/chat; default emits one text block.
 	chatHandler func(w http.ResponseWriter, r *http.Request)
 
+	// checkpoint enables the Vercel checkpoint mock: an uncleared request to
+	// /api/session gets a 429 challenge, and the solution route hands out a
+	// _vcrcs cookie. It is on by default so every test exercises clearance.
+	checkpoint bool
+	// challengeTokens counts issued challenges; challengeSubmits counts
+	// solution submissions and challengeRejects counts refused proofs.
+	challengeTokens  atomic.Int32
+	challengeSubmits atomic.Int32
+	challengeRejects atomic.Int32
+	// refuseSubmit forces the solution route to answer 403 (proof rejected).
+	refuseSubmit bool
+
 	// Search-lab fixtures. When the handlers are nil the routes answer 404.
-	searchHandler  func(w http.ResponseWriter, r *http.Request)
-	configHandler  func(w http.ResponseWriter, r *http.Request)
-	searchTokens   []string
-	searchBodies   []string
+	searchHandler   func(w http.ResponseWriter, r *http.Request)
+	configHandler   func(w http.ResponseWriter, r *http.Request)
+	searchTokens    []string
+	searchBodies    []string
 	searchEncodings []string
 }
 
@@ -100,9 +113,10 @@ func startUpstream(t *testing.T) *mockUpstream {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	m := &mockUpstream{t: t, ln: ln, roots: roots, baseURL: "https://" + ln.Addr().String()}
+	m := &mockUpstream{t: t, ln: ln, roots: roots, baseURL: "https://" + ln.Addr().String(), checkpoint: true}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/session", m.handleSession)
+	mux.HandleFunc(challengePath, m.handleChallenge)
 	mux.HandleFunc("/api/chat", m.handleChat)
 	mux.HandleFunc("/api/search-lab/config", m.handleConfig)
 	mux.HandleFunc("/api/search-lab/run", m.handleSearchRun)
@@ -112,10 +126,13 @@ func startUpstream(t *testing.T) *mockUpstream {
 	return m
 }
 
+// challengePath mirrors the checkpoint's solution endpoint.
+const challengePath = "/.well-known/vercel/security/request-challenge"
+
 func (m *mockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.sessionCount++
-	status, body := m.sessionStatus, m.sessionBody
+	status, body, checkpoint := m.sessionStatus, m.sessionBody, m.checkpoint
 	m.mu.Unlock()
 	if r.Method != http.MethodGet {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -130,7 +147,45 @@ func (m *mockUpstream) handleSession(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, body)
 		return
 	}
+	// The checkpoint challenges any request without clearance. Only the
+	// ordinary (unset status/body) path challenges, so tests that script a
+	// specific session response keep their meaning.
+	if checkpoint {
+		if ck, err := r.Cookie(clear.CookieName); err != nil || ck.Value != "cleared" {
+			m.challenge(w)
+			return
+		}
+	}
 	writeSessionToken(w, m.sessionCount)
+}
+
+func (m *mockUpstream) challenge(w http.ResponseWriter) {
+	n := m.challengeTokens.Add(1)
+	w.Header().Set("x-vercel-mitigated", "challenge")
+	w.Header().Set("x-vercel-challenge-token", checkpointToken(m.sessionCount+int(n)))
+	w.WriteHeader(http.StatusTooManyRequests)
+}
+
+func (m *mockUpstream) handleChallenge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	m.challengeSubmits.Add(1)
+	if m.refuseSubmit {
+		m.challengeRejects.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	token := r.Header.Get("x-vercel-challenge-token")
+	solution := r.Header.Get("x-vercel-challenge-solution")
+	if token == "" || solution == "" || r.Header.Get("x-vercel-challenge-version") != "2" || !verifySolution(m.t, token, solution) {
+		m.challengeRejects.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: clear.CookieName, Value: "cleared", Path: "/", MaxAge: 3600})
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func writeSessionToken(w http.ResponseWriter, n int) {
@@ -243,19 +298,21 @@ func TestFetchSession(t *testing.T) {
 	}
 }
 
-func TestFetchSessionRejectsChallenge(t *testing.T) {
+// A checkpoint that never issues a token cannot be cleared: the fetch reports
+// ErrClearance rather than a raw 429, and it does not retry.
+func TestFetchSessionUnclearableChallenge(t *testing.T) {
 	t.Parallel()
 	m := startUpstream(t)
+	m.checkpoint = false
 	m.sessionStatus = http.StatusTooManyRequests
 	m.sessionBody = "<!DOCTYPE html><title>Vercel Security Checkpoint</title>"
 	c, _ := newTestClient(t, m, 0)
 	_, err := c.FetchSession(context.Background())
-	var se *StatusError
-	if !errors.As(err, &se) || se.Status != http.StatusTooManyRequests {
-		t.Fatalf("err = %v, want StatusError 429", err)
+	if !errors.Is(err, ErrClearance) {
+		t.Fatalf("err = %v, want ErrClearance", err)
 	}
-	if !strings.Contains(se.Body, "Checkpoint") {
-		t.Fatalf("body = %q", se.Body)
+	if got := m.challengeSubmits.Load(); got != 0 {
+		t.Fatalf("submissions = %d, want 0", got)
 	}
 }
 
@@ -389,8 +446,7 @@ func TestChatNon200IsTypedError(t *testing.T) {
 func TestChatEmptyPoolIsUnavailable(t *testing.T) {
 	t.Parallel()
 	m := startUpstream(t)
-	m.sessionStatus = http.StatusTooManyRequests
-	m.sessionBody = "challenge"
+	m.sessionBody = `{"ok":true,"token":"short"}` // a non-clearance failure
 	c, _ := newTestClient(t, m, 0)
 	_, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
 	if !errors.Is(err, ErrUnavailable) {
@@ -586,7 +642,9 @@ func TestChatHeaderPhaseCoversDial(t *testing.T) {
 	}
 	c.base = "https://" + silent.Addr().String()
 	start := time.Now()
-	_, err = c.post(context.Background(), "/api/chat", writeSessionTokenValue(1), []byte(`{}`), 200*time.Millisecond, nil)
+	_, err = c.do(context.Background(), http.MethodPost, "/api/chat", []byte(`{}`), 200*time.Millisecond, func(r *http.Request) {
+		r.Header.Set("x-session-token", writeSessionTokenValue(1))
+	})
 	if err == nil {
 		t.Fatal("expected a pre-header timeout")
 	}
@@ -600,5 +658,133 @@ func TestChatHeaderPhaseCoversDial(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("Chat hung for %s on a silent TLS peer", elapsed)
+	}
+}
+
+// TestChatReacquiresClearanceOn429 proves the retry contract: a request that
+// was challenged despite carrying a cookie triggers exactly one refresh and
+// one replay, and the replay succeeds.
+func TestChatReacquiresClearanceOn429(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	var attempts atomic.Int32
+	m.chatHandler = func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			// A challenge even though clearance was acquired.
+			m.challenge(w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"type\":\"text-delta\",\"id\":\"text-0\",\"delta\":\"ok\"}\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+	}
+	c, _ := newTestClient(t, m, 1)
+	stream, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	defer stream.Close()
+	io.Copy(io.Discard, stream.Body)
+	if attempts.Load() != 2 {
+		t.Fatalf("chat attempts = %d, want 2 (challenge + replay)", attempts.Load())
+	}
+	// One acquisition before the first attempt, one refresh after the 429.
+	if got := m.challengeSubmits.Load(); got != 2 {
+		t.Fatalf("clearance acquisitions = %d, want 2", got)
+	}
+	if got := m.challengeRejects.Load(); got != 0 {
+		t.Fatalf("solver produced %d rejected proofs", got)
+	}
+}
+
+// TestChallengeIsRetriedOnlyOnce: a persistent 429 must not become a loop.
+func TestChallengeIsRetriedOnlyOnce(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	var attempts atomic.Int32
+	m.chatHandler = func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		m.challenge(w)
+	}
+	c, _ := newTestClient(t, m, 1)
+	_, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != http.StatusTooManyRequests {
+		t.Fatalf("err = %v, want StatusError 429", err)
+	}
+	// One attempt plus exactly one replay; postAuthed retries 401/403 only,
+	// so a persistent 429 ends the request rather than looping.
+	if attempts.Load() != 2 {
+		t.Fatalf("chat attempts = %d, want 2 (no challenge loop)", attempts.Load())
+	}
+}
+
+// TestSessionAndChatShareOneClearance: the pool fetcher and chat use the same
+// Clearance, so only one solve happens for a warmed pool plus one chat.
+func TestSessionAndChatShareOneClearance(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	c, _ := newTestClient(t, m, 2)
+	stream, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	stream.Close()
+	if got := m.challengeSubmits.Load(); got != 1 {
+		t.Fatalf("clearance acquisitions = %d, want 1 shared across the pool and chat", got)
+	}
+	state := c.Clearance().State()
+	if !state.HasCookie || state.RefreshCount != 1 {
+		t.Fatalf("clearance state = %+v", state)
+	}
+}
+
+// TestClearanceFailureIsTyped: when the checkpoint refuses every proof, chat
+// fails with ErrClearance instead of hammering the upstream.
+func TestClearanceFailureIsTyped(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	m.refuseSubmit = true
+	c, _ := newTestClient(t, m, 0)
+	_, err := c.Chat(context.Background(), NewChatRequest([]openai.TextMessage{openaiText("hi")}, ""), time.Second, nil)
+	if !errors.Is(err, ErrClearance) {
+		t.Fatalf("err = %v, want ErrClearance", err)
+	}
+	// The pool reports the cause, but the clearance failure stays first in
+	// the chain so the server can map it to upstream_clearance_failed.
+	if errors.Is(err, ErrAuthRejected) {
+		t.Fatalf("clearance failure misclassified as auth: %v", err)
+	}
+}
+
+// TestEveryRequestCarriesUAAndCookie checks the binding invariants: one UA
+// constant, and the cookie on requests once held.
+func TestEveryRequestCarriesUAAndCookie(t *testing.T) {
+	t.Parallel()
+	m := startUpstream(t)
+	var mu sync.Mutex
+	var uas, cookies []string
+	// Observe via the search route, which postAuthed also funnels through.
+	m.searchHandler = func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		uas = append(uas, r.Header.Get("User-Agent"))
+		cookies = append(cookies, r.Header.Get("Cookie"))
+		mu.Unlock()
+		io.WriteString(w, `{"t":"docs","sources":[]}`+"\n")
+	}
+	c, _ := newTestClient(t, m, 1)
+	if _, err := c.Search(context.Background(), &SearchRequest{Query: "q"}, time.Second); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(uas) != 1 {
+		t.Fatalf("requests observed = %d", len(uas))
+	}
+	if uas[0] != clear.UserAgent {
+		t.Fatalf("UA = %q, want the clearance UA", uas[0])
+	}
+	if cookies[0] != clear.CookieName+"=cleared" {
+		t.Fatalf("cookie = %q, want the clearance cookie", cookies[0])
 	}
 }

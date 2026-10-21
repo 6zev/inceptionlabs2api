@@ -359,10 +359,27 @@ func TestRefreshBadTokenIsReported(t *testing.T) {
 	}
 }
 
-func TestRefreshNoChallengeIsError(t *testing.T) {
+// A 200 from the probe means the edge is not challenging this egress:
+// acquisition is a successful no-op, not an error.
+func TestRefreshNoChallengeIsSuccess(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "not a challenge")
+		io.WriteString(w, `{"ok":true,"token":"1792553057.`+strings.Repeat("0", 31)+`a.`+strings.Repeat("f", 64)+`"}`)
+	}))
+	defer srv.Close()
+	c := newTestClearance(t, srv)
+	if err := c.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if _, cookie := c.Header(); cookie != "" {
+		t.Fatalf("cookie = %q, want none when unchallenged", cookie)
+	}
+}
+
+func TestRefreshOtherStatusIsError(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 	c := newTestClearance(t, srv)

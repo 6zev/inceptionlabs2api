@@ -32,6 +32,10 @@ type Config struct {
 	SearchConfigCheck bool
 	// SearchProbeTimeout bounds that probe.
 	SearchProbeTimeout time.Duration
+	// ClearanceRefresh is the proactive _vcrcs refresh age (cookie TTL 60m).
+	ClearanceRefresh time.Duration
+	// ClearanceCooldown is the minimum spacing between clearance refreshes.
+	ClearanceCooldown time.Duration
 }
 
 // Defaults returns the configuration used when no environment variable is set.
@@ -50,6 +54,9 @@ func Defaults() Config {
 		SearchTimeout:      60 * time.Second,
 		SearchConfigCheck:  true,
 		SearchProbeTimeout: 15 * time.Second,
+
+		ClearanceRefresh:  45 * time.Minute,
+		ClearanceCooldown: 15 * time.Second,
 	}
 }
 
@@ -121,6 +128,12 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if c.SearchProbeTimeout, err = envDuration(getenv, "IL2API_SEARCH_PROBE_TIMEOUT", c.SearchProbeTimeout); err != nil {
 		return Config{}, err
 	}
+	if c.ClearanceRefresh, err = envDuration(getenv, "IL2API_CLEARANCE_REFRESH", c.ClearanceRefresh); err != nil {
+		return Config{}, err
+	}
+	if c.ClearanceCooldown, err = envDuration(getenv, "IL2API_CLEARANCE_COOLDOWN", c.ClearanceCooldown); err != nil {
+		return Config{}, err
+	}
 	if v := strings.TrimSpace(strings.ToLower(getenv("IL2API_SEARCH_CONFIG_CHECK"))); v != "" {
 		switch v {
 		case "on", "1", "true", "yes":
@@ -163,8 +176,14 @@ func (c Config) validate() error {
 	if c.SearchProbeTimeout <= 0 {
 		return fmt.Errorf("config: IL2API_SEARCH_PROBE_TIMEOUT must be positive, got %s", c.SearchProbeTimeout)
 	}
-	if c.ContextChars == 0 || c.ContextChars < -1 {
-		return fmt.Errorf("config: IL2API_CONTEXT_CHARS must be positive or -1 to disable, got %d", c.ContextChars)
+	if c.ContextChars < -1 {
+		return fmt.Errorf("config: IL2API_CONTEXT_CHARS must be positive or -1, got %d", c.ContextChars)
+	}
+	if c.ClearanceRefresh <= 0 {
+		return fmt.Errorf("config: IL2API_CLEARANCE_REFRESH must be positive, got %s", c.ClearanceRefresh)
+	}
+	if c.ClearanceCooldown < 0 {
+		return fmt.Errorf("config: IL2API_CLEARANCE_COOLDOWN must not be negative, got %s", c.ClearanceCooldown)
 	}
 	u, err := url.Parse(c.UpstreamBase)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {

@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -24,8 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andybalholm/brotli"
-
+	"inceptionlabs2api/internal/clear"
 	"inceptionlabs2api/internal/pool"
 	"inceptionlabs2api/internal/server"
 	"inceptionlabs2api/internal/upstream"
@@ -50,6 +50,11 @@ type tlsUpstream struct {
 	search func(w http.ResponseWriter, r *http.Request)
 	config func(w http.ResponseWriter, r *http.Request)
 	status atomic.Int32
+	// sessionBody overrides the /api/session body when non-empty.
+	sessionBody string
+	// refuseSubmit makes the checkpoint reject every proof, which is how the
+	// "egress cannot be cleared" path is exercised.
+	refuseSubmit atomic.Bool
 }
 
 func (m *tlsUpstream) setChat(fn func(http.ResponseWriter, *http.Request)) {
@@ -113,13 +118,33 @@ func newTLSUpstream(t *testing.T) *tlsUpstream {
 			io.WriteString(w, "<html>Vercel Security Checkpoint</html>")
 			return
 		}
-		var n int
+		// Checkpoint protocol: no clearance cookie -> 429 + token; the
+		// solution route below hands the cookie out.
+		if ck, err := r.Cookie(clear.CookieName); err != nil || ck.Value != "cleared" {
+			w.Header().Set("x-vercel-mitigated", "challenge")
+			w.Header().Set("x-vercel-challenge-token", checkpointToken())
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
 		m.mu.Lock()
-		n = len(m.tokens) + 1
+		body := m.sessionBody
+		n := len(m.tokens) + 1
 		m.mu.Unlock()
+		if body != "" {
+			io.WriteString(w, body)
+			return
+		}
 		nonce := strings.Repeat("0", 31) + string(rune('a'+n%26))
 		token := "1792553057." + nonce + "." + strings.Repeat("f", 64)
 		json.NewEncoder(w).Encode(map[string]any{"ok": true, "token": token})
+	})
+	mux.HandleFunc("/.well-known/vercel/security/request-challenge", func(w http.ResponseWriter, r *http.Request) {
+		if m.refuseSubmit.Load() {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: clear.CookieName, Value: "cleared", Path: "/", MaxAge: 3600})
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
@@ -157,6 +182,16 @@ func newTLSUpstream(t *testing.T) *tlsUpstream {
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
 	return m
+}
+
+// checkpointToken is a syntactically valid v2 token for the mock checkpoint.
+// The solution is accepted without verification here: the solver itself is
+// tested against the captured Chromium fixture in internal/clear.
+func checkpointToken() string {
+	payload := strings.Join([]string{
+		strings.Repeat("a", 32), "0d8769f6", strings.Repeat("0", 40), "3", "bin",
+	}, ";")
+	return "2.1792561477.60." + base64.StdEncoding.EncodeToString([]byte(payload)) + "." + strings.Repeat("0", 32)
 }
 
 func (m *tlsUpstream) tokenCount() int {
@@ -370,17 +405,43 @@ func TestEndToEndClientDisconnectKeepsPool(t *testing.T) {
 	}
 }
 
-func TestEndToEndMissingSessionIs503(t *testing.T) {
+func TestEndToEndClearanceFailureIs503(t *testing.T) {
 	t.Parallel()
 	st := newStack(t, 5*time.Second)
-	// Drain the pool: both tokens are rejected, then sessions start failing.
-	st.mock.status.Store(http.StatusTooManyRequests)
+	// The checkpoint refuses every proof: no session can be acquired, and the
+	// error is actionable rather than a generic empty pool.
+	st.mock.refuseSubmit.Store(true)
 	for _, tok := range []string{"a", "b"} {
 		st.pool.Discard("1792553057." + strings.Repeat("0", 31) + tok + "." + strings.Repeat("f", 64))
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for st.pool.Stats().Size > 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
+	}
+	resp, err := http.Post(st.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody(true)))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body %s, want 503", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "upstream_clearance_failed") {
+		t.Fatalf("body = %s", raw)
+	}
+}
+
+// An upstream that answers /api/session with garbage leaves the pool empty
+// for a non-clearance reason; that is the plain upstream_unavailable case.
+func TestEndToEndMissingSessionIs503(t *testing.T) {
+	t.Parallel()
+	st := newStack(t, 5*time.Second)
+	st.mock.mu.Lock()
+	st.mock.sessionBody = `{"ok":true,"token":"short"}`
+	st.mock.mu.Unlock()
+	for _, tok := range []string{"a", "b"} {
+		st.pool.Discard("1792553057." + strings.Repeat("0", 31) + tok + "." + strings.Repeat("f", 64))
 	}
 	resp, err := http.Post(st.srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody(true)))
 	if err != nil {
@@ -510,9 +571,9 @@ const searchNDJSON = `{"t":"run_start","config":{"fanout":1,"depth":1,"keepTopK"
 {"t":"run_done","ms":2923.47,"answer":"The sources describe [1][2]."}
 `
 
-// TestEndToEndWebSearch drives /v1/web_search through the real utls stack
-// against an upstream that answers Brotli-compressed NDJSON — the live wire
-// format. It also proves the startup probe flips healthz to true.
+// TestEndToEndWebSearch drives /v1/web_search through the real clearance-aware
+// stack against an upstream that speaks the checkpoint protocol. It also
+// proves the startup probe flips healthz to true.
 func TestEndToEndWebSearch(t *testing.T) {
 	t.Parallel()
 	st := newStack(t, 5*time.Second)
@@ -522,10 +583,9 @@ func TestEndToEndWebSearch(t *testing.T) {
 	})
 	st.mock.setSearch(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
-		w.Header().Set("Content-Encoding", "br")
-		bw := brotli.NewWriter(w)
-		io.WriteString(bw, searchNDJSON)
-		bw.Close()
+		// Compression is the upstream's choice; identity is what the client
+		// asks for, so the mock answers plain NDJSON.
+		io.WriteString(w, searchNDJSON)
 	})
 	st.srvSearch.StartSearchProbe()
 

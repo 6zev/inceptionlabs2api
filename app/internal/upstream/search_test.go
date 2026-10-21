@@ -14,8 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andybalholm/brotli"
-
 	"inceptionlabs2api/internal/pool"
 )
 
@@ -116,23 +114,21 @@ func TestSearchCollectsQueriesAndSources(t *testing.T) {
 	}
 }
 
-func TestSearchDecodesBrotliBody(t *testing.T) {
+// The build has zero dependencies and Go has no Brotli decoder, so a br body
+// (which only appears if an intermediary re-compresses) is a typed error that
+// names the encoding rather than mojibake or a silent empty result.
+func TestSearchBrotliBodyIsTypedError(t *testing.T) {
 	t.Parallel()
 	m := startUpstream(t)
 	m.searchHandler = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		w.Header().Set("Content-Encoding", "br")
-		bw := brotli.NewWriter(w)
-		io.WriteString(bw, realisticSearchNDJSON)
-		bw.Close()
+		io.WriteString(w, realisticSearchNDJSON)
 	}
 	c, _ := newTestClient(t, m, 1)
-	res, err := c.Search(context.Background(), &SearchRequest{Query: "q"}, time.Second)
-	if err != nil {
-		t.Fatalf("Search: %v", err)
-	}
-	if len(res.Sources) != 2 || len(res.Queries) != 2 {
-		t.Fatalf("brotli body not decoded: sources=%d queries=%d", len(res.Sources), len(res.Queries))
+	_, err := c.Search(context.Background(), &SearchRequest{Query: "q"}, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "brotli") {
+		t.Fatalf("err = %v, want a typed brotli error", err)
 	}
 }
 
@@ -322,8 +318,7 @@ func TestSearchRetriesOn401WithFreshToken(t *testing.T) {
 func TestSearchEmptyPoolIsUnavailable(t *testing.T) {
 	t.Parallel()
 	m := startUpstream(t)
-	m.sessionStatus = http.StatusTooManyRequests
-	m.sessionBody = "challenge"
+	m.sessionBody = `{"ok":true,"token":"short"}` // a non-clearance failure
 	c, _ := newTestClient(t, m, 0)
 	_, err := c.Search(context.Background(), &SearchRequest{Query: "q"}, time.Second)
 	if !errors.Is(err, ErrUnavailable) {

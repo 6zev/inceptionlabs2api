@@ -24,6 +24,11 @@ func (s *Server) upstreamError(err error) *openai.RequestError {
 	case errors.Is(err, upstream.ErrStreamTruncated):
 		return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamStream, "",
 			"upstream closed the stream before completion")
+	case errors.Is(err, upstream.ErrClearance):
+		// Retryable from the client's point of view: the upstream is reachable
+		// but this gateway cannot prove itself right now.
+		return openai.New(http.StatusServiceUnavailable, "server_error", openai.CodeUpstreamClearance, "",
+			"the upstream bot checkpoint could not be cleared; check the egress and /healthz clearance state")
 	case errors.Is(err, upstream.ErrUnavailable):
 		return openai.New(http.StatusServiceUnavailable, "server_error", openai.CodeUpstreamUnavailable, "",
 			"upstream session pool is empty; the upstream may be challenging this egress or unavailable, retry shortly")

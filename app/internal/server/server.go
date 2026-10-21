@@ -15,15 +15,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"inceptionlabs2api/internal/clear"
 	"inceptionlabs2api/internal/openai"
 	"inceptionlabs2api/internal/pool"
 	"inceptionlabs2api/internal/upstream"
 )
 
-// maxBodyBytes caps request bodies before JSON decoding. The 250k-character
-// guard is the real limit; this is a generous backstop. It is sized for
-// 250k astral-plane characters serialised as \u escapes (12 bytes each,
-// ~3 MB) so compliant input gets the guard's 400, not a 413.
+// maxBodyBytes caps request bodies before JSON decoding. It exists only to
+// bound memory use and is far above any request the upstream itself accepts;
+// it is not a substitute for the upstream's context limit (SPEC §1.1).
 const maxBodyBytes = 6 << 20
 
 // Chatter is the upstream abstraction the handlers depend on.
@@ -42,6 +42,12 @@ type Searcher interface {
 // PoolStats reports pool size for /healthz.
 type PoolStats interface {
 	Stats() pool.Stats
+}
+
+// ClearanceStats reports checkpoint clearance state for /healthz. A nil
+// source means the gateway does not track clearance (e.g. unit tests).
+type ClearanceStats interface {
+	State() clear.State
 }
 
 // Config configures the HTTP surface.
@@ -75,6 +81,7 @@ type Server struct {
 	up   Chatter
 	se   Searcher
 	pool PoolStats
+	clr  ClearanceStats
 	now  func() time.Time
 	logf func(format string, args ...any)
 
@@ -117,6 +124,9 @@ func (s *Server) SetClock(now func() time.Time) { s.now = now }
 // SetSearcher attaches the standalone retrieval backend. Without one the
 // route answers 503 rather than panicking.
 func (s *Server) SetSearcher(se Searcher) { s.se = se }
+
+// SetClearance attaches the clearance state reported by /healthz.
+func (s *Server) SetClearance(c ClearanceStats) { s.clr = c }
 
 // StartSearchProbe launches the one-shot /api/search-lab/config probe in the
 // background. It is a no-op when no searcher is attached, and repeated calls
@@ -322,6 +332,9 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.pool != nil {
 		body["pool"] = s.pool.Stats()
+	}
+	if s.clr != nil {
+		body["clearance"] = s.clr.State()
 	}
 	writeJSON(w, http.StatusOK, body)
 }

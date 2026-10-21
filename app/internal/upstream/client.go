@@ -13,13 +13,14 @@ import (
 	"strings"
 	"time"
 
-	"inceptionlabs2api/internal/fp"
+	"inceptionlabs2api/internal/clear"
 	"inceptionlabs2api/internal/pool"
 )
 
-// ChromeUA is the browser user agent the upstream expects for anonymous
-// sessions. It must stay consistent between /api/session and /api/chat.
-const ChromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+// ChromeUA is the browser user agent every upstream request carries. It is
+// the same constant clearance acquisition uses: the _vcrcs cookie is bound to
+// (egress IP, UA, HTTP/2), so the two must never diverge.
+const ChromeUA = clear.UserAgent
 
 // maxErrorBody caps how much of a non-200 upstream body is read (and logged).
 const maxErrorBody = 4096
@@ -29,7 +30,7 @@ const maxErrorBody = 4096
 const maxAuthRetries = 2
 
 // StatusError is a typed non-200 upstream response. The body is kept for
-// server-side logging and never sent to clients verbatim.
+// server-side logging and for a sanitised client-facing message.
 type StatusError struct {
 	Status int
 	Body   string
@@ -46,14 +47,18 @@ var ErrUnavailable = errors.New("upstream: no session token available")
 // ErrAuthRejected means the upstream answered 401/403 on every attempt.
 var ErrAuthRejected = errors.New("upstream: session token rejected")
 
-// Client issues /api/chat requests through the fingerprint transport.
+// ErrClearance means the checkpoint could not be cleared.
+var ErrClearance = errors.New("upstream: clearance unavailable")
+
+// Client issues upstream requests through one shared HTTP/2 transport and the
+// clearance-aware request path.
 type Client struct {
 	base    string
-	proxy   string
 	pool    *pool.Pool
-	roots   *x509.CertPool
 	timeout time.Duration
 	logf    func(format string, args ...any)
+	clear   *clear.Clearance
+	hc      *http.Client
 }
 
 // Config configures a Client.
@@ -63,6 +68,11 @@ type Config struct {
 	Pool    *pool.Pool
 	// SessionTimeout bounds one /api/session fetch.
 	SessionTimeout time.Duration
+	// ClearanceRefresh is the proactive cookie refresh age. Zero means 45m.
+	ClearanceRefresh time.Duration
+	// ClearanceCooldown is the minimum spacing between acquisitions. Zero
+	// means 15s.
+	ClearanceCooldown time.Duration
 	// RootCAs is optional; nil means the system trust store.
 	RootCAs *x509.CertPool
 	// Logf is optional; nil means log.Printf.
@@ -70,7 +80,9 @@ type Config struct {
 }
 
 // NewClient builds a Client and returns it together with a Fetcher suitable
-// for pool.New.
+// for pool.New. The transport is created once and shared by session fetches,
+// chat, search, and clearance acquisition, so every request egresses through
+// the same proxy with the same TLS configuration.
 func NewClient(cfg Config) (*Client, pool.Fetcher) {
 	if cfg.SessionTimeout <= 0 {
 		cfg.SessionTimeout = 15 * time.Second
@@ -79,14 +91,24 @@ func NewClient(cfg Config) (*Client, pool.Fetcher) {
 	if logf == nil {
 		logf = log.Printf
 	}
+	tr := clear.Transport(clear.TransportOptions{Proxy: cfg.Proxy, RootCAs: cfg.RootCAs})
+	// No http.Client.Timeout: a wall-clock cap would kill legitimately long
+	// diffusion generations. The sliding idle watchdog lives in Reader.
+	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
 	c := &Client{
 		base:    strings.TrimRight(cfg.BaseURL, "/"),
-		proxy:   cfg.Proxy,
 		pool:    cfg.Pool,
-		roots:   cfg.RootCAs,
 		timeout: cfg.SessionTimeout,
 		logf:    logf,
+		hc:      hc,
 	}
+	c.clear = clear.New(clear.Config{
+		BaseURL:  c.base,
+		Client:   hc,
+		Refresh:  cfg.ClearanceRefresh,
+		Cooldown: cfg.ClearanceCooldown,
+		Logf:     logf,
+	})
 	return c, c.FetchSession
 }
 
@@ -97,28 +119,121 @@ func (c *Client) BindPool(p *pool.Pool) { c.pool = p }
 // Logf returns the client's logger, used by the server for upstream diagnosis.
 func (c *Client) Logf() func(format string, args ...any) { return c.logf }
 
+// Clearance exposes the clearance state for /healthz.
+func (c *Client) Clearance() *clear.Clearance { return c.clear }
+
+// applyClearance sets the shared UA and the clearance cookie on req.
+func (c *Client) applyClearance(req *http.Request) {
+	ua, cookie := c.clear.Header()
+	req.Header.Set("User-Agent", ua)
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+}
+
+// ensureClearance acquires (or refreshes) the clearance cookie.
+func (c *Client) ensureClearance(ctx context.Context) error {
+	if err := c.clear.Ensure(ctx); err != nil {
+		return fmt.Errorf("%w: %v", ErrClearance, err)
+	}
+	return nil
+}
+
+// Send performs an upstream request with clearance handling. prepare
+// customises headers. On a 429 that carries a Vercel challenge, clearance is
+// refreshed once and the request (with a fresh body reader, if any) is
+// replayed. The caller owns the returned response body.
+//
+// This is the one request path: session fetches, chat, search, and probes all
+// funnel through it, so no endpoint can accidentally bypass the cookie.
+func (c *Client) Send(ctx context.Context, method, path string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
+	if err := c.ensureClearance(ctx); err != nil {
+		return nil, err
+	}
+	resp, err := c.do(ctx, method, path, body, headerTimeout, prepare)
+	if err != nil {
+		return nil, err
+	}
+	if !clear.IsChallenge(resp) {
+		return resp, nil
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
+	resp.Body.Close()
+	c.logf("upstream: checkpoint challenged %s %s; refreshing clearance and replaying once", method, path)
+
+	// The challenge proves the cookie is not accepted; forget it rather than
+	// letting the cooldown reuse it, then acquire a new one.
+	c.clear.Invalidate()
+	if err := c.clear.Refresh(ctx); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrClearance, err)
+	}
+	return c.do(ctx, method, path, body, headerTimeout, prepare)
+}
+
+// do issues one upstream request. A nil body means no request body.
+// headerTimeout bounds the whole pre-response phase (dial, TLS, headers); the
+// response body is not subject to it, so long generations are unaffected.
+func (c *Client) do(ctx context.Context, method, path string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	if headerTimeout <= 0 {
+		headerTimeout = 60 * time.Second
+	}
+	hctx, cancelHeader := context.WithCancel(ctx)
+	timer := time.AfterFunc(headerTimeout, cancelHeader)
+
+	req, err := http.NewRequestWithContext(hctx, method, c.base+path, rdr)
+	if err != nil {
+		timer.Stop()
+		cancelHeader()
+		return nil, fmt.Errorf("upstream: build %s request: %w", path, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	c.applyClearance(req)
+	if prepare != nil {
+		prepare(req)
+	}
+	resp, err := c.hc.Do(req)
+	timer.Stop()
+	if err != nil {
+		timedOut := hctx.Err() != nil && ctx.Err() == nil
+		cancelHeader()
+		if timedOut {
+			return nil, fmt.Errorf("%w: no response headers within %s", ErrIdleTimeout, headerTimeout)
+		}
+		return nil, fmt.Errorf("upstream: %s request: %w", path, err)
+	}
+	resp.Body = &closeHook{ReadCloser: resp.Body, hook: cancelHeader}
+	return resp, nil
+}
+
+// closeHook runs hook once when the body is closed, releasing the per-request
+// header timer context.
+type closeHook struct {
+	io.ReadCloser
+	hook func()
+}
+
+func (c *closeHook) Close() error {
+	err := c.ReadCloser.Close()
+	c.hook()
+	return err
+}
+
 // FetchSession calls GET /api/session once and validates the token shape.
 func (c *Client) FetchSession(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	tr, err := fp.Transport(fp.Options{Proxy: c.proxy, RootCAs: c.roots})
+	resp, err := c.Send(ctx, http.MethodGet, "/api/session", nil, c.timeout, func(req *http.Request) {
+		req.Header.Set("Accept", "*/*")
+	})
 	if err != nil {
 		return "", err
-	}
-	defer tr.CloseIdleConnections()
-	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/session", nil)
-	if err != nil {
-		return "", fmt.Errorf("upstream: build session request: %w", err)
-	}
-	req.Header.Set("User-Agent", ChromeUA)
-	req.Header.Set("Accept", "*/*")
-
-	resp, err := hc.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("upstream: fetch session: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -144,7 +259,8 @@ func (c *Client) FetchSession(ctx context.Context) (string, error) {
 
 // checkRedirect rejects redirects that leave the configured origin or
 // downgrade HTTPS. The session token travels as a custom header, which Go
-// would otherwise copy to a cross-host redirect target.
+// would otherwise copy to a cross-host redirect target. The clearance cookie
+// is scoped to the origin for the same reason.
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 3 {
 		return fmt.Errorf("upstream: stopped after %d redirects", len(via))
@@ -159,8 +275,7 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// Stream is an opened upstream SSE stream. Close releases the connection and
-// the per-request transport.
+// Stream is an opened upstream SSE stream. Close releases the response body.
 type Stream struct {
 	Body   io.ReadCloser
 	Reader *Reader
@@ -204,9 +319,20 @@ func (c *Client) postAuthed(ctx context.Context, path, label string, body []byte
 	for attempt := 0; attempt <= maxAuthRetries; attempt++ {
 		token, err := c.pool.Get(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+			// A pool that could not fill because the checkpoint refused us is
+			// a clearance failure, not a generic "no token": the operator can
+			// act on it (egress, UA, PoW drift).
+			if errors.Is(err, ErrClearance) {
+				return nil, fmt.Errorf("%w: %w", ErrClearance, err)
+			}
+			return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
 		}
-		resp, err := c.post(ctx, path, token, body, headerTimeout, prepare)
+		resp, err := c.Send(ctx, http.MethodPost, path, body, headerTimeout, func(req *http.Request) {
+			req.Header.Set("x-session-token", token)
+			if prepare != nil {
+				prepare(req)
+			}
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -228,120 +354,6 @@ func (c *Client) postAuthed(ctx context.Context, path, label string, body []byte
 		}
 	}
 	return nil, lastErr
-}
-
-// post issues one authenticated POST to path and returns the response. The
-// caller owns the body. prepare may add endpoint-specific headers.
-func (c *Client) post(ctx context.Context, path, token string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
-	if headerTimeout <= 0 {
-		headerTimeout = 60 * time.Second
-	}
-	tr, err := fp.Transport(fp.Options{Proxy: c.proxy, RootCAs: c.roots, ResponseHeaderTimeout: headerTimeout})
-	if err != nil {
-		return nil, err
-	}
-	// No http.Client.Timeout: a wall-clock cap would kill legitimately long
-	// diffusion generations. The sliding idle watchdog lives in Reader.
-	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
-
-	// ResponseHeaderTimeout only starts once the connection is up (Go ignores
-	// TLSHandshakeTimeout when DialTLSContext is set), so dial, CONNECT and
-	// the TLS handshake would otherwise be unbounded. Cancel the whole
-	// pre-response phase from a timer; on success the timer is stopped and
-	// the context stays alive for the body.
-	hctx, cancelHeader := context.WithCancel(ctx)
-	timer := time.AfterFunc(headerTimeout, cancelHeader)
-	defer timer.Stop()
-
-	req, err := http.NewRequestWithContext(hctx, http.MethodPost, c.base+path, bytes.NewReader(body))
-	if err != nil {
-		cancelHeader()
-		tr.CloseIdleConnections()
-		return nil, fmt.Errorf("upstream: build %s request: %w", path, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-session-token", token)
-	req.Header.Set("User-Agent", ChromeUA)
-	if prepare != nil {
-		prepare(req)
-	}
-
-	resp, err := hc.Do(req)
-	if err != nil {
-		timedOut := hctx.Err() != nil && ctx.Err() == nil
-		cancelHeader()
-		tr.CloseIdleConnections()
-		if timedOut {
-			return nil, fmt.Errorf("%w: no response headers within %s", ErrIdleTimeout, headerTimeout)
-		}
-		return nil, fmt.Errorf("upstream: %s request: %w", path, err)
-	}
-	timer.Stop()
-	// Release the per-request transport (and the header context) when the
-	// body is closed.
-	resp.Body = &closeHook{ReadCloser: resp.Body, hook: func() {
-		cancelHeader()
-		tr.CloseIdleConnections()
-	}}
-	return resp, nil
-}
-
-// get issues an unauthenticated GET bounded by its own timeout. It is used
-// only for capability probes (/api/search-lab/config), which do not need a
-// session token.
-func (c *Client) get(ctx context.Context, path, label string) (*http.Response, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	tr, err := fp.Transport(fp.Options{Proxy: c.proxy, RootCAs: c.roots, ResponseHeaderTimeout: c.timeout})
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
-	if err != nil {
-		cancel()
-		tr.CloseIdleConnections()
-		return nil, fmt.Errorf("upstream: build %s request: %w", label, err)
-	}
-	req.Header.Set("User-Agent", ChromeUA)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := hc.Do(req)
-	if err != nil {
-		cancel()
-		tr.CloseIdleConnections()
-		if ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("%w: no response headers within %s", ErrIdleTimeout, c.timeout)
-		}
-		return nil, fmt.Errorf("upstream: %s request: %w", label, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-		resp.Body.Close()
-		cancel()
-		tr.CloseIdleConnections()
-		c.logf("upstream: %s status %d: %s", label, resp.StatusCode, truncate(string(bodyText), 300))
-		return nil, &StatusError{Status: resp.StatusCode, Body: string(bodyText)}
-	}
-	resp.Body = &closeHook{ReadCloser: resp.Body, hook: func() {
-		cancel()
-		tr.CloseIdleConnections()
-	}}
-	return resp, nil
-}
-
-// closeHook runs hook once when the body is closed, releasing the
-// per-request transport.
-type closeHook struct {
-	io.ReadCloser
-	hook func()
-}
-
-func (c *closeHook) Close() error {
-	err := c.ReadCloser.Close()
-	c.hook()
-	return err
 }
 
 func truncate(s string, n int) string {

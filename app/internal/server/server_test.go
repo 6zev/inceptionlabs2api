@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"inceptionlabs2api/internal/clear"
 	"inceptionlabs2api/internal/openai"
 	"inceptionlabs2api/internal/pool"
 	"inceptionlabs2api/internal/upstream"
@@ -979,5 +980,42 @@ func TestTooManyTextPartsRejected(t *testing.T) {
 	}
 	if up.count() != 0 {
 		t.Fatal("part-flood reached upstream")
+	}
+}
+
+// fakeClearance is a fixed clearance snapshot for /healthz.
+type fakeClearance struct{ st clear.State }
+
+func (f fakeClearance) State() clear.State { return f.st }
+
+func TestHealthzReportsClearance(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(&fakeChatter{})
+	s.SetClearance(fakeClearance{st: clear.State{HasCookie: true, AgeSeconds: 12, RefreshCount: 3}})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var body struct {
+		Clearance clear.State `json:"clearance"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body.Clearance.HasCookie || body.Clearance.AgeSeconds != 12 || body.Clearance.RefreshCount != 3 {
+		t.Fatalf("clearance = %+v", body.Clearance)
+	}
+}
+
+func TestHealthzOmitsClearanceWithoutSource(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(&fakeChatter{})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	var body map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &body)
+	if _, ok := body["clearance"]; ok {
+		t.Fatal("clearance must be omitted when no source is attached")
 	}
 }

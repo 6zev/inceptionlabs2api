@@ -34,10 +34,12 @@ func run() error {
 	logf := log.Printf
 
 	up, fetch := upstream.NewClient(upstream.Config{
-		BaseURL:        cfg.UpstreamBase,
-		Proxy:          cfg.Proxy,
-		SessionTimeout: cfg.SessionTimeout,
-		Logf:           logf,
+		BaseURL:           cfg.UpstreamBase,
+		Proxy:             cfg.Proxy,
+		SessionTimeout:    cfg.SessionTimeout,
+		ClearanceRefresh:  cfg.ClearanceRefresh,
+		ClearanceCooldown: cfg.ClearanceCooldown,
+		Logf:              logf,
 	})
 
 	p := pool.New(pool.Config{
@@ -63,6 +65,7 @@ func run() error {
 		Logf:               logf,
 	}, up, p)
 	srv.SetSearcher(up)
+	srv.SetClearance(up.Clearance())
 	if cfg.SearchConfigCheck {
 		// Background and bounded: a challenged config route must never delay
 		// or fail boot.

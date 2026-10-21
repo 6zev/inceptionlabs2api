@@ -53,6 +53,10 @@ const (
 // work itself was rejected (checkpoint version drift). Retrying cannot help.
 var ErrRefused = errors.New("clear: challenge solution refused")
 
+// errNoChallenge means the edge answered the probe without a challenge, so
+// there is nothing to clear: this egress is already welcome.
+var errNoChallenge = errors.New("clear: no challenge issued")
+
 // State is the /healthz view of clearance.
 type State struct {
 	HasCookie    bool  `json:"has_cookie"`
@@ -238,13 +242,9 @@ func (c *Clearance) wait(ctx context.Context, done chan struct{}) error {
 	case <-done:
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if c.lastErr != nil {
-			return c.lastErr
-		}
-		if c.cookie == "" {
-			return errors.New("clear: acquisition produced no cookie")
-		}
-		return nil
+		// A successful acquisition may legitimately end with no cookie: an
+		// unchallenged egress needs none. Only a recorded error is a failure.
+		return c.lastErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -272,6 +272,15 @@ func (c *Clearance) refresh(ctx context.Context) error {
 
 	start := c.now()
 	token, err := c.fetchChallenge(ctx)
+	if errors.Is(err, errNoChallenge) {
+		// Not challenged: no cookie is needed on this egress. Successful
+		// acquisition with nothing to hold.
+		c.mu.Lock()
+		c.cookie = ""
+		c.mu.Unlock()
+		c.logf("clear: probe was not challenged; no clearance needed")
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -310,6 +319,9 @@ func (c *Clearance) fetchChallenge(ctx context.Context) (string, error) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
 
 	token := resp.Header.Get("x-vercel-challenge-token")
+	if resp.StatusCode == http.StatusOK {
+		return "", errNoChallenge
+	}
 	if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusForbidden {
 		return "", fmt.Errorf("clear: expected challenge, got HTTP %d", resp.StatusCode)
 	}

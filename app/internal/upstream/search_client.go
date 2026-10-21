@@ -12,8 +12,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	"github.com/andybalholm/brotli"
 )
 
 // ErrSearchIncomplete means the NDJSON body ended without a docs event and
@@ -83,14 +81,17 @@ func (c *Client) Search(ctx context.Context, req *SearchRequest, idle time.Durat
 	return collectSearch(ctx, reader, idle)
 }
 
-// decodedBody wraps body according to Content-Encoding. Identity and br are
-// supported; anything else is a typed error rather than mojibake.
+// decodedBody wraps body according to Content-Encoding. Identity and gzip
+// (stdlib) are supported. Brotli cannot be decoded without a third-party
+// dependency, so a br body is a typed error naming the encoding rather than
+// mojibake; the request advertises Accept-Encoding: identity, so this only
+// happens if an intermediary re-compresses.
 func decodedBody(body io.Reader, encoding string) (io.Reader, error) {
 	switch strings.ToLower(strings.TrimSpace(encoding)) {
 	case "", "identity":
 		return body, nil
 	case "br":
-		return brotli.NewReader(body), nil
+		return nil, fmt.Errorf("upstream: search body is brotli-encoded (%q) and this build has no brotli decoder", encoding)
 	case "gzip":
 		zr, err := gzip.NewReader(body)
 		if err != nil {
@@ -283,7 +284,9 @@ func truncateRunes(s string, n int) string {
 // SearchConfig calls GET /api/search-lab/config. It needs no session token
 // (the live probe succeeded without one) and is used once at startup.
 func (c *Client) SearchConfig(ctx context.Context) (*SearchConfigResponse, error) {
-	resp, err := c.get(ctx, "/api/search-lab/config", "search config")
+	resp, err := c.Send(ctx, http.MethodGet, "/api/search-lab/config", nil, c.timeout, func(r *http.Request) {
+		r.Header.Set("Accept", "application/json")
+	})
 	if err != nil {
 		return nil, err
 	}
