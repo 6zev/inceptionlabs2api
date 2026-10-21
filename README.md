@@ -219,7 +219,9 @@ curl http://localhost:3000/v1/web_search \
 - 响应带 `Cache-Control: no-store`；本接口不流式，整次检索完成后一次性返回。
 
 错误映射与聊天接口一致：会话池为空 `503 upstream_unavailable`；上游配置
-`retrievalAvailable:false` 时 `503 search_unavailable`；上游非 200 或流内出现
+`retrievalAvailable:false` 时 `503 search_unavailable`（探测请求会带上清关 cookie
+与会话 token；如果响应里根本没有 `retrievalAvailable` 字段——例如又一个挑战
+JSON——`search.available` 会保持 `null`，绝不会被误读成 `false`）；上游非 200 或流内出现
 终止 `error` 事件 `502 upstream_error`；`docs` 之前流被截断
 `502 upstream_stream_error`；滑动空闲窗口（默认 60 秒，每行重置）超时
 `504 upstream_idle_timeout`，整次运行另有 10 个空闲窗口的绝对上限。
