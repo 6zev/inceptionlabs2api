@@ -56,8 +56,9 @@ func TestDecodeDropsUnknownParamsSilently(t *testing.T) {
 	}
 }
 
-// Tool calling is out of scope, but offering tools must not break the call:
-// the fields are dropped and the request proceeds as plain chat.
+// The decoder normalises these tool fields without rejecting the request: a
+// tool_choice shape or an out-of-scope "functions" key must not break plain
+// chat.
 func TestDecodeDropsToolFieldsAndProceeds(t *testing.T) {
 	t.Parallel()
 	for _, body := range []string{

@@ -234,11 +234,11 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 	var cites upstream.CitationCollector
 	parser := tools.NewParser(manifest.Declared)
 	emitted := 0
-	// produced tracks whether ANY client-visible byte went out. The measured
-	// empty-answer failure mode (reasoning-only stream, no text, no calls)
-	// emits nothing until the very end — so a retry must happen before any
-	// frame leaves. Reasoning deltas are buffered, not written, until the
-	// first content/call proves the round is alive.
+	// sawAlive tracks whether the round released anything past the opening
+	// role frame. The measured empty-answer failure mode (reasoning-only
+	// stream, no text, no calls) never does, so the retry happens before the
+	// first answer frame leaves. Reasoning deltas are buffered, not written,
+	// until the first content/call proves the round is alive.
 	sawAlive := false
 	bufReasoning := ""
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
