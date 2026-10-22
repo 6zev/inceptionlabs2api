@@ -48,8 +48,7 @@ type Parser struct {
 	open   string // "" outside a block; else the marker that opened it
 	closer string // matching close marker
 
-	calls    []Call
-	overflow bool
+	calls []Call
 }
 
 // NewParser returns a parser that accepts only the given tool names.
@@ -84,10 +83,6 @@ func (p *Parser) Flush() []byte {
 
 // Calls returns the calls parsed so far in appearance order.
 func (p *Parser) Calls() []Call { return p.calls }
-
-// Overflowed reports whether a block exceeded maxBlockBytes. Once it has, the
-// rest of the response is treated as prose; callers may log it.
-func (p *Parser) Overflowed() bool { return p.overflow }
 
 // findStart returns the earliest start marker index in buf.
 func (p *Parser) findStart() (int, string) {
@@ -133,7 +128,6 @@ func (p *Parser) drain(final bool) []byte {
 			out = append(out, p.buf...)
 			p.buf = p.buf[:0]
 			p.open, p.closer = "", ""
-			p.overflow = true
 			return out
 		}
 

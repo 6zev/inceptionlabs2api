@@ -143,9 +143,6 @@ func New(cfg Config, up Chatter, p PoolStats) *Server {
 	return &Server{cfg: cfg, up: up, pool: p, now: time.Now, logf: logf}
 }
 
-// SetClock replaces the clock; tests use it for deterministic created fields.
-func (s *Server) SetClock(now func() time.Time) { s.now = now }
-
 // SetSearcher attaches the standalone retrieval backend. Without one the
 // route answers 503 rather than panicking.
 func (s *Server) SetSearcher(se Searcher) { s.se = se }

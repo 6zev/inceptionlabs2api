@@ -391,47 +391,6 @@ func (s *Server) replayRound(w http.ResponseWriter, flusher http.Flusher, write 
 	}
 }
 
-// finishStream flushes a parser's tail, emits its calls and closes the SSE
-// response.
-func (s *Server) finishStream(w http.ResponseWriter, flusher http.Flusher, write func(openai.Delta, *string) bool, parser *tools.Parser, cites upstream.CitationCollector, emitted int) {
-	if tail := parser.Flush(); len(tail) > 0 {
-		if !write(openai.Delta{Content: string(tail)}, nil) {
-			return
-		}
-	}
-	emitToolCalls(w, flusher, parser.Calls(), emitted, write)
-	finish := "stop"
-	if len(parser.Calls()) > 0 {
-		finish = "tool_calls"
-	}
-	if !write(openai.Delta{Annotations: cites.Citations()}, &finish) {
-		return
-	}
-	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
-}
-
-// streamFailure writes the mid-stream error envelope unless the client is
-// already gone.
-func (s *Server) streamFailure(w http.ResponseWriter, r *http.Request, flusher http.Flusher, readErr error) {
-	if errors.Is(readErr, errClientGone) {
-		return
-	}
-	if errors.Is(readErr, context.Canceled) && r.Context().Err() != nil {
-		return
-	}
-	s.upErrors.Add(1)
-	s.logf("upstream: stream failed after headers: %v", readErr)
-	se := streamError(readErr)
-	_ = writeEvent(w, se.Envelope())
-	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
-}
-
 // chunkWriter builds the frame writer for one streamed response.
 func (s *Server) chunkWriter(w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string, tag string) func(openai.Delta, *string) bool {
 	return func(delta openai.Delta, finish *string) bool {
