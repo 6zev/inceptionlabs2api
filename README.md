@@ -133,6 +133,30 @@ curl http://localhost:3000/v1/chat/completions \
 `config` 可省略；范围超限时自动钳制到上游上限。响应包含改写后的查询组
 与结果列表（`url` / `title` / `snippet` / `cite_index`）。
 
+**`answer` 字段（可选）**：网关会完整读取上游检索流水线直到合成结束。
+上游实际抓取的是页面全文，`run_done` 事件携带一段基于全文合成的、带
+`[n]` 引用标记的答案；网关把它作为 `answer` 透传给调用方。引用标记与
+`results` 数组顺序一一对应（`cite_index` 从 1 起，网关不重排来源）。
+上游未产出答案时该字段整体省略，调用方按 `results` 自行阅读来源。
+
+实测捕获示例（2026-10-22，查询 "Go 1.27 new features"）：
+
+```json
+{
+  "object": "web_search",
+  "queries": ["go 1.27 release date", "go 1.27 new features"],
+  "results": [
+    {"url": "https://go.dev/doc/go1.27", "title": "Go 1.27 Release Notes", "snippet": "", "cite_index": 1},
+    {"url": "https://go.dev/blog/go1.27", "title": "The Go Blog: Go 1.27", "snippet": "", "cite_index": 2},
+    {"url": "https://go.dev/blog/release/go1.27", "title": "Go 1.27 is released", "snippet": "", "cite_index": 3}
+  ],
+  "answer": "According to the sources, Go 1.27 was released on August 19, 2026 [1][2][3]. ..."
+}
+```
+
+内置 `web_search` 工具回灌给模型的结果使用同一结构（多一个 `as_of`
+字段），因此模型现在拿到的是全文级答案而不是只有标题和链接。
+
 ## 文字转语音 `/v1/audio/speech`
 
 ```json

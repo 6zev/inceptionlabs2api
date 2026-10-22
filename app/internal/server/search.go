@@ -38,10 +38,14 @@ type webSearchConfigIn struct {
 
 // webSearchResponse mirrors the simple-chat contract exactly:
 // {"object":"web_search","queries":[...],"results":[{url,title,snippet,cite_index}]}.
+// answer is the upstream's content-grounded synthesized text (citation
+// markers align with the results order); it is omitted when the run
+// produced none, so existing clients see one new optional field only.
 type webSearchResponse struct {
 	Object  string            `json:"object"`
 	Queries []string          `json:"queries"`
 	Results []webSearchResult `json:"results"`
+	Answer  string            `json:"answer,omitempty"`
 }
 
 type webSearchResult struct {
@@ -92,6 +96,7 @@ func (s *Server) webSearch(w http.ResponseWriter, r *http.Request) {
 		Object:  "web_search",
 		Queries: nonNil(res.Queries),
 		Results: results(res.Sources),
+		Answer:  res.Answer,
 	})
 }
 
