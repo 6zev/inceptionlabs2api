@@ -298,6 +298,23 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fold long histories past the upstream limit before conversion. The
+	// plain path has no preamble message, so the fold trigger is the history
+	// length alone; the teaching section rides inside the bubble. Below the
+	// trigger the messages cross untouched — byte-identical to no-fold.
+	if len(msgs) > openai.FoldTrigger {
+		hist := make([]openai.History, 0, len(msgs))
+		for _, m := range msgs {
+			hist = append(hist, openai.History{Role: m.Role, Texts: m.Texts})
+		}
+		if folded, did := openai.FoldHistory(hist, false); did {
+			msgs = make([]openai.TextMessage, 0, len(folded))
+			for _, h := range folded {
+				msgs = append(msgs, openai.TextMessage{Role: h.Role, Texts: h.Texts})
+			}
+		}
+	}
+
 	ureq := upstream.NewChatRequest(msgs, req.ReasoningEffort)
 	if req.Stream {
 		s.stream(w, r, ureq, req.Model)
