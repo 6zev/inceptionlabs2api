@@ -154,6 +154,54 @@ curl -X POST http://localhost:3000/v1/audio/transcriptions \
 
 响应：`{"object": "transcription", "text": "识别出的文字"}`
 
+
+## 决策 `/v1/decisions`
+
+Mercury Decide：给一段场景文本 + 若干结构化问题，返回带概率的判定结果，
+客服分流 / 工单路由 / 验收打分类任务的专用接口。**body 原样透传上游**，
+上游校验器是唯一权威。
+
+```json
+{
+  "state": "Hi — I was charged TWICE for my annual plan this morning. I need a refund today.",
+  "questions": [
+    {"id": "q-1", "name": "wants_refund", "type": "noul",
+     "instructions": "Is the customer asking for money back?", "options": []},
+    {"id": "q-6", "name": "team", "type": "choice",
+     "instructions": "Which team should own this ticket?",
+     "options": [
+       {"id": "opt-2", "name": "billing", "description": "Charges, invoices, refunds"},
+       {"id": "opt-3", "name": "technical", "description": "Bugs, outages, integrations"}]},
+    {"id": "q-11", "name": "urgency", "type": "score",
+     "instructions": "How urgently does this need a human?",
+     "options": [
+       {"id": "lvl-7", "name": "", "description": "Can wait a week"},
+       {"id": "lvl-9", "name": "", "description": "Today"}]}
+  ],
+  "images": []
+}
+```
+
+**响应**：
+
+```json
+{
+  "answers": {
+    "wants_refund": {"type": "noul", "p": 0.9995},
+    "team": {"type": "choice", "choice": "billing",
+             "probabilities": {"billing": 0.9999, "technical": 0.00001},
+             "confidence": 0.9999},
+    "urgency": {"type": "score", "score": 0.9975,
+                "levels": [{"label": "Today", "p": 0.9975}], "confidence": 0.995}
+  },
+  "inputTokens": 289, "latencyMs": 152
+}
+```
+
+问题类型三选一：`noul`（是/否）、`choice`（2–12 个命名选项）、
+`score`（2–10 档评分）。限制：`state` ≤ 12000 字符、1–8 个问题、
+选项名 ≤ 40 字符、images ≤ 3 张（PNG/JPEG/WebP/GIF）。
+
 ## 配置（关键环境变量）
 
 | 变量 | 默认值 | 说明 |
