@@ -23,3 +23,9 @@ go.work.sum
 
 # local task brief
 TASK.md
+
+# documentation and tests stay local, out of the published tree
+*.md
+docs/
+*_test.go
+integration_test.go
