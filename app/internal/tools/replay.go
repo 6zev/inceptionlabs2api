@@ -79,18 +79,30 @@ type Result struct {
 	Content string
 }
 
+// resultContract is the trailer line of a rendered result turn. It exists to
+// break the narrate-no-call stall: after consuming a tool result the model
+// sometimes ends its turn with a plan narration and no call block — a
+// self-reinforcing pattern once one such turn is in history. The trailer
+// states the continuation rule at the exact point the decision is made.
+const resultContract = "[End of tool result. If the task is not complete, call the next tool now — narration alone is not a valid turn.]"
+
 // RenderResults renders one or more tool results as a single user turn. The
-// upstream has no tool role, and the Qwen/Hermes templates carry results in a
-// <tool_response> envelope, so that is what the model is shown.
+// upstream has no tool role; results ride in a user message. The format is a
+// single-layer bracket block, deliberately NOT XML: client tool results are
+// frequently XML documents themselves (`<tool_result>…</tool_result>` from
+// agent frameworks), and the old XML envelope wrapped that content into
+// nested markup the model read as structure. A bracket header no result body
+// can forge closes each block; the contract trailer appears once per turn,
+// after the last result.
 func RenderResults(results []Result) string {
 	var b strings.Builder
 	for i, r := range results {
 		if i > 0 {
 			b.WriteByte('\n')
 		}
-		b.WriteString("<tool_response")
+		b.WriteString("[Tool Result")
 		if r.CallID != "" {
-			b.WriteString(` call_id="`)
+			b.WriteString(` id="`)
 			b.WriteString(attrEscape(r.CallID))
 			b.WriteByte('"')
 		}
@@ -99,16 +111,28 @@ func RenderResults(results []Result) string {
 			b.WriteString(attrEscape(r.Name))
 			b.WriteByte('"')
 		}
-		b.WriteString(">\n")
+		b.WriteString("]\n")
 		b.WriteString(r.Content)
-		b.WriteString("\n</tool_response>")
+		b.WriteByte('\n')
+		if i == len(results)-1 {
+			b.WriteString(resultContract)
+		} else {
+			b.WriteString("[End of tool result]")
+		}
 	}
 	return b.String()
 }
 
-// attrEscape makes a value safe inside a double-quoted XML-ish attribute: it
-// replaces the three characters that could terminate or forge the attribute.
+// attrEscape makes a value safe inside a double-quoted bracket attribute: it
+// removes the characters that could terminate the attribute or forge a new
+// line. XML entity escaping is intentionally NOT applied — the block is not
+// XML and entities would reach the model literally.
 func attrEscape(s string) string {
-	r := strings.NewReplacer(`"`, "&quot;", "<", "&lt;", ">", "&gt;")
+	r := strings.NewReplacer(
+		`"`, `'`,
+		"]", "",
+		"\n", " ",
+		"\r", " ",
+	)
 	return r.Replace(s)
 }
