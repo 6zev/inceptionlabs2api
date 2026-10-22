@@ -371,8 +371,8 @@ the trade-off is not worth it: the full manifest is simpler, the count never
 changes the prompt shape, and the native `web_search` round loop already
 covers the one gateway-served capability that needs an internal round.
 
-The loader tool and all its machinery (`TierThreshold`, `tool_schema`,
-`Expand`/`Expanded`) are gone. A call to an undeclared name — a stale
+The loader tool and all its machinery — the threshold constant, the
+`tool_schema` name, and the expand/expanded re-render methods — are gone. A call to an undeclared name — a stale
 `tool_schema` call included — is prose under the standing parser rule, never a
 gateway error (§4 preamble: the gateway translates and never blocks).
 
