@@ -66,7 +66,9 @@ func planTools(req *openai.ChatRequest, native *tools.Tool) (*toolPlan, *openai.
 
 // chatWithTools answers a request whose tools are active. A tiered manifest is
 // resolved in full before any bytes are written (the loader needs another
-// round); a flat manifest streams.
+// round); a flat manifest streams. The native web_search loop likewise
+// resolves internally first, so a flat manifest with native search on takes
+// the pre-buffered path too.
 func (s *Server) chatWithTools(w http.ResponseWriter, r *http.Request, req *openai.ChatRequest, plan *toolPlan) {
 	ureq := upstream.NewToolChatRequestHistory(plan.hist, req.ReasoningEffort, plan.manifest)
 	if plan.manifest.Loader {

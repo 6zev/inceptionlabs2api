@@ -129,18 +129,16 @@ type Manifest struct {
 // tierNote explains why schemas are absent and how to ask for them.
 const tierNote = "\nSome argument details are omitted to save context. If you need them, reply with a `" + toolSchemaName + "` block once: " + `{"name": "` + toolSchemaName + `", "arguments": {"names": ["…"]}}` + ".\n"
 
-// header is the fixed part of every preamble: the call contract followed by
-// the choice-specific instructions.
-//
-// The wording is not free-form: the upstream web backend intermittently
-// returns an empty answer (reasoning-start/end only, no text-delta) when a
-// system message looks like tool-calling scaffolding. The one reproducible
-// trigger found in ~20 probes was a "<tools>…</tools>" catalogue block, which
-// produced no text in 10/10 attempts; with the definitions as plain JSON lines
-// the same text answered in 5/7. Headings and the word "function" were
-// suspected first and later disproved as deterministic triggers. The exact
-// phrasing is therefore part of the protocol, not copy: re-probe before
-// rewording (DESIGN-TOOLS.md §1.1).
+// The preamble wording is not free-form: the upstream web backend
+// intermittently returns an empty answer (reasoning-start/end only, no
+// text-delta) when a system message looks like tool-calling scaffolding. The
+// one reproducible trigger found in ~20 probes was a "<tools>…</tools>"
+// catalogue block, which produced no text in 10/10 attempts; with the
+// definitions as plain JSON lines the same text answered in 5/7. Headings and
+// the word "function" were suspected first and later disproved as
+// deterministic triggers. The exact phrasing is therefore part of the
+// protocol, not copy: re-probe before rewording (DESIGN-TOOLS.md §1.1).
+
 // activeSkeleton returns the skeleton selected by PreStyle, defaulting to
 // hermes for any unknown value.
 func activeSkeleton() skeleton {

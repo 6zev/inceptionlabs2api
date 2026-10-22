@@ -102,6 +102,10 @@ func NewToolChatRequestHistory(hist []openai.History, effort string, m *tools.Ma
 	// effort (medium/instant/high), while the identical preamble with
 	// webSearchEnabled:false answered with a clean <tool_call> block. A client that
 	// declares tools wants ITS tools honored; tool-less chat keeps search on.
+	//
+	// This also holds for the gateway's native web_search tool: it is served
+	// from OUR manifest (one catalogue) and must never be paired with the
+	// upstream's builtin search.
 	return &ChatRequest{
 		ReasoningEffort:  effort,
 		WebSearchEnabled: m == nil,
