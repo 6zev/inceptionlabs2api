@@ -965,9 +965,8 @@ instruction.
 containing the `<tools>` list (one compact JSON object per line:
 `name`, `description`, `parameters`) and the `<tool_call>` output contract.
 Under a named `tool_choice` only that tool is listed. `tool_choice:"none"`
-disables injection and parsing entirely. Above **30** declared tools the list
-is a tier-1 index (names + descriptions, no `parameters`) plus a synthetic
-`tool_schema` loader (§4.1.1).
+disables injection and parsing entirely. Every declared tool is listed with its
+full definition, at any count: there is no count-based tiering (§4.1.1).
 
 **Parsing.** Accumulated text is scanned for `<tool_call>` … `</tool_call>`
 (JSON body: `name` string, `arguments` object) and, as drift tolerance,
@@ -993,24 +992,14 @@ Consecutive `role:"tool"` messages are grouped into one user turn containing
 `<tool_response call_id="…" name="…">…</tool_response>` blocks in arrival
 order; a result with no matching call id keeps its `call_id` and omits `name`.
 
-#### 4.1.1 Tiered manifest
+#### 4.1.1 No tiered manifest
 
-When a request declares **more than 30 tools**, the system preamble lists every
-tool's name and description but **no parameter schemas**, plus a synthetic
-function `tool_schema({"names":[…]} | {"query":"…"})` that is not a client tool.
-If the model's buffered response calls `tool_schema`, the gateway builds a
-second upstream request whose preamble contains the full schemas of the
-requested tools (lexical match over name + description when `query` is used),
-repeats the original user turn, and at most **twice** repeats this. If the
-second round still calls `tool_schema`, that block is demoted to text, any
-other calls stand, and the response ends normally. The client never sees
-`tool_schema`; both probe rounds are buffered in full before anything is
-written, so the response shape is always one normal answer.
-
-The threshold and the tier shape are cited, not invented: 30 is the lower bound
-of the published 30–50-tool degradation range, and "names + descriptions in
-context, parameter schema deferred" is exactly what OpenAI's `defer_loading`
-documents (`DESIGN-TOOLS.md` §6.2).
+Every request that declares tools carries the full definition of every
+declared tool — name, description and parameter schema — regardless of the
+count. There is no threshold, no schema-withholding mode and no synthetic
+loader tool. A model that calls an undeclared name (for example `tool_schema`,
+left over from an old prompt) produces ordinary prose: undeclared names never
+become calls and never become errors.
 
 ## 5. Session pool
 
@@ -1406,8 +1395,9 @@ Invalid values are startup errors with an actionable message.
   undeclared names, text-and-call in one response, parallel calls, marker
   splits at every byte boundary, multi-byte runes at holdbacks, 64 KiB cap,
   code fences, replay of assistant `tool_calls` and grouped `tool` results,
-  every `tool_choice` variant, and both tiered-manifest paths (loader honoured,
-  loader repeated twice → demoted). The live probe plan and its budget are in
+  every `tool_choice` variant, and full definitions at a 40-tool count
+  (including an old `tool_schema` call passing through as prose). The live
+  probe plan and its budget are in
   `DESIGN-TOOLS.md` §8.
 - Citation translation is pinned against scripted `source-url` streams:
   normal sources (rank order, annotation shape, finish-frame delivery),

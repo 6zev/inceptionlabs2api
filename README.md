@@ -226,10 +226,9 @@ curl http://localhost:3000/v1/chat/completions \
 - **按需注入。** 只有 `tools` 非空的请求才会带提示词；没有工具的请求走原来的代码
   路径，**逐字节不变**（有 golden 测试和上线前的实机抓包对照
   `testdata/no-tools-baseline.sse`）。工具定义按紧凑 JSON 输出，不做缩进。
-- **超过 30 个工具时自动分层。** 提示词只给名称和描述，参数 schema 由模型按需调用
-  内置的 `tool_schema` 索取；网关内部最多再发两轮，客户端始终只看到一次正常响应。
-  阈值和分层形状来自厂商文档（30–50 个工具后选择质量下降）与实测，见
-  `DESIGN-TOOLS.md` §6。
+- **工具定义始终完整。** 无论声明多少个工具，提示词都携带每个工具的名称、描述和
+  完整参数 schema，不存在按数量分层或按需索取 schema 的机制，见
+  `DESIGN-TOOLS.md` §6.2。
 - **`tool_choice`** 支持 `none`（完全不走工具路径）、`auto`、`required`（提示"必须
   调用"）和 `{"type":"function","function":{"name":…}}`（只注入并只接受该工具）。
 - **多轮**：把带 `tool_calls` 的 assistant 消息和 `role:"tool"` 结果原样回传即可，

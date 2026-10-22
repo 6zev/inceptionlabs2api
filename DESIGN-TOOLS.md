@@ -356,45 +356,25 @@ Cost when tools *are* present:
 - **Only the declared tool under a named `tool_choice`** (§5) — can remove the
   entire rest of the manifest.
 
-### 6.2 Tiered manifest above 30 tools
+### 6.2 No tiered manifest (decision reversed)
 
-**Decision: when a request declares more than 30 tools, inject a tier-1 index
-(names + descriptions, no parameter schemas) plus a synthetic
-`tool_schema` loader. If the model calls the loader, the gateway expands those
-schemas and re-asks the upstream internally, at most twice.**
+**Decision: every request carries the full definition of every declared tool.
+A count-based tier — a names-only index above *N* tools plus a synthetic
+`tool_schema` loader — was built, then removed by owner decision.**
 
-Evidence and why this shape:
+The earlier design (§6.2 in history) withheld parameter schemas above 30
+declared tools and offered a loader the model could call to pull them back in,
+citing Anthropic's and OpenAI's tool-search docs on selection degrading past
+30–50 tools. The cost was a second upstream round on any request that used the
+loader and a prompt shape that depended on tool count. The owner ruled that
+the trade-off is not worth it: the full manifest is simpler, the count never
+changes the prompt shape, and the native `web_search` round loop already
+covers the one gateway-served capability that needs an internal round.
 
-- Anthropic's docs report that selection degrades once **30–50 tools** are
-  available and that tool search reduces a 58-tool / ~55 K-token setup by over
-  85 % by loading only 3–5 tools **[D: platform.claude.com "Tool search tool"]**.
-  30 is the lower bound of that published range — the threshold is cited, not
-  invented.
-- OpenAI's `defer_loading` keeps the **name and description** in context and
-  defers the parameter schema: "in practice tool search is mostly deferring the
-  parameter schema" **[D: developers.openai.com "Tool search"]**. Our tier 1 is
-  exactly that: the same names and descriptions, schema removed.
-- The loader is **model-driven, not a fixed top-k**. A fixed shortlist of 5
-  finds nothing when the right tool ranks 6th–20th; an adaptive depth reaches
-  90.3 % vs 90.8 % coverage while loading 7 tools on average **[D: arXiv
-  2605.24660]**. A model that can ask for *any* declared name by name avoids
-  the fixed-k failure; Claude Code's `select:<name>` escape hatch is the same
-  idea **[D: code.claude.com MCP tool search]**.
-- The expansion is a **server-internal extra round**, mirroring Anthropic's
-  documented "adds a search step before tool invocation" **[D]**. It happens
-  before anything is written to the client (content and calls are buffered
-  during the probe round), so the client sees one normal response.
-- Bounded at **2 rounds**. This is not a client-loop guard (the OpenAI protocol
-  is client-driven and each of our requests is stateless, so no guard is
-  needed there — verified against the protocol shape in §4); it bounds *our*
-  internal re-ask loop, which otherwise could repeat at gateway expense.
-
-Cost: a tiered request that uses the loader pays one extra upstream generation.
-A tiered request that does not use it pays only the generation it would have
-paid anyway, plus the buffering described in §3 (≈0 on this upstream). If the
-second expansion still returns a loader call, that block is demoted to text and
-the response ends with `finish_reason:"stop"` — the client never sees the
-synthetic tool.
+The loader tool and all its machinery (`TierThreshold`, `tool_schema`,
+`Expand`/`Expanded`) are gone. A call to an undeclared name — a stale
+`tool_schema` call included — is prose under the standing parser rule, never a
+gateway error (§4 preamble: the gateway translates and never blocks).
 
 ### 6.3 Techniques considered and rejected
 
@@ -436,10 +416,7 @@ Every row is a test in `app/internal/tools` (unit) and/or
 | T18 | Code-fenced block | Parsed if the name is declared | Parser test |
 | T19 | `tools` is present but not an array / function has no name | 400 `invalid_request_error` (structural class 2) — a body the wire cannot express; no upstream call | Decode tests |
 | T20 | Tool call plus `source-url` citations | Annotations still ride the finish frame next to `tool_calls` | Server SSE test |
-| T21 | >30 tools | Tier-1 manifest has no `parameters`; loader tool present | Manifest unit test |
-| T22 | >30 tools, model calls the loader | Internal re-ask includes the requested schemas; client sees only the final answer; ≤2 rounds | Server test with scripted upstream call counter |
-| T23 | >30 tools, loader called on both rounds | Loader block demoted to text, `finish_reason:"stop"` | Server test |
-| T24 | ≤30 tools | Full schemas, no loader (tiering must not trigger) | Manifest unit test |
+| T24 | 40 tools | All 40 definitions carry `parameters`; no loader note; one upstream round | Manifest unit test + server test |
 | T25 | `parallel_tool_calls:false` | Instruction present; parser still returns whatever the model sent (it does not enforce) | Manifest test |
 
 Coverage target: ≥80 % over `app/internal/tools`, with every row above present
@@ -464,7 +441,7 @@ came out, including the negative ones.
 | V3 | same, streaming | Empty-answer outcome on 2 attempts (`role` frame, then `{}` + `stop`); the streaming path itself is pinned by tests against scripted upstreams |
 | V4 | `tool_choice:"required"` | Not run: budget consumed by the §1.1 investigation. Covered by T11 in tests |
 | V5 | multi-round call → result → answer | Not run live: covered end-to-end by `TestE2EToolCallRoundTrip` against the TLS mock |
-| V6 | tiered manifest, >30 tools | Not run live: covered by T21–T23 |
+| V6 | full manifest, 40 tools | Not run live: covered by T24 |
 
 Honest summary: the wire format is **validated** (one real call, plus the
 parser/stream/replay paths proven by tests and a full E2E), and the no-tools
