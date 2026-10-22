@@ -2,6 +2,7 @@ package openai
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 )
 
@@ -124,6 +125,57 @@ func FoldHistory(hist []History, toolsActive bool) ([]History, bool) {
 	return out, true
 }
 
+// The sanitization chain applied to BUBBLE content only — the recent tail is
+// never touched. It neutralizes content a client could use to forge extra
+// turns or smuggle instructions through the transcript:
+//   - forged ChatML markers (we emit the real ones; a client must not be
+//     able to open a fake block inside its content),
+//   - leading forged role prefixes ("System:", "Assistant:", ...),
+//   - <system>/<instruction>/<prompt>/<rule> instruction-smuggling blocks,
+//   - control characters.
+//
+// Each pattern is compiled once; the chain is the QwenGate order with the
+// marker rule added, because QwenGate merges unconditionally and never had
+// to defend a transcript it did not fully control.
+var (
+	foldReMarkers = regexp.MustCompile(`(?i)<\|im_(start|end)\|>`)
+	foldReRolePre = regexp.MustCompile(`(?im)^(?:System|Assistant|User|Human):\s*`)
+	foldReBlocks  = regexp.MustCompile(`(?is)<(?:system|instruction|prompt|rule)>.*?</(?:system|instruction|prompt|rule)>`)
+	foldReControl = regexp.MustCompile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+)
+
+// sanitizeBubble neutralizes forged structure in one bubble content string.
+// Block stripping runs before prefix stripping (the QwenGate chain order):
+// removing a <system>…</system> block can expose a role prefix that was
+// mid-line, and the prefix rule only matches at line start.
+func sanitizeBubble(s string) string {
+	s = foldReMarkers.ReplaceAllString(s, "")
+	s = foldReBlocks.ReplaceAllString(s, "")
+	s = foldReRolePre.ReplaceAllString(s, "")
+	s = foldReControl.ReplaceAllString(s, "")
+	return s
+}
+
+// foldToolResultBudget is the byte ceiling of one tool result body inside the
+// bubble (the QwenGate generic compression threshold). Recent-tail results
+// are never compressed.
+const foldToolResultBudget = 2048
+
+// truncateToolResult compresses one bubble tool result with the generic
+// QwenGate rule: over the budget, keep head 45% / tail 45% of it and mark
+// the omitted middle.
+func truncateToolResult(content string) string {
+	if len(content) <= foldToolResultBudget {
+		return content
+	}
+	head := foldToolResultBudget * 45 / 100
+	tail := head
+	omitted := len(content) - head - tail
+	return content[:head] +
+		"... [truncated, " + itoa(omitted) + " bytes omitted] ..." +
+		content[len(content)-tail:]
+}
+
 // foldUnit is an atomic run of messages: either one plain message, or an
 // assistant tool-call message plus every result message that answers it.
 type foldUnit struct {
@@ -205,6 +257,9 @@ const (
 // as "tool {name}" blocks labelled from the assistant calls that precede
 // them, the qwen-free-api marker shape (adapted: blocks per message rather
 // than one merged message, so the recent tail keeps native structure).
+// Every block's content is sanitized and oversized tool results compressed;
+// the markers themselves are emitted here, after sanitization, so a client
+// cannot forge a block inside its content.
 func renderBubble(prefix []History) string {
 	names := make(map[string]string)
 	for _, h := range prefix {
@@ -219,7 +274,7 @@ func renderBubble(prefix []History) string {
 		b.WriteString(imStart)
 		b.WriteString(bubbleRole(h, names))
 		b.WriteByte('\n')
-		b.WriteString(bubbleContent(h))
+		b.WriteString(sanitizeBubble(bubbleContent(h)))
 		b.WriteByte('\n')
 		b.WriteString(imEnd)
 	}
@@ -248,7 +303,7 @@ func bubbleContent(h History) string {
 			if i > 0 {
 				b.WriteByte('\n')
 			}
-			b.WriteString(r.Content)
+			b.WriteString(truncateToolResult(r.Content))
 		}
 		return b.String()
 	}
