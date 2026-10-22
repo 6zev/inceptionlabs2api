@@ -125,33 +125,7 @@ type Manifest struct {
 	// loaded is the subset of tools whose full schemas the current preamble
 	// carries instead of the tier-1 index entry.
 	loaded []Tool
-	// opening is the prose clause after "You have access to", naming the
-	// operations without the words "function"/"functions".
-	opening string
 }
-
-// openingClause is part of the stable hermes-compact preamble measured in the
-// 14-probe wording matrix (2026-10-22, probe/outP1..C): the fixed skeleton
-// "You are a helpful assistant with access to the following tools: <JSON lines>
-// <contract>" hit tool calls in 7/8 live requests (incl. multi-tool selection,
-// no-hint natural ask, tool_choice=required, and a no-tool chat staying clean),
-// while the previous draft wording missed 3/3 locally and scored 5/7 in its own
-// validation. The skeleton's exact text is protocol: re-probe before rewording
-// (DESIGN-TOOLS.md §1.1).
-func openingClause(n int) string {
-	if n == 1 {
-		return "one operation, described below"
-	}
-	return fmt.Sprintf("%d operations, described below", n)
-}
-
-// openingFor names a single operation concretely in the prose; multi-tool
-// requests keep the generic count.
-
-// definitionHeader introduces the catalogue. Definitions are plain JSON lines:
-// wrapping them in <tools>…</tools> made the upstream return an empty answer
-// in 10/10 probes (DESIGN-TOOLS.md §1.1).
-const definitionHeader = "\nOperation definitions, one JSON object per line:\n"
 
 // tierNote explains why schemas are absent and how to ask for them.
 const tierNote = "\nSome argument details are omitted to save context. If you need them, reply with a `" + toolSchemaName + "` block once: " + `{"name": "` + toolSchemaName + `", "arguments": {"names": ["…"]}}` + ".\n"
@@ -255,7 +229,7 @@ func BuildManifest(list []Tool, c Choice, parallelOff bool) (*Manifest, error) {
 		}
 	}
 
-	m := &Manifest{Tiered: len(selected) > TierThreshold, tools: selected, opening: openingClause(len(selected))}
+	m := &Manifest{Tiered: len(selected) > TierThreshold, tools: selected}
 	for _, t := range selected {
 		m.Declared = append(m.Declared, t.Name)
 	}
@@ -405,6 +379,5 @@ func (m *Manifest) Expanded(extra []Tool) *Manifest {
 		tools:        m.tools,
 		instructions: m.instructions,
 		loaded:       allLoaded,
-		opening:      m.opening,
 	}
 }
