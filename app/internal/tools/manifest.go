@@ -159,18 +159,32 @@ func (m *Manifest) header() string {
 // blocks — a self-reinforcing pattern once one such turn is in history.
 const continuationRuleSentence = "After a tool result arrives, if the task is not yet complete, immediately call the next tool. Never end your turn with only a description of what you are about to do."
 
-// workedExample renders a concrete marker-block example from the FIRST
-// declared tool's real name and a minimal argument shape derived from its
-// parameters schema. A concrete example of the exact wire shape is cheaper
-// for the model to imitate than prose alone. Blank-named or no tools skip
-// the example entirely.
+// workedExample renders concrete marker-block examples from the declared
+// tools' real names and minimal argument shapes derived from their parameter
+// schemas, one "Example:" line per tool for up to TWO tools — parity with the
+// reference implementations (ToolForge xyml.py _example_input_from_tool,
+// toolkit render.go). A concrete example of the exact wire shape is cheaper
+// for the model to imitate than prose alone. Blank-named tools are skipped
+// (the next named tool takes the slot) and a name is never rendered twice.
+// No tools at all skips the examples entirely.
 func workedExample(list []Tool) string {
-	if len(list) == 0 || strings.TrimSpace(list[0].Name) == "" {
-		return ""
+	var b strings.Builder
+	seen := make(map[string]bool, 2)
+	for _, t := range list {
+		if strings.TrimSpace(t.Name) == "" || seen[t.Name] {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		seen[t.Name] = true
+		b.WriteString("Example: " + callStart + `{"name":` + quoteJSON(t.Name) +
+			`,"arguments":` + exampleArguments(t.Parameters) + "}" + callEnd)
+		if len(seen) == 2 {
+			break
+		}
 	}
-	t := list[0]
-	return "Example: " + callStart + `{"name":` + quoteJSON(t.Name) +
-		`,"arguments":` + exampleArguments(t.Parameters) + "}" + callEnd
+	return b.String()
 }
 
 // exampleArguments derives a minimal argument object from a JSON schema.
