@@ -24,6 +24,18 @@ const (
 	RecoveryParseFailed
 )
 
+// String names the kind for wire-log lines ([recovery kind=...]).
+func (k RecoveryKind) String() string {
+	switch k {
+	case RecoveryTruncated:
+		return "truncated"
+	case RecoveryParseFailed:
+		return "parse_failed"
+	default:
+		return "clean"
+	}
+}
+
 // retrySnippetLimit bounds the original-output tail embedded in a retry
 // message, so a long broken round cannot balloon the retry turn.
 const retrySnippetLimit = 2000
