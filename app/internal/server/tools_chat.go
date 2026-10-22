@@ -115,13 +115,108 @@ func (s *Server) readRound(ctx context.Context, ureq *upstream.ChatRequest, mani
 // manifest present the model occasionally returns reasoning-only, zero text
 // and zero calls (probe/outQ q1/q3/q4, probe/outP2 timing runs). The upstream
 // web surface shows the same flakiness without any preamble, so this is the
-// model's occasional refusal-shaped pause, not a request defect. The client
+// model's occasional refusal-shaped pause, not a request defect. Reasoning
+// without text or a call is the pause itself (the streaming path always
+// treated it so via sawAlive), so only content and calls decide. The client
 // asked for tool calling; an empty answer is not a valid tool response, so
 // the gateway re-asks once internally with the same manifest — protocol
 // completion, not content interception: whatever the retry returns is passed
 // through verbatim, empty or not.
 func (r *round) emptyToolAnswer() bool {
-	return r.content == "" && r.reasoning == "" && len(r.calls) == 0
+	return r.content == "" && len(r.calls) == 0
+}
+
+// retryKind classifies one zero-call round for the recovery retry. The empty
+// answer keeps its own legacy branch (same-manifest re-ask); a broken-call
+// round — truncated envelope or unparseable block — gets the ToolForge-style
+// recovery retry; clean prose returns false: the gateway translates, never
+// blocks, and a clean prose answer is a legal terminal.
+func (s *Server) retryKind(res *round, calls []tools.Call) (tools.RecoveryKind, bool) {
+	all := res.calls
+	if calls != nil {
+		all = calls
+	}
+	if len(all) > 0 {
+		return tools.RecoveryClean, false
+	}
+	if res.emptyToolAnswer() {
+		return tools.RecoveryClean, true // legacy empty branch
+	}
+	kind := tools.ClassifyNoCall(res.content, tools.ForeignOpenMarker)
+	s.logf("tools: [recovery kind=%s] zero-call round (%d content bytes)", kind, len(res.content))
+	return kind, kind != tools.RecoveryClean
+}
+
+// recoveryRequest clones ureq with the broken round appended as history —
+// assistant(original content) + user(retry message) — so the model sees what
+// it emitted and is asked to re-emit it properly.
+func recoveryRequest(ureq *upstream.ChatRequest, res *round, message string) *upstream.ChatRequest {
+	clone := *ureq
+	msgs := make([]upstream.Message, 0, len(ureq.Messages)+2)
+	msgs = append(msgs, ureq.Messages...)
+	if res.content != "" {
+		msgs = append(msgs, upstream.Message{
+			Parts: []upstream.Part{{Type: "text", Text: res.content, State: "done"}},
+			ID:    upstream.RandomID("m"),
+			Role:  "assistant",
+		})
+	}
+	msgs = append(msgs, upstream.Message{
+		Parts: []upstream.Part{{Type: "text", Text: message}},
+		ID:    upstream.RandomID("m"),
+		Role:  "user",
+	})
+	clone.Messages = msgs
+	return &clone
+}
+
+// recoverRound runs the ONE bounded recovery retry for a retry-worthy
+// zero-call round: the empty answer re-asks with the same manifest (legacy
+// behavior), the broken-call kinds re-ask with the original output appended
+// as history plus the retry message. The retry result passes through
+// verbatim — call or prose, empty or not; a transport failure keeps the
+// ORIGINAL round rather than failing a client who already has an answer.
+func (s *Server) recoverRound(ctx context.Context, ureq *upstream.ChatRequest, manifest *tools.Manifest, res *round, kind tools.RecoveryKind) *round {
+	retryReq := ureq
+	switch {
+	case res.emptyToolAnswer():
+		// Legacy empty branch: fresh stream, same manifest.
+	case kind == tools.RecoveryTruncated:
+		retryReq = recoveryRequest(ureq, res, tools.RetryMessageTruncated(res.content))
+	case kind == tools.RecoveryParseFailed:
+		retryReq = recoveryRequest(ureq, res, tools.RetryMessageParseFailed(res.content))
+	}
+	s.logf("tools: %s, retrying once", retryLogReason(kind, res))
+	retry, err := s.readRound(ctx, retryReq, manifest)
+	if err != nil {
+		s.upErrors.Add(1)
+		s.logf("tools: recovery retry failed: %v (passing original round through)", err)
+		return res
+	}
+	return retry
+}
+
+// retryLogReason names the retry for the log line.
+func retryLogReason(kind tools.RecoveryKind, res *round) string {
+	if res.emptyToolAnswer() {
+		return "empty answer round (no text/call)"
+	}
+	return fmt.Sprintf("[recovery kind=%s] broken-call round", kind)
+}
+
+// recoveryRequestFor builds the ureq a broken-round native retry re-asks
+// with. The empty answer keeps the same manifest (legacy); the broken-call
+// kinds carry the original output plus the retry message.
+func recoveryRequestFor(ureq *upstream.ChatRequest, res *round, kind tools.RecoveryKind) *upstream.ChatRequest {
+	switch {
+	case res.emptyToolAnswer():
+		return ureq
+	case kind == tools.RecoveryTruncated:
+		return recoveryRequest(ureq, res, tools.RetryMessageTruncated(res.content))
+	case kind == tools.RecoveryParseFailed:
+		return recoveryRequest(ureq, res, tools.RetryMessageParseFailed(res.content))
+	}
+	return ureq
 }
 
 // emitToolCalls writes one delta frame per parsed call and returns the number
@@ -149,21 +244,29 @@ func emitToolCalls(w http.ResponseWriter, flusher http.Flusher, calls []tools.Ca
 // native search tool active it runs the internal loop first: every round is
 // consumed privately (no bytes) until the model stops calling web_search, and
 // only that final round is replayed as frames.
+//
+// The plain path consumes each round fully before any frame leaves (the
+// upstream sends whole answers in single events on this diffusion model, so
+// nothing is lost). That is what makes the recovery retry sound: a zero-call
+// round can be classified — clean prose, the measured empty answer, a
+// truncated call envelope, an unparseable block — BEFORE the client has seen
+// a byte, so a broken round never streams half its narration and the retry
+// result (call or prose) is passed through verbatim.
 func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, manifest *tools.Manifest, plan *toolPlan) {
 	if plan.native {
 		s.streamNative(w, r, ureq, model, plan)
 		return
 	}
 	rtag := wireTag()
-	stream, err := s.up.Chat(r.Context(), ureq, s.cfg.IdleTimeout, func(line string) {
-		s.logf("upstream: skipping malformed SSE line: %q", truncate(line, 200))
-	})
+	res, err := s.readRound(r.Context(), ureq, manifest)
 	if err != nil {
 		s.fail(w, s.upstreamError(err))
 		return
 	}
-	defer stream.Close()
-	s.streams.Add(1)
+	if kind, retry := s.retryKind(res, nil); retry {
+		res = s.recoverRound(r.Context(), ureq, manifest, res, kind)
+	}
+	wireDumpRound(rtag, res.content, res.calls)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -171,115 +274,13 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
+	s.streams.Add(1)
 
-	id := upstream.RandomID("chatcmpl")
-	created := s.now().Unix()
-	write := s.chunkWriter(w, flusher, id, created, model, rtag)
+	write := s.chunkWriter(w, flusher, upstream.RandomID("chatcmpl"), s.now().Unix(), model, rtag)
 	if !write(openai.Delta{Role: "assistant"}, nil) {
 		return
 	}
-
-	var cites upstream.CitationCollector
-	parser := tools.NewParser(manifest.Declared)
-	emitted := 0
-	// sawAlive tracks whether the round released anything past the opening
-	// role frame. The measured empty-answer failure mode (reasoning-only
-	// stream, no text, no calls) never does, so the retry happens before the
-	// first answer frame leaves. Reasoning deltas are buffered, not written,
-	// until the first content/call proves the round is alive.
-	sawAlive := false
-	bufReasoning := ""
-	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
-		cites.Observe(ev, s.logf)
-		defer wireDumpEvent(rtag, ev, 0, len(parser.Calls()))
-		switch ev.Type {
-		case upstream.EventReasoningDelta:
-			if sawAlive {
-				if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
-					return errClientGone
-				}
-			} else {
-				bufReasoning += ev.Reasoning()
-			}
-		case upstream.EventTextStart, upstream.EventTextDelta:
-			released := parser.Feed([]byte(ev.ContentText()))
-			if !sawAlive {
-				// First sign of life: flush the buffered reasoning, then go
-				// live. A <tool_call>-block call may release no text at all, so a
-				// parsed call alone also counts as alive.
-				sawAlive = true
-				if bufReasoning != "" {
-					if !write(openai.Delta{ReasoningContent: bufReasoning}, nil) {
-						return errClientGone
-					}
-					bufReasoning = ""
-				}
-			}
-			if len(released) > 0 && !write(openai.Delta{Content: string(released)}, nil) {
-				return errClientGone
-			}
-			emitted = emitToolCalls(w, flusher, parser.Calls(), emitted, write)
-			if len(parser.Calls()) > 0 {
-				sawAlive = true
-			}
-		}
-		return nil
-	})
-	// The measured empty-answer failure mode ends the upstream stream with
-	// nothing ever released. If no byte went out (and the client is still
-	// connected), re-ask ONCE with a fresh stream before writing anything.
-	// The retry consumes the same upstream contract; its result passes
-	// through verbatim, empty or not.
-	if readErr == nil && !sawAlive && len(parser.Calls()) == 0 {
-		stream.Close()
-		s.logf("tools: empty answer round (no text/call), retrying once")
-		stream2, err2 := s.up.Chat(r.Context(), ureq, s.cfg.IdleTimeout, func(line string) {
-			s.logf("upstream: skipping malformed SSE line: %q", truncate(line, 200))
-		})
-		if err2 == nil {
-			defer stream2.Close()
-			parser2 := tools.NewParser(manifest.Declared)
-			cites2 := upstream.CitationCollector{}
-			readErr2 := stream2.Reader.Read(r.Context(), func(ev upstream.Event) error {
-				cites2.Observe(ev, s.logf)
-				defer wireDumpEvent(rtag, ev, 0, len(parser2.Calls()))
-				switch ev.Type {
-				case upstream.EventReasoningDelta:
-					if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
-						return errClientGone
-					}
-				case upstream.EventTextStart, upstream.EventTextDelta:
-					released := parser2.Feed([]byte(ev.ContentText()))
-					if len(released) > 0 && !write(openai.Delta{Content: string(released)}, nil) {
-						return errClientGone
-					}
-					emitted = emitToolCalls(w, flusher, parser2.Calls(), emitted, write)
-				}
-				return nil
-			})
-			if readErr2 == nil {
-				cites = cites2
-				wireDumpRound(rtag, string(parser2.Flush()), parser2.Calls())
-				s.finishStream(w, flusher, write, parser2, cites, emitted)
-				return
-			}
-			// Retry also failed at transport level: fall through to the
-			// original stream's tail handling below (nothing was written).
-			s.upErrors.Add(1)
-			s.logf("upstream: retry stream failed after headers: %v", readErr2)
-			readErr = readErr2
-		} else {
-			s.upErrors.Add(1)
-			s.logf("upstream: retry open failed: %v", err2)
-			readErr = err2
-		}
-	}
-	if readErr != nil {
-		s.streamFailure(w, r, flusher, readErr)
-		return
-	}
-	wireDumpRound(rtag, string(parser.Flush()), parser.Calls())
-	s.finishStream(w, flusher, write, parser, cites, emitted)
+	s.replayRound(w, flusher, write, res, res.calls)
 }
 
 // streamNative consumes rounds privately until the model stops calling the
@@ -289,7 +290,6 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, plan *toolPlan) {
 	rtag := wireTag()
 	res, calls, err := s.resolveNative(r.Context(), ureq, plan)
-	wireDumpRound(rtag, res.content, calls)
 	if err != nil {
 		if nativeAbort(r, err) {
 			return
@@ -297,16 +297,18 @@ func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upst
 		s.fail(w, s.upstreamError(err))
 		return
 	}
-	// The measured empty-answer failure mode can land on the final round too.
-	// Nothing has been written yet, so the same one-shot retry applies.
-	if res.emptyToolAnswer() && len(calls) == 0 {
-		s.logf("tools: empty answer round (no text/call), retrying once")
-		if retry, retryCalls, err2 := s.resolveNative(r.Context(), ureq, plan); err2 == nil {
-			res, calls = retry, retryCalls
+	wireDumpRound(rtag, res.content, calls)
+	// The final round gets the same classification and one bounded retry as
+	// the plain path. Nothing has been written yet, so the retry is free.
+	if kind, doRetry := s.retryKind(res, calls); doRetry {
+		if retryRes, retryCalls, err2 := s.resolveNative(r.Context(), recoveryRequestFor(ureq, res, kind), plan); err2 == nil {
+			res, calls = retryRes, retryCalls
+			wireDumpRound(rtag, res.content, calls)
 		} else if nativeAbort(r, err2) {
 			return
 		} else {
-			s.logf("tools: native retry failed: %v", err2)
+			s.upErrors.Add(1)
+			s.logf("tools: native recovery retry failed: %v (passing original round through)", err2)
 		}
 	}
 
@@ -466,8 +468,23 @@ func (s *Server) completeTools(w http.ResponseWriter, r *http.Request, ureq *ups
 		return
 	}
 	if plan.native {
+		// The native loop's final round gets the same classification and one
+		// bounded retry as the plain path. The retry re-enters the native
+		// loop (not a bare readRound) so a retry round that calls web_search
+		// is served internally rather than leaked to the client.
+		if kind, doRetry := s.retryKind(res, calls); doRetry {
+			if retryRes, retryCalls, err2 := s.resolveNative(r.Context(), recoveryRequestFor(ureq, res, kind), plan); err2 == nil {
+				res, calls = retryRes, retryCalls
+			} else {
+				s.upErrors.Add(1)
+				s.logf("tools: native recovery retry failed: %v (passing original round through)", err2)
+			}
+		}
 		s.writeToolCompletion(w, model, res.content, res.reasoning, calls, res.cites.Citations())
 		return
+	}
+	if kind, retry := s.retryKind(res, nil); retry {
+		res = s.recoverRound(r.Context(), ureq, manifest, res, kind)
 	}
 	s.writeToolCompletion(w, model, res.content, res.reasoning, res.calls, res.cites.Citations())
 }

@@ -142,7 +142,157 @@ func (m *Manifest) header() string {
 	}
 	sk := activeSkeleton()
 	preamble := sk.lead + "\n\n" + defs.String() + sk.contract + "\n"
+	// Additions after the measured skeleton (wire-format law: the skeleton
+	// wording is protocol and stays byte-identical; these lines are added
+	// mechanisms only) — a concrete worked example of the marker block and
+	// the continuation rule that breaks the narrate-no-call stall.
+	if ex := workedExample(m.tools); ex != "" {
+		preamble += ex + "\n"
+	}
+	preamble += continuationRuleSentence + "\n"
 	return preamble + m.instructions
+}
+
+// continuationRuleSentence is the anti-stall rule, appended to every preamble
+// style. It targets the narrate-no-call stall: after consuming a tool result
+// the model sometimes ends its turn with a plan narration and zero call
+// blocks — a self-reinforcing pattern once one such turn is in history.
+const continuationRuleSentence = "After a tool result arrives, if the task is not yet complete, immediately call the next tool. Never end your turn with only a description of what you are about to do."
+
+// workedExample renders a concrete marker-block example from the FIRST
+// declared tool's real name and a minimal argument shape derived from its
+// parameters schema. A concrete example of the exact wire shape is cheaper
+// for the model to imitate than prose alone. Blank-named or no tools skip
+// the example entirely.
+func workedExample(list []Tool) string {
+	if len(list) == 0 || strings.TrimSpace(list[0].Name) == "" {
+		return ""
+	}
+	t := list[0]
+	return "Example: " + callStart + `{"name":` + quoteJSON(t.Name) +
+		`,"arguments":` + exampleArguments(t.Parameters) + "}" + callEnd
+}
+
+// exampleArguments derives a minimal argument object from a JSON schema.
+// When the schema lists required properties only those are rendered;
+// otherwise every property renders, in schema order so the example mirrors
+// the definition line the model just read. Type mapping: string -> "...",
+// integer/number -> 1, boolean -> true, object -> {}, array -> [],
+// anything else -> "". An absent or unparseable schema renders {}.
+func exampleArguments(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "{}"
+	}
+	names, props, required, ok := schemaProperties([]byte(trimmed))
+	if !ok {
+		return "{}"
+	}
+	if len(required) == 0 {
+		required = names
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	first := true
+	for _, name := range required {
+		prop, ok := props[name]
+		if !ok {
+			continue
+		}
+		if !first {
+			b.WriteByte(',')
+		}
+		first = false
+		b.WriteString(quoteJSON(name))
+		b.WriteByte(':')
+		b.WriteString(exampleValue(prop))
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+// schemaProperties walks a schema's properties object in document order and
+// its required list. ok is false when raw is not a parseable schema object.
+func schemaProperties(raw []byte) (names []string, props map[string]json.RawMessage, required []string, ok bool) {
+	props = make(map[string]json.RawMessage)
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil, nil, nil, false
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, nil, nil, false
+		}
+		key, _ := keyTok.(string)
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, nil, nil, false
+		}
+		switch key {
+		case "properties":
+			names, ok = objectKeys(value)
+			if !ok {
+				return nil, nil, nil, false
+			}
+			if err := json.Unmarshal(value, &props); err != nil {
+				return nil, nil, nil, false
+			}
+		case "required":
+			if err := json.Unmarshal(value, &required); err != nil {
+				required = nil
+			}
+		}
+	}
+	return names, props, required, true
+}
+
+// objectKeys returns the keys of a JSON object in document order.
+func objectKeys(raw json.RawMessage) ([]string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil, false
+	}
+	var keys []string
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, false
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, false
+		}
+		keys = append(keys, key)
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return nil, false
+		}
+	}
+	return keys, true
+}
+
+// exampleValue renders the minimal placeholder for one schema property.
+func exampleValue(prop json.RawMessage) string {
+	var p struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(prop, &p)
+	switch p.Type {
+	case "string":
+		return `"..."`
+	case "integer", "number":
+		return "1"
+	case "boolean":
+		return "true"
+	case "object":
+		return "{}"
+	case "array":
+		return "[]"
+	}
+	return `"..."` // unknown or absent type: a string is the safest shape
 }
 
 // The skeleton carries the call contract in prose; it deliberately renders no
