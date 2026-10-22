@@ -23,8 +23,6 @@ var wireSeq atomic.Int64
 
 func init() { wireDebug.Store(os.Getenv("IL2API_WIRE_DEBUG") == "on") }
 
-func wireDebugEnabled() bool { return wireDebug.Load() }
-
 // wireLog writes one line to stderr with a request tag so concurrent streams
 // can be told apart.
 func wireLog(tag, format string, args ...any) {

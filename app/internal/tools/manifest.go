@@ -159,18 +159,32 @@ func (m *Manifest) header() string {
 // blocks — a self-reinforcing pattern once one such turn is in history.
 const continuationRuleSentence = "After a tool result arrives, if the task is not yet complete, immediately call the next tool. Never end your turn with only a description of what you are about to do."
 
-// workedExample renders a concrete marker-block example from the FIRST
-// declared tool's real name and a minimal argument shape derived from its
-// parameters schema. A concrete example of the exact wire shape is cheaper
-// for the model to imitate than prose alone. Blank-named or no tools skip
-// the example entirely.
+// workedExample renders concrete marker-block examples from the declared
+// tools' real names and minimal argument shapes derived from their parameter
+// schemas, one "Example:" line per tool for up to TWO tools — parity with the
+// reference implementations (ToolForge xyml.py _example_input_from_tool,
+// toolkit render.go). A concrete example of the exact wire shape is cheaper
+// for the model to imitate than prose alone. Blank-named tools are skipped
+// (the next named tool takes the slot) and a name is never rendered twice.
+// No tools at all skips the examples entirely.
 func workedExample(list []Tool) string {
-	if len(list) == 0 || strings.TrimSpace(list[0].Name) == "" {
-		return ""
+	var b strings.Builder
+	seen := make(map[string]bool, 2)
+	for _, t := range list {
+		if strings.TrimSpace(t.Name) == "" || seen[t.Name] {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		seen[t.Name] = true
+		b.WriteString("Example: " + callStart + `{"name":` + quoteJSON(t.Name) +
+			`,"arguments":` + exampleArguments(t.Parameters) + "}" + callEnd)
+		if len(seen) == 2 {
+			break
+		}
 	}
-	t := list[0]
-	return "Example: " + callStart + `{"name":` + quoteJSON(t.Name) +
-		`,"arguments":` + exampleArguments(t.Parameters) + "}" + callEnd
+	return b.String()
 }
 
 // exampleArguments derives a minimal argument object from a JSON schema.
@@ -275,12 +289,73 @@ func objectKeys(raw json.RawMessage) ([]string, bool) {
 }
 
 // exampleValue renders the minimal placeholder for one schema property.
+// JSON Schema allows "type" to be either a single name or an array of names
+// (e.g. ["string","null"] for a nullable string); an array picks the example
+// from the first non-"null" entry, with the concrete-type precedence
+// array > object > boolean > integer/number > string when several concrete
+// types are listed (mirroring ToolForge's _example_value).
 func exampleValue(prop json.RawMessage) string {
 	var p struct {
-		Type string `json:"type"`
+		Type json.RawMessage `json:"type"`
 	}
-	_ = json.Unmarshal(prop, &p)
-	switch p.Type {
+	if err := json.Unmarshal(prop, &p); err != nil {
+		return `"..."` // unparseable property: a string is the safest shape
+	}
+	return exampleForType(p.Type)
+}
+
+// exampleForType maps a schema "type" value — single name, array of names, or
+// absent — to the minimal example placeholder.
+func exampleForType(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return `"..."` // absent type: a string is the safest shape
+	}
+	var names []string
+	if strings.HasPrefix(trimmed, "[") {
+		if err := json.Unmarshal(raw, &names); err != nil {
+			return `"..."`
+		}
+	} else {
+		var single string
+		if err := json.Unmarshal(raw, &single); err != nil {
+			return `"..."`
+		}
+		names = []string{single}
+	}
+	if len(names) == 0 {
+		return `"..."`
+	}
+	// First non-"null" entry; when several concrete types remain, the
+	// precedence order below decides (array > object > boolean > number >
+	// string), not list position.
+	var pick string
+	set := make(map[string]bool, len(names))
+	for _, n := range names {
+		if n == "null" {
+			continue
+		}
+		if !set[n] {
+			set[n] = true
+			if pick == "" {
+				pick = n
+			}
+		}
+	}
+	for _, preferred := range []string{"array", "object", "boolean", "integer", "number", "string"} {
+		if set[preferred] {
+			return exampleForName(preferred)
+		}
+	}
+	if pick != "" {
+		return `"..."` // a concrete type we do not model: safest shape
+	}
+	return `"..."` // all-null type array
+}
+
+// exampleForName renders the placeholder for one concrete schema type name.
+func exampleForName(name string) string {
+	switch name {
 	case "string":
 		return `"..."`
 	case "integer", "number":
@@ -292,7 +367,7 @@ func exampleValue(prop json.RawMessage) string {
 	case "array":
 		return "[]"
 	}
-	return `"..."` // unknown or absent type: a string is the safest shape
+	return `"..."`
 }
 
 // The skeleton carries the call contract in prose; it deliberately renders no

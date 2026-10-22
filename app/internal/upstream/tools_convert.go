@@ -7,17 +7,6 @@ import (
 	"inceptionlabs2api/internal/tools"
 )
 
-// NewToolChatRequest is NewChatRequest plus an optional tool preamble and
-// tool-aware history. A nil manifest and a history with no tool payloads take
-// exactly the legacy path, so a caller may pass them unconditionally.
-func NewToolChatRequest(msgs []openai.TextMessage, effort string, m *tools.Manifest) *ChatRequest {
-	hist := make([]openai.History, 0, len(msgs))
-	for _, msg := range msgs {
-		hist = append(hist, openai.History{Role: msg.Role, Texts: msg.Texts})
-	}
-	return NewToolChatRequestHistory(hist, effort, m)
-}
-
 // NewToolChatRequestHistory builds the upstream body from tool-aware history.
 //
 // Placement follows the Qwen/Hermes templates: the tool preamble is a system

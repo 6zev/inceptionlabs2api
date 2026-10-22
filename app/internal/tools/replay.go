@@ -40,10 +40,15 @@ func RenderAssistant(text string, calls []EncodedCall) string {
 	}
 	var b strings.Builder
 	b.WriteString(text)
+	// Each rendered block ends with '\n', so only the transition out of the
+	// opening text can need a separator — tracked instead of re-reading the
+	// builder's tail (which would copy the whole buffer per call).
+	needNL := b.Len() > 0 && !strings.HasSuffix(text, "\n")
 	for _, c := range calls {
-		if b.Len() > 0 && !strings.HasSuffix(b.String(), "\n") {
+		if needNL {
 			b.WriteByte('\n')
 		}
+		needNL = false
 		b.WriteString(callStart)
 		b.WriteString(`{"id":`)
 		b.WriteString(quoteJSON(c.ID))
@@ -124,13 +129,15 @@ func RenderResults(results []Result) string {
 }
 
 // attrEscape makes a value safe inside a double-quoted bracket attribute: it
-// removes the characters that could terminate the attribute or forge a new
-// line. XML entity escaping is intentionally NOT applied — the block is not
-// XML and entities would reach the model literally.
+// replaces the characters that could terminate the attribute or forge a new
+// line with visible substitutes (] becomes the fullwidth 〕, U+3015, so a
+// client id or name containing ] stays recognizably readable instead of being
+// silently destroyed). XML entity escaping is intentionally NOT applied — the
+// block is not XML and entities would reach the model literally.
 func attrEscape(s string) string {
 	r := strings.NewReplacer(
 		`"`, `'`,
-		"]", "",
+		"]", "〕",
 		"\n", " ",
 		"\r", " ",
 	)
