@@ -70,8 +70,8 @@ token，聊天请求带上 `x-session-token` 即可。本项目把这条链路�
   在没有偏移信息时按约定为 0；`__searching__` 静默忽略，`__search_error__` 只记日志、
   不中断回答。
 
-范围之外（刻意不做）：usage/token 统计、工具调用、搜索答案正文（只桥接来源）、
-管理面板。设计细节见 [docs/SPEC.md](docs/SPEC.md)。
+范围之外（刻意不做）：usage/token 统计、搜索答案正文（只桥接来源）、管理面板。
+设计细节见 [docs/SPEC.md](docs/SPEC.md)。
 
 ## 快速开始
 
@@ -239,9 +239,15 @@ curl http://localhost:3000/v1/chat/completions \
   写完——这些一律作为**普通文本**返回，绝不报错。流式响应在块完整后才发出
   `tool_calls` 增量，并以 `finish_reason:"tool_calls"` 结束；同步响应形状相同。
 - **一个上游特性要知道：** 系统提示里的工具脚手架有时会让上游返回**空回答**
-  （只有 reasoning 事件、没有正文）。网关会把空回答如实返回为 `content:""` +
-  `finish_reason:"stop"`，不重试、不伪造调用。具体措辞与命中率见
+  （只有 reasoning 事件、没有正文）。流式路径会先静默重试一次；重试仍是空回答时
+  如实返回 `content:""` + `finish_reason:"stop"`，不伪造调用。具体措辞与命中率见
   `DESIGN-TOOLS.md` §1.1。
+- **原生 `web_search`（`IL2API_NATIVE_WEB_SEARCH=on`）：** 请求带 `tools` 但没
+  自己声明 `web_search` 时，网关会在同一份提示词里追加一个由网关执行的
+  `web_search` 工具。模型调用它时，网关用 `/v1/web_search` 的同一检索后端执行，
+  把 `{"object":"web_search","as_of":"YYYY-MM-DD","queries":[…],"results":[…]}` 作为
+  工具结果回填，然后继续同一轮生成；每个请求最多 3 次，客户端只看到最终回答。
+  客户端自己声明了 `web_search` 时该名字归客户端所有，网关不接管。
 
 ### 独立联网搜索 `POST /v1/web_search`
 
