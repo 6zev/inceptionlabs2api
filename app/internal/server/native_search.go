@@ -133,8 +133,8 @@ func (s *Server) serveNativeCalls(ctx context.Context, calls []tools.Call, conte
 	return append([]openai.History{assistant}, out...), budget, nil
 }
 
-// nativePending reports whether a hard local error means the stream must stop.
-// A client cancellation is not written anywhere.
+// nativeAbort reports whether a client cancellation means nothing should be
+// written. It mirrors the check the plain streaming path makes inline.
 func nativeAbort(r *http.Request, err error) bool {
 	return errors.Is(err, context.Canceled) && r.Context().Err() != nil
 }
