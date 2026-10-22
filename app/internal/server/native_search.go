@@ -68,13 +68,15 @@ func errorContent(msg string) string {
 // nativeSearch runs one call against the attached retrieval backend under a
 // bounded timeout. The returned content is always a tool result; err is set
 // only for a hard local failure that must surface as an OpenAI error frame.
-func (s *Server) nativeSearch(ctx context.Context, call tools.Call) (string, error) {
+// The run's sources are returned alongside so the loop can build client
+// annotations; a failed or error-shaped result yields none.
+func (s *Server) nativeSearch(ctx context.Context, call tools.Call) (string, []upstream.SearchSource, error) {
 	if s.se == nil {
-		return "", upstream.ErrUnavailable
+		return "", nil, upstream.ErrUnavailable
 	}
 	req, re := decodeWebSearch([]byte(call.Arguments))
 	if re != nil {
-		return errorContent(re.Message), nil
+		return errorContent(re.Message), nil, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.SearchTimeout)
 	defer cancel()
@@ -84,16 +86,16 @@ func (s *Server) nativeSearch(ctx context.Context, call tools.Call) (string, err
 		switch {
 		case errors.As(err, &se):
 			s.logf("tools: native search failed: %s", truncate(se.Message, 300))
-			return errorContent(truncate(se.Message, 1000)), nil
+			return errorContent(truncate(se.Message, 1000)), nil, nil
 		case errors.Is(err, upstream.ErrSearchIncomplete):
-			return errorContent("upstream search closed before returning results"), nil
+			return errorContent("upstream search closed before returning results"), nil, nil
 		case errors.Is(err, upstream.ErrIdleTimeout), errors.Is(err, context.DeadlineExceeded):
 			s.logf("tools: native search timed out: %v", err)
-			return errorContent("search timed out"), nil
+			return errorContent("search timed out"), nil, nil
 		}
-		return "", err
+		return "", nil, err
 	}
-	return nativeSearchContent(res, s.now().UTC().Format("2006-01-02")), nil
+	return nativeSearchContent(res, s.now().UTC().Format("2006-01-02")), res.Sources, nil
 }
 
 // nativeRound splits a parsed round into the calls the gateway serves itself
@@ -111,8 +113,10 @@ func nativeRound(calls []tools.Call) (native, client []tools.Call) {
 
 // serveNativeCalls answers every web_search call in one round and returns the
 // history a re-ask must carry: the assistant turn as emitted plus one result
-// per call. budget is the number of searches already run.
-func (s *Server) serveNativeCalls(ctx context.Context, calls []tools.Call, content string, budget int) ([]openai.History, int, error) {
+// per call. budget is the number of searches already run. cites collects the
+// sources each successful run retrieved, so resolveNative can attach them to
+// the client-facing answer as annotations.
+func (s *Server) serveNativeCalls(ctx context.Context, calls []tools.Call, content string, budget int, cites *sourceCollector) ([]openai.History, int, error) {
 	assistant := openai.History{Role: "assistant"}
 	if content != "" {
 		assistant.Texts = []string{content}
@@ -127,16 +131,55 @@ func (s *Server) serveNativeCalls(ctx context.Context, calls []tools.Call, conte
 		})
 		result := `{"error":"search budget exhausted"}`
 		if budget < nativeSearchBudget {
-			r, err := s.nativeSearch(ctx, c)
+			r, sources, err := s.nativeSearch(ctx, c)
 			if err != nil {
 				return nil, budget, err
 			}
 			result = r
+			if cites != nil {
+				cites.add(sources)
+			}
 			budget++
 		}
 		out = append(out, openai.History{Role: "user", Results: []openai.ToolResult{{CallID: id, Content: result}}})
 	}
 	return append([]openai.History{assistant}, out...), budget, nil
+}
+
+// nativeMaxCitations mirrors the chat-path annotation cap (upstream's own
+// maxCitations): it bounds one answer's annotation frame against a hostile
+// upstream even at the full search budget (3 runs x 50 sources).
+const nativeMaxCitations = 50
+
+// sourceCollector merges native-search sources into the citation shape the
+// chat path produces (url_citation annotations), deduped by URL in
+// first-seen order. Titles arrive already normalized by the upstream
+// collector, so they pass through unchanged.
+type sourceCollector struct {
+	cites []openai.Citation
+	seen  map[string]struct{}
+}
+
+func (c *sourceCollector) add(sources []upstream.SearchSource) {
+	for _, s := range sources {
+		if len(c.cites) >= nativeMaxCitations {
+			return
+		}
+		if c.seen == nil {
+			c.seen = make(map[string]struct{})
+		}
+		if _, dup := c.seen[s.URL]; dup {
+			continue
+		}
+		c.seen[s.URL] = struct{}{}
+		c.cites = append(c.cites, openai.Citation{
+			Type:       "url_citation",
+			URL:        s.URL,
+			Title:      s.Title,
+			StartIndex: 0,
+			EndIndex:   0,
+		})
+	}
 }
 
 // nativeAbort reports whether a client cancellation means nothing should be

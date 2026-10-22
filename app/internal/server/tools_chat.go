@@ -77,6 +77,30 @@ type round struct {
 	reasoning string
 	calls     []tools.Call
 	cites     upstream.CitationCollector
+	// nativeCites carries the sources the native search loop retrieved, in
+	// first-seen order, deduped by URL. Index is assigned in annotations()
+	// so chat-path citations and search sources stay in one 1-based space.
+	nativeCites []openai.Citation
+}
+
+// annotations returns the citations the client-facing answer carries: the
+// chat stream's source-url citations plus, on the native path, the search
+// loop's retrieved sources. On the native path the chat collector stays
+// empty (webSearchEnabled is false with a manifest), and vice versa, so the
+// two families never overlap in practice — the merge is order-preserving
+// regardless.
+func (r *round) annotations() []openai.Citation {
+	base := r.cites.Citations()
+	if len(r.nativeCites) == 0 {
+		return base
+	}
+	out := make([]openai.Citation, 0, len(base)+len(r.nativeCites))
+	out = append(out, base...)
+	for i, c := range r.nativeCites {
+		c.Index = len(base) + i + 1
+		out = append(out, c)
+	}
+	return out
 }
 
 // readRound opens one upstream stream and consumes it fully.
@@ -327,13 +351,17 @@ func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upst
 // resolveNative runs the internal web_search loop: read a round, serve every
 // native call, append its result, and re-ask. It returns the first round with
 // no native call plus any client calls accumulated from internal rounds (they
-// are emitted with the final answer so no client tool call is lost).
+// are emitted with the final answer so no client tool call is lost). Every
+// source the loop retrieved is attached to the returned round as annotations,
+// so the client sees the citations the answer's [n] markers refer to even
+// though the tool path never fires source-url events.
 func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, plan *toolPlan) (*round, []tools.Call, error) {
 	manifest := plan.manifest
 	hist := plan.hist
 	effort := ureq.ReasoningEffort
 	budget := 0
 	var pending []tools.Call
+	var cites sourceCollector
 	// One round per allowed search, plus the round that reports the budget
 	// exhaustion, plus a final round the model answers in. A model that keeps
 	// calling past that is resolved with the calls stripped rather than looped.
@@ -347,9 +375,10 @@ func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, 
 		last = res
 		native, client := nativeRound(res.calls)
 		if len(native) == 0 {
+			res.nativeCites = cites.cites
 			return res, append(pending, client...), nil
 		}
-		step, used, err := s.serveNativeCalls(ctx, native, res.content, budget)
+		step, used, err := s.serveNativeCalls(ctx, native, res.content, budget, &cites)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -361,6 +390,7 @@ func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, 
 	// round, with the unresolved native calls stripped. A refusal-by-loop is
 	// not a client-visible error; the stream still closes normally.
 	s.logf("tools: native search round cap reached; answering with the last round")
+	last.nativeCites = cites.cites
 	return last, pending, nil
 }
 
@@ -379,7 +409,7 @@ func (s *Server) replayRound(w http.ResponseWriter, flusher http.Flusher, write 
 	if len(calls) > 0 {
 		finish = "tool_calls"
 	}
-	if !write(openai.Delta{Annotations: res.cites.Citations()}, &finish) {
+	if !write(openai.Delta{Annotations: res.annotations()}, &finish) {
 		return
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
@@ -436,13 +466,13 @@ func (s *Server) completeTools(w http.ResponseWriter, r *http.Request, ureq *ups
 				s.logf("tools: native recovery retry failed: %v (passing original round through)", err2)
 			}
 		}
-		s.writeToolCompletion(w, model, res.content, res.reasoning, calls, res.cites.Citations())
+		s.writeToolCompletion(w, model, res.content, res.reasoning, calls, res.annotations())
 		return
 	}
 	if kind, retry := s.retryKind(res, nil); retry {
 		res = s.recoverRound(r.Context(), ureq, manifest, res, kind)
 	}
-	s.writeToolCompletion(w, model, res.content, res.reasoning, res.calls, res.cites.Citations())
+	s.writeToolCompletion(w, model, res.content, res.reasoning, res.calls, res.annotations())
 }
 
 // writeToolCompletion writes the aggregated chat.completion for tool output.

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"inceptionlabs2api/internal/openai"
 	"inceptionlabs2api/internal/upstream"
 )
 
@@ -21,18 +21,18 @@ import (
 func callOpenMarker() string  { return "<tool_" + "call>" }
 func callCloseMarker() string { return "</tool" + "_call>" }
 
-// sseCall renders one marker-protocol tool call as an SSE round body.
+// sseCallRaw renders one marker-protocol tool call as an SSE round body,
+// without JSON HTML escaping (see below).
 func sseCall(name, args string) string {
-	return sseText(callOpenMarker() + `{"name":"` + name + `","arguments":` + args + `}` + callCloseMarker())
+	return sseCallRaw(name, args)
 }
 
 // mockSearcher scripts one SearchResult per queued run and records requests.
 type mockSearcher struct {
-	mu    sync.Mutex
-	runs  []*upstream.SearchResult
-	errs  []error
-	reqs  []*upstream.SearchRequest
-	slept time.Duration // unused; kept nil-safe
+	mu   sync.Mutex
+	runs []*upstream.SearchResult
+	errs []error
+	reqs []*upstream.SearchRequest
 }
 
 func (m *mockSearcher) Search(ctx context.Context, req *upstream.SearchRequest, idle time.Duration) (*upstream.SearchResult, error) {
@@ -161,9 +161,130 @@ func TestWebSearchEndpointOmitsAnswerWhenUpstreamHasNone(t *testing.T) {
 	}
 }
 
-// Unused import guards for helpers shared with later components.
-var (
-	_ io.Reader     = strings.NewReader("")
-	_ time.Duration = time.Second
-	_ http.Handler  = http.DefaultServeMux
-)
+// --- Component 3: native search sources reach the client as annotations ---
+
+// nativeFlow scripts a two-round native search: the model calls web_search,
+// then answers. Returns the mock chatter and the searcher.
+func nativeFlow() (*mockChatter, *mockSearcher) {
+	search := sseCallRaw("web_search", `{"query":"go 1.27 release date"}`)
+	final := "Go 1.27 was released on August 19, 2026 [1][2]."
+	return &mockChatter{rounds: []string{search, sseText(final)}}, &mockSearcher{runs: []*upstream.SearchResult{go127Run()}}
+}
+
+func TestNativeSearchSourcesBecomeAnnotationsNonStream(t *testing.T) {
+	mock, se := nativeFlow()
+	s := newNativeServer(t, mock, se)
+	w := postChat(t, s, weatherRequest(false))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	var comp openai.Completion
+	if err := json.Unmarshal(w.Body.Bytes(), &comp); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	cites := comp.Choices[0].Message.Annotations
+	if len(cites) != 2 {
+		t.Fatalf("annotations = %+v, want the two search sources", cites)
+	}
+	if cites[0].URL != "https://go.dev/doc/go1.27" || cites[0].Type != "url_citation" || cites[0].Index != 1 {
+		t.Fatalf("first citation wrong: %+v", cites[0])
+	}
+	if cites[1].URL != "https://go.dev/blog/go1.27" || cites[1].Index != 2 {
+		t.Fatalf("second citation wrong: %+v", cites[1])
+	}
+	if cites[0].Title != "Go 1.27 Release Notes" {
+		t.Fatalf("title must pass through: %+v", cites[0])
+	}
+	if comp.Choices[0].Message.Content != "Go 1.27 was released on August 19, 2026 [1][2]." {
+		t.Fatalf("final answer must pass through: %q", comp.Choices[0].Message.Content)
+	}
+}
+
+func TestNativeSearchSourcesBecomeAnnotationsStream(t *testing.T) {
+	mock, se := nativeFlow()
+	s := newNativeServer(t, mock, se)
+	w := postChat(t, s, weatherRequest(true))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	var got []openai.Citation
+	for _, c := range streamFrames(t, w.Body.String()) {
+		got = append(got, c.Choices[0].Delta.Annotations...)
+	}
+	if len(got) != 2 || got[0].URL != "https://go.dev/doc/go1.27" || got[1].URL != "https://go.dev/blog/go1.27" {
+		t.Fatalf("streamed annotations = %+v, want the two search sources", got)
+	}
+}
+
+func TestNoNativeSearchMeansNoAnnotations(t *testing.T) {
+	// Native search off: even though the round is identical, no source
+	// events fire on the tool path and no annotations may appear.
+	mock, _ := nativeFlow()
+	s := newTestServer(t, mock) // NativeWebSearch unset
+	w := postChat(t, s, weatherRequest(false))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	var comp openai.Completion
+	if err := json.Unmarshal(w.Body.Bytes(), &comp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if cites := comp.Choices[0].Message.Annotations; len(cites) != 0 {
+		t.Fatalf("plain path must not gain annotations: %+v", cites)
+	}
+}
+
+func TestNativeSearchDedupesSourcesAcrossSearches(t *testing.T) {
+	// Two searches returning one shared and one distinct source each:
+	// annotations carry three citations, first-seen order, deduped by URL.
+	shared := "https://go.dev/doc/go1.27"
+	s1 := &upstream.SearchResult{Sources: []upstream.SearchSource{
+		{Title: "Go 1.27 Release Notes", URL: shared, Score: 0.97},
+		{Title: "Go Blog A", URL: "https://go.dev/blog/a", Score: 0.9},
+	}}
+	s2 := &upstream.SearchResult{Sources: []upstream.SearchSource{
+		{Title: "Go 1.27 Release Notes (dup)", URL: shared, Score: 0.5},
+		{Title: "Go Blog B", URL: "https://go.dev/blog/b", Score: 0.8},
+	}}
+	call1 := sseCallRaw("web_search", `{"query":"go 1.27"}`)
+	call2 := sseCallRaw("web_search", `{"query":"go 1.27 features"}`)
+	final := "done"
+	mock := &mockChatter{rounds: []string{call1, call2, sseText(final)}}
+	se := &mockSearcher{runs: []*upstream.SearchResult{s1, s2}}
+	s := newNativeServer(t, mock, se)
+	w := postChat(t, s, weatherRequest(false))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	var comp openai.Completion
+	if err := json.Unmarshal(w.Body.Bytes(), &comp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	cites := comp.Choices[0].Message.Annotations
+	if len(cites) != 3 {
+		t.Fatalf("annotations = %+v, want 3 deduped citations", cites)
+	}
+	if cites[0].URL != shared || cites[1].URL != "https://go.dev/blog/a" || cites[2].URL != "https://go.dev/blog/b" {
+		t.Fatalf("first-seen order broken: %+v", cites)
+	}
+}
+
+// sseCallRaw is sseCall without JSON HTML escaping: the wire format carries
+// the call markers as raw bytes, and encoding/json's default < > escaping
+// would corrupt them into </> forms the parser never sees.
+func sseCallRaw(name, args string) string {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	payload := map[string]any{"name": name, "arguments": json.RawMessage(args)}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	_ = enc.Encode(upstream.Event{Type: upstream.EventTextStart, Snapshot: callOpenMarker() + string(raw) + callCloseMarker()})
+	return "data: " + strings.TrimRight(b.String(), "\n") + "\n\ndata: [DONE]\n\n"
+}
