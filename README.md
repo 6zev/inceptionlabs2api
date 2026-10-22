@@ -43,13 +43,31 @@ curl http://localhost:3000/v1/chat/completions \
 
 | Route | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | Chat, streaming + tool calls |
-| `POST /v1/web_search` | Standalone retrieval |
+| `POST /v1/chat/completions` | Chat, streaming + tool calls + gateway web_search loop |
+| `POST /v1/web_search` | Standalone web search (query + optional config) |
 | `POST /v1/audio/speech` | Text-to-speech |
-| `POST /v1/audio/transcriptions` | Speech-to-text |
+| `POST /v1/audio/transcriptions` | Speech-to-text (multipart upload) |
 | `POST /v1/decisions` | Structured decision tasks |
 | `GET /v1/models` | Model list |
 | `GET /healthz` | Liveness + pool state |
+
+### Tool calling
+
+Any OpenAI-style `tools` array works — the model emits standard `tool_calls`,
+and a tool result sent back as a `role:"tool"` message continues the loop:
+
+```json
+{
+  "model": "mercury-3",
+  "tools": [{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+  "tool_choice": "auto",
+  "messages": [{"role":"user","content":"Weather in Tokyo?"}]
+}
+```
+
+`web_search` is additionally built into the gateway: when enabled, the model
+can search the live web mid-answer and cite results, without any client-side
+tool definitions.
 
 ## Configuration (key env)
 
