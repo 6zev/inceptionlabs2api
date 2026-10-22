@@ -34,7 +34,6 @@ var PreStyle = "hermes"
 type skeleton struct {
 	lead     string // opening sentence before the definition lines
 	contract string // the call-contract sentence after the definitions
-	expanded string // opening sentence used by Expand (tiered rebuild)
 }
 
 // hermesSkeleton is the hermes-compact skeleton from the 14-probe wording
