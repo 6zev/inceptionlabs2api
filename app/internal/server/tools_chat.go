@@ -11,11 +11,6 @@ import (
 	"inceptionlabs2api/internal/upstream"
 )
 
-// maxRounds bounds the internal re-ask loop for a tiered manifest: one initial
-// round plus at most two schema expansions (SPEC §4.1.1). It does not bound the
-// client's own agent loop, which is client-driven and stateless here.
-const maxRounds = 3
-
 // toolPlan is the request-scoped state derived from tools/tool_choice.
 type toolPlan struct {
 	manifest *tools.Manifest
@@ -64,21 +59,11 @@ func planTools(req *openai.ChatRequest, native *tools.Tool) (*toolPlan, *openai.
 	return &toolPlan{manifest: manifest, hist: hist, native: native != nil}, nil
 }
 
-// chatWithTools answers a request whose tools are active. A tiered manifest is
-// resolved in full before any bytes are written (the loader needs another
-// round); a flat manifest streams. The native web_search loop likewise
-// resolves internally first, so a flat manifest with native search on takes
-// the pre-buffered path too.
+// chatWithTools answers a request whose tools are active. A plain manifest
+// streams; the native web_search loop resolves internally first, so a
+// manifest with native search on takes the pre-buffered path.
 func (s *Server) chatWithTools(w http.ResponseWriter, r *http.Request, req *openai.ChatRequest, plan *toolPlan) {
 	ureq := upstream.NewToolChatRequestHistory(plan.hist, req.ReasoningEffort, plan.manifest)
-	if plan.manifest.Loader {
-		if req.Stream {
-			s.streamTiered(w, r, req, plan)
-			return
-		}
-		s.completeTiered(w, r, req, plan)
-		return
-	}
 	if req.Stream {
 		s.streamTools(w, r, ureq, req.Model, plan.manifest, plan)
 		return
@@ -137,46 +122,6 @@ func (r *round) emptyToolAnswer() bool {
 	return r.content == "" && r.reasoning == "" && len(r.calls) == 0
 }
 
-// resolveRounds runs the tiered loop: read a round, and if it called the
-// schema loader, expand and re-ask. Intermediate rounds are internal steps; the
-// returned round is the one the client sees. The loop bound is maxRounds.
-func (s *Server) resolveRounds(ctx context.Context, req *openai.ChatRequest, plan *toolPlan) (*round, error) {
-	manifest := plan.manifest
-	loaded := false
-	for round := 0; round < maxRounds; round++ {
-		ureq := upstream.NewToolChatRequestHistory(plan.hist, req.ReasoningEffort, manifest)
-		res, err := s.readRound(ctx, ureq, manifest)
-		if err != nil {
-			return nil, err
-		}
-		loader := -1
-		for i, c := range res.calls {
-			if c.Name == loaderName {
-				loader = i
-				break
-			}
-		}
-		if loader < 0 {
-			return res, nil
-		}
-		loaderCall := res.calls[loader]
-		// The loader is never a client-visible call, whether or not it
-		// resolves; any sibling calls in the same round stand.
-		res.calls = append(res.calls[:loader], res.calls[loader+1:]...)
-		if loaded {
-			// Second loader call: stop resolving and answer with what we have.
-			return res, nil
-		}
-		expanded := manifest.Expand(loaderCall.Arguments)
-		if len(expanded) == 0 {
-			return res, nil
-		}
-		manifest = manifest.Expanded(expanded)
-		loaded = true
-	}
-	return nil, fmt.Errorf("tools: round resolution exhausted")
-}
-
 // emitToolCalls writes one delta frame per parsed call and returns the number
 // emitted so far.
 func emitToolCalls(w http.ResponseWriter, flusher http.Flusher, calls []tools.Call, emitted int, write func(openai.Delta, *string) bool) int {
@@ -198,7 +143,7 @@ func emitToolCalls(w http.ResponseWriter, flusher http.Flusher, calls []tools.Ca
 	return emitted
 }
 
-// streamTools is the streaming path for a non-tiered manifest. With the
+// streamTools is the streaming path for a plain manifest. With the
 // native search tool active it runs the internal loop first: every round is
 // consumed privately (no bytes) until the model stops calling web_search, and
 // only that final round is replayed as frames.
@@ -493,7 +438,7 @@ func (s *Server) chunkWriter(w http.ResponseWriter, flusher http.Flusher, id str
 	}
 }
 
-// completeTools is the non-streaming path for a non-tiered manifest.
+// completeTools is the non-streaming path for a plain manifest.
 func (s *Server) completeTools(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, manifest *tools.Manifest, plan *toolPlan) {
 	var res *round
 	var calls []tools.Call
@@ -549,79 +494,3 @@ func (s *Server) writeToolCompletion(w http.ResponseWriter, model, content, reas
 		}},
 	})
 }
-
-// streamTiered resolves every round first, then replays the final answer as
-// normal frames: the loader is an internal step, so the client must never see
-// a partial first round.
-func (s *Server) streamTiered(w http.ResponseWriter, r *http.Request, req *openai.ChatRequest, plan *toolPlan) {
-	res, err := s.resolveRounds(r.Context(), req, plan)
-	if err != nil {
-		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
-			return
-		}
-		s.fail(w, s.upstreamError(err))
-		return
-	}
-	content, reasoning, calls := res.content, res.reasoning, res.calls
-	s.streams.Add(1)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
-
-	id := upstream.RandomID("chatcmpl")
-	created := s.now().Unix()
-	write := func(delta openai.Delta, finish *string) bool {
-		chunk := openai.Chunk{
-			ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-			Choices: []openai.ChunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
-		}
-		if err := writeEvent(w, chunk); err != nil {
-			return false
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return true
-	}
-	if !write(openai.Delta{Role: "assistant"}, nil) {
-		return
-	}
-	if reasoning != "" && !write(openai.Delta{ReasoningContent: reasoning}, nil) {
-		return
-	}
-	if content != "" && !write(openai.Delta{Content: content}, nil) {
-		return
-	}
-	emitToolCalls(w, flusher, calls, 0, write)
-	finish := "stop"
-	annotations := res.cites.Citations()
-	if len(calls) > 0 {
-		finish = "tool_calls"
-	}
-	if !write(openai.Delta{Annotations: annotations}, &finish) {
-		return
-	}
-	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
-}
-
-// completeTiered resolves every round and writes one completion.
-func (s *Server) completeTiered(w http.ResponseWriter, r *http.Request, req *openai.ChatRequest, plan *toolPlan) {
-	res, err := s.resolveRounds(r.Context(), req, plan)
-	if err != nil {
-		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
-			return
-		}
-		s.fail(w, s.upstreamError(err))
-		return
-	}
-	s.writeToolCompletion(w, req.Model, res.content, res.reasoning, res.calls, res.cites.Citations())
-}
-
-// loaderName mirrors tools' synthetic loader name for call inspection.
-const loaderName = "tool_schema"

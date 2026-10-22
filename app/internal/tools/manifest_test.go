@@ -14,62 +14,28 @@ func weatherTool() Tool {
 	}
 }
 
-// T24: at or below the threshold, every parameter schema is present and no
-// loader is offered.
-func TestManifestFullBelowThreshold(t *testing.T) {
+// The manifest has no count-based tiering: a request declaring 40 tools
+// carries all 40 full definitions, schemas included, and no loader note.
+func TestManifestRendersFullDefinitionsAtAnyCount(t *testing.T) {
 	t.Parallel()
-	tools := []Tool{weatherTool()}
+	tools := manyTools(40)
 	m, err := BuildManifest(tools, Choice{Auto: true}, false)
 	if err != nil {
 		t.Fatalf("BuildManifest: %v", err)
 	}
-	if m.Tiered || m.Loader {
-		t.Fatalf("tiered=%v loader=%v below threshold", m.Tiered, m.Loader)
-	}
-	if !strings.Contains(m.Preamble, `"parameters"`) || !strings.Contains(m.Preamble, "get_weather") {
-		t.Fatalf("preamble lacks schema:\n%s", m.Preamble)
-	}
-	if strings.Contains(m.Preamble, "tool_schema") {
-		t.Fatal("loader advertised below threshold")
-	}
-}
-
-// T21: above the threshold the preamble carries names and descriptions only,
-// plus the loader.
-func TestManifestTieredAboveThreshold(t *testing.T) {
-	t.Parallel()
-	tools := manyTools(TierThreshold + 1)
-	m, err := BuildManifest(tools, Choice{Auto: true}, false)
-	if err != nil {
-		t.Fatalf("BuildManifest: %v", err)
-	}
-	if !m.Tiered || !m.Loader {
-		t.Fatalf("tiered=%v loader=%v, want both", m.Tiered, m.Loader)
-	}
-	if strings.Contains(m.Preamble, `"parameters"`) {
-		t.Fatal("tier-1 manifest still carries parameter schemas")
+	if got := strings.Count(m.Preamble, `,"parameters":`); got != len(tools) {
+		t.Fatalf("preamble carries %d schemas, want %d:\n%s", got, len(tools), m.Preamble)
 	}
 	for _, tool := range tools {
 		if !strings.Contains(m.Preamble, tool.Name) {
-			t.Fatalf("tool %q missing from index", tool.Name)
+			t.Fatalf("tool %q missing from preamble", tool.Name)
 		}
 	}
-	if !strings.Contains(m.Preamble, toolSchemaName) {
-		t.Fatal("loader not in preamble")
+	if strings.Contains(m.Preamble, "tool_schema") {
+		t.Fatal("loader advertised")
 	}
-	if len(m.Declared) != len(tools)+1 || m.Declared[len(m.Declared)-1] != toolSchemaName {
-		t.Fatalf("declared = %v", m.Declared)
-	}
-}
-
-func TestManifestThresholdBoundary(t *testing.T) {
-	t.Parallel()
-	m, err := BuildManifest(manyTools(TierThreshold), Choice{Auto: true}, false)
-	if err != nil {
-		t.Fatalf("BuildManifest: %v", err)
-	}
-	if m.Tiered {
-		t.Fatalf("tiered at exactly %d tools; threshold is >%d", TierThreshold, TierThreshold)
+	if len(m.Declared) != len(tools) {
+		t.Fatalf("declared %d names, want %d", len(m.Declared), len(tools))
 	}
 }
 
@@ -189,45 +155,6 @@ func TestManifestRejectsEmptyName(t *testing.T) {
 	}
 }
 
-// Expanding a loader call returns the requested tools, matched by name first
-// and by lexical query second.
-func TestExpand(t *testing.T) {
-	t.Parallel()
-	tools := manyTools(5)
-	m, err := BuildManifest(tools, Choice{Auto: true}, false)
-	if err != nil {
-		t.Fatalf("BuildManifest: %v", err)
-	}
-
-	got := m.Expand(`{"names":["tool_1","tool_3"]}`)
-	if len(got) != 2 || got[0].Name != "tool_1" || got[1].Name != "tool_3" {
-		t.Fatalf("names expansion = %v", got)
-	}
-
-	got = m.Expand(`{"query":"tool_2"}`)
-	if len(got) == 0 || got[0].Name != "tool_2" {
-		t.Fatalf("query expansion = %v", got)
-	}
-
-	if got := m.Expand(`not json`); len(got) != 0 {
-		t.Fatalf("garbage expanded to %v", got)
-	}
-	if got := m.Expand(`{"names":["missing"]}`); len(got) != 0 {
-		t.Fatalf("unknown name expanded to %v", got)
-	}
-}
-
-func TestExpandCapsResults(t *testing.T) {
-	t.Parallel()
-	m, err := BuildManifest(manyTools(TierThreshold+20), Choice{Auto: true}, false)
-	if err != nil {
-		t.Fatalf("BuildManifest: %v", err)
-	}
-	if got := m.Expand(`{"query":"tool"}`); len(got) > maxExpand {
-		t.Fatalf("expanded %d > cap %d", len(got), maxExpand)
-	}
-}
-
 func manyTools(n int) []Tool {
 	out := make([]Tool, 0, n)
 	for i := 0; i < n; i++ {
@@ -245,56 +172,6 @@ func itoa(i int) string {
 		return string(rune('0' + i))
 	}
 	return itoa(i/10) + string(rune('0'+i%10))
-}
-
-// Expanded turns named tools into full schemas while keeping every other
-// tool's index entry and the loader, and stays declared.
-func TestExpanded(t *testing.T) {
-	t.Parallel()
-	tools := manyTools(TierThreshold + 2)
-	m, err := BuildManifest(tools, Choice{Auto: true}, false)
-	if err != nil {
-		t.Fatalf("BuildManifest: %v", err)
-	}
-	first := m.tools[0]
-	next := m.Expanded([]Tool{first})
-	if !next.Tiered || !next.Loader {
-		t.Fatalf("expanded tiered=%v loader=%v", next.Tiered, next.Loader)
-	}
-	if !strings.Contains(next.Preamble, `"name":"tool_0","description":"Operation number 0 for testing.","parameters":{"type":"object"`) {
-		t.Fatalf("expanded tool lacks schema:\n%s", next.Preamble)
-	}
-	// An unloaded tool keeps its index entry: expanding one tool must not
-	// re-inflate the whole manifest.
-	if !strings.Contains(next.Preamble, `{"name":"tool_1","description":"Operation number 1 for testing."}`+"\n") {
-		t.Fatalf("unloaded tool lost its index entry:\n%s", next.Preamble)
-	}
-	if strings.Count(next.Preamble, `,"parameters":`) != 1 {
-		t.Fatalf("expanded manifest carries %d schemas, want 1", strings.Count(next.Preamble, `,"parameters":`))
-	}
-	// Every declared name must still be declared, plus the loader.
-	if len(next.Declared) != len(tools)+1 || next.Declared[len(next.Declared)-1] != toolSchemaName {
-		t.Fatalf("declared = %v", next.Declared)
-	}
-	if len(next.tools) != len(tools) {
-		t.Fatalf("tools = %d", len(next.tools))
-	}
-	// Unknown tools cannot be injected into the catalogue: Expand only
-	// answers with declared tools, and a second expansion keeps the first
-	// tool's schema while the index stays complete.
-	next = next.Expanded([]Tool{{Name: "extra", Parameters: json.RawMessage(`{}`)}})
-	if len(next.tools) != len(tools) {
-		t.Fatalf("tools after extra = %d", len(next.tools))
-	}
-	if !strings.Contains(next.Preamble, `"name":"tool_0"`) || !strings.Contains(next.Preamble, `"name":"tool_30"`) {
-		t.Fatalf("index incomplete after second expansion")
-	}
-	if strings.Contains(next.Preamble, `"name":"extra"`) {
-		t.Fatal("undeclared tool was injected into the catalogue")
-	}
-	if strings.Count(next.Preamble, `,"parameters":`) != 1 {
-		t.Fatalf("second expansion dropped the first schema")
-	}
 }
 
 // The native search tool is declared with a real parameter schema derived

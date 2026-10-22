@@ -4,22 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 )
-
-// TierThreshold is the declared-tool count above which the manifest drops
-// parameter schemas and offers the loader. 30 is the lower bound of the
-// published 30–50-tool degradation range (DESIGN-TOOLS.md §6.2).
-const TierThreshold = 30
-
-// toolSchemaName is the synthetic loader's name. It is never a client tool:
-// the server answers it itself and never emits it to the client.
-const toolSchemaName = "tool_schema"
-
-// maxExpand bounds how many tools one loader call may load, so a model cannot
-// ask for the whole catalogue at once and defeat the point of tiering.
-const maxExpand = 10
 
 // PreStyle selects the preamble skeleton. "hermes" is the measured 7/8
 // hermes-compact skeleton; "inception" is the reconstructed AI-SDK v5 style
@@ -114,20 +100,10 @@ type Manifest struct {
 	Preamble string
 	// Declared is the set of names a call may use, in manifest order.
 	Declared []string
-	// Tiered reports that parameter schemas were withheld.
-	Tiered bool
-	// Loader reports that the synthetic tool_schema function was offered.
-	Loader bool
 
 	tools        []Tool
 	instructions string
-	// loaded is the subset of tools whose full schemas the current preamble
-	// carries instead of the tier-1 index entry.
-	loaded []Tool
 }
-
-// tierNote explains why schemas are absent and how to ask for them.
-const tierNote = "\nSome argument details are omitted to save context. If you need them, reply with a `" + toolSchemaName + "` block once: " + `{"name": "` + toolSchemaName + `", "arguments": {"names": ["…"]}}` + ".\n"
 
 // The preamble wording is not free-form: the upstream web backend
 // intermittently returns an empty answer (reasoning-start/end only, no
@@ -152,29 +128,20 @@ func (m *Manifest) header() string {
 	// The skeleton is selected by PreStyle; the hermes variant is the
 	// measured 7/8 baseline (see hermesSkeleton).
 	var defs strings.Builder
-	if m.Tiered {
-		for _, t := range m.tools {
-			fmt.Fprintf(&defs, `{"name":%s,"description":%s}`+"\n", quoteJSON(t.Name), quoteJSON(t.Description))
+	for _, t := range m.tools {
+		// An empty description renders natively: the code-lab catalog
+		// (probe/outY/y1, verbatim) never carries a description field
+		// without content, so an empty string becomes an omitted field
+		// rather than literal "".
+		params := ""
+		if t.Description != "" {
+			params = `,"description":` + quoteJSON(t.Description)
 		}
-	} else {
-		for _, t := range m.tools {
-			// An empty description renders natively: the code-lab catalog
-			// (probe/outY/y1, verbatim) never carries a description field
-			// without content, so an empty string becomes an omitted field
-			// rather than literal "".
-			params := ""
-			if t.Description != "" {
-				params = `,"description":` + quoteJSON(t.Description)
-			}
-			fmt.Fprintf(&defs, `{"name":%s%s,"parameters":%s}`+"\n",
-				quoteJSON(t.Name), params, compactParams(t.Parameters))
-		}
+		fmt.Fprintf(&defs, `{"name":%s%s,"parameters":%s}`+"\n",
+			quoteJSON(t.Name), params, compactParams(t.Parameters))
 	}
 	sk := activeSkeleton()
 	preamble := sk.lead + "\n\n" + defs.String() + sk.contract + "\n"
-	if m.Tiered {
-		preamble += tierNote
-	}
 	return preamble + m.instructions
 }
 
@@ -226,7 +193,7 @@ func BuildManifest(list []Tool, c Choice, parallelOff bool) (*Manifest, error) {
 		}
 	}
 
-	m := &Manifest{Tiered: len(selected) > TierThreshold, tools: selected}
+	m := &Manifest{tools: selected}
 	for _, t := range selected {
 		m.Declared = append(m.Declared, t.Name)
 	}
@@ -235,66 +202,10 @@ func BuildManifest(list []Tool, c Choice, parallelOff bool) (*Manifest, error) {
 
 	// The preamble is fully assembled in header(): the hermes-compact skeleton
 	// carries the definitions inline (that ordering is what the 14-probe
-	// wording matrix measured, probe/outP1..C). Tiered manifests keep the
-	// schema-withholding note and declare the synthetic loader last so it never
-	// shadows a real tool's name.
-	if m.Tiered {
-		m.Loader = true
-		m.Declared = append(m.Declared, toolSchemaName)
-	}
+	// wording matrix measured, probe/outP1..C). Every tool renders its full
+	// definition regardless of how many the client declared.
 	m.Preamble = m.header()
 	return m, nil
-}
-
-// Expand answers a loader call's arguments with the tools it names, matched by
-// exact name first and then by a case-insensitive lexical match over name and
-// description. Results are capped at maxExpand. Unknown names are dropped.
-func (m *Manifest) Expand(arguments string) []Tool {
-	var req struct {
-		Names []string `json:"names"`
-		Query string   `json:"query"`
-	}
-	if err := json.Unmarshal([]byte(arguments), &req); err != nil {
-		return nil
-	}
-	var out []Tool
-	seen := make(map[string]struct{})
-	add := func(t Tool) {
-		if len(out) >= maxExpand {
-			return
-		}
-		if _, dup := seen[t.Name]; dup {
-			return
-		}
-		seen[t.Name] = struct{}{}
-		out = append(out, t)
-	}
-
-	byName := make(map[string]Tool, len(m.tools))
-	for _, t := range m.tools {
-		byName[t.Name] = t
-	}
-	for _, n := range req.Names {
-		if t, ok := byName[n]; ok {
-			add(t)
-		}
-	}
-	if q := strings.ToLower(strings.TrimSpace(req.Query)); q != "" {
-		var hits []Tool
-		for _, t := range m.tools {
-			if strings.Contains(strings.ToLower(t.Name), q) || strings.Contains(strings.ToLower(t.Description), q) {
-				hits = append(hits, t)
-			}
-		}
-		sort.SliceStable(hits, func(i, j int) bool {
-			// Name matches rank above description-only matches.
-			return strings.Contains(strings.ToLower(hits[i].Name), q) && !strings.Contains(strings.ToLower(hits[j].Name), q)
-		})
-		for _, t := range hits {
-			add(t)
-		}
-	}
-	return out
 }
 
 // compactParams renders a parameter schema compactly, or {} when it is absent
@@ -315,66 +226,4 @@ func compactParams(raw json.RawMessage) string {
 func quoteJSON(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
-}
-
-// Expanded returns the manifest for the next round: the original declared
-// tools, with the given tools carrying full schemas instead of the tier-1
-// index. Already-expanded tools keep their schemas. The loader stays offered
-// so the model may ask again, but the server caps the number of rounds.
-func (m *Manifest) Expanded(extra []Tool) *Manifest {
-	// loaded keeps the tools whose schemas are now in the prompt.
-	loaded := make(map[string]Tool, len(extra))
-	for _, t := range m.loaded {
-		loaded[t.Name] = t
-	}
-	for _, t := range extra {
-		loaded[t.Name] = t
-	}
-
-	var b strings.Builder
-	// Rebuild with the same skeleton BuildManifest used (PreStyle-selectable);
-	// the tier note replaces the full definitions for un-expanded tools.
-	sk := activeSkeleton()
-	b.WriteString(sk.lead + "\n\n")
-	for _, t := range m.tools {
-		if full, ok := loaded[t.Name]; ok {
-			params := ""
-			if full.Description != "" {
-				params = `,"description":` + quoteJSON(full.Description)
-			}
-			fmt.Fprintf(&b, `{"name":%s%s,"parameters":%s}`+"\n",
-				quoteJSON(full.Name), params, compactParams(full.Parameters))
-			continue
-		}
-		params := ""
-		if t.Description != "" {
-			params = `,"description":` + quoteJSON(t.Description)
-		}
-		fmt.Fprintf(&b, `{"name":%s%s}`+"\n", quoteJSON(t.Name), params)
-	}
-	b.WriteString(sk.contract + "\n")
-	b.WriteString(tierNote)
-
-	declared := make([]string, 0, len(m.tools)+1)
-	for _, t := range m.tools {
-		declared = append(declared, t.Name)
-	}
-	declared = append(declared, toolSchemaName)
-
-	allLoaded := make([]Tool, 0, len(loaded))
-	for _, t := range m.tools {
-		if full, ok := loaded[t.Name]; ok {
-			allLoaded = append(allLoaded, full)
-		}
-	}
-
-	return &Manifest{
-		Preamble:     b.String(),
-		Declared:     declared,
-		Tiered:       true,
-		Loader:       true,
-		tools:        m.tools,
-		instructions: m.instructions,
-		loaded:       allLoaded,
-	}
 }

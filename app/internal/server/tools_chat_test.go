@@ -410,10 +410,11 @@ func TestRoundsTripReachesUpstream(t *testing.T) {
 	}
 }
 
-// T21/T22: above the threshold, the first upstream call has no parameter
-// schemas; a loader call triggers one re-ask that does, and the client never
-// sees the loader.
-func TestTieredLoaderResolvesInternally(t *testing.T) {
+// Every request carries full tool definitions: a 40-tool request sends all
+// 40 schemas in the preamble with no loader note, in one upstream round. An
+// old-prompt call to the removed tool_schema loader is just an undeclared
+// name, so it passes through as prose like any other unknown tool.
+func TestManifestSendsFullDefinitionsAtAnyCount(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	var prompts []string
@@ -422,62 +423,32 @@ func TestTieredLoaderResolvesInternally(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		call++
-		first := call == 1
-		if first {
-			return streamOf(toolStream(`<tool_call>{"name":"tool_schema","arguments":{"names":["tool_3"]}}</tool_call>`)), nil
-		}
-		return streamOf(toolStream(`<tool_call>{"name":"tool_3","arguments":{"x":"v"}}</tool_call>`)), nil
+		return streamOf(toolStream(`<tool_call>{"name":"tool_schema","arguments":{"names":["tool_3"]}}</tool_call>`)), nil
 	}}
-	upWithCapture := &capturingChatter{inner: up, prompts: &prompts}
-	s := newTestServer(upWithCapture)
-	rec := postChat(t, s, tieredBody(true))
+	s := newTestServer(&capturingChatter{inner: up, prompts: &prompts})
+	rec := postChat(t, s, manyToolBody(false, 40))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d (%s)", rec.Code, rec.Body)
 	}
 	mu.Lock()
 	n := call
 	mu.Unlock()
-	if n != 2 {
-		t.Fatalf("upstream rounds = %d, want 2", n)
+	if n != 1 {
+		t.Fatalf("upstream rounds = %d, want 1", n)
 	}
-	if len(prompts) != 2 {
-		t.Fatalf("prompts = %d", len(prompts))
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %d, want 1", len(prompts))
 	}
-	if !strings.Contains(prompts[0], toolSchemaLoader) || strings.Contains(prompts[0], `"parameters"`) {
-		t.Fatalf("tier-1 prompt wrong:\n%s", prompts[0])
+	if got := strings.Count(prompts[0], `,"parameters":`); got != 40 {
+		t.Fatalf("preamble carries %d schemas, want 40", got)
 	}
-	if !strings.Contains(prompts[1], `"name":"tool_3","description":"operation 3","parameters":{"type":"object"`) {
-		t.Fatalf("expanded prompt lacks tool_3 schema:\n%s", prompts[1])
+	if !strings.Contains(prompts[0], `"name":"tool_39"`) {
+		t.Fatalf("last tool missing from preamble")
 	}
-	out := rec.Body.String()
-	if strings.Contains(out, "tool_schema") {
-		t.Fatalf("loader leaked to the client: %s", out)
+	if strings.Contains(prompts[0], "tool_schema") {
+		t.Fatalf("loader note in preamble:\n%s", prompts[0])
 	}
-	if !strings.Contains(out, `"name":"tool_3"`) || !strings.Contains(out, `"finish_reason":"tool_calls"`) {
-		t.Fatalf("final call missing: %s", out)
-	}
-}
-
-// T23: a loader call on both rounds stops resolving and never reaches the
-// client.
-func TestTieredLoaderTwiceStops(t *testing.T) {
-	t.Parallel()
-	var mu sync.Mutex
-	call := 0
-	up := &fakeChatter{fn: func(int) (*upstream.Stream, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		call++
-		return streamOf(toolStream(`<tool_call>{"name":"tool_schema","arguments":{"query":"tool"}}</tool_call>`)), nil
-	}}
-	s := newTestServer(up)
-	rec := postChat(t, s, tieredBody(false))
-	mu.Lock()
-	n := call
-	mu.Unlock()
-	if n != 2 {
-		t.Fatalf("rounds = %d, want 2 (initial + one expansion)", n)
-	}
+	// The stale loader call is undeclared, so it is prose, not a tool call.
 	var c openai.Completion
 	if err := json.Unmarshal(rec.Body.Bytes(), &c); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -485,12 +456,7 @@ func TestTieredLoaderTwiceStops(t *testing.T) {
 	if len(c.Choices[0].Message.ToolCalls) != 0 || c.Choices[0].FinishReason != "stop" {
 		t.Fatalf("choice = %+v", c.Choices[0])
 	}
-	if strings.Contains(rec.Body.String(), "tool_schema") {
-		t.Fatalf("loader leaked: %s", rec.Body)
-	}
 }
-
-const toolSchemaLoader = "tool_schema"
 
 // capturingChatter records every preamble handed to the upstream.
 type capturingChatter struct {
@@ -511,9 +477,9 @@ func (c *capturingChatter) Chat(ctx context.Context, req *upstream.ChatRequest, 
 	return c.inner.Chat(ctx, req, idle, onMalformed)
 }
 
-func tieredBody(stream bool) string {
+func manyToolBody(stream bool, n int) string {
 	var tools []string
-	for i := 0; i < 31; i++ {
+	for i := 0; i < n; i++ {
 		tools = append(tools, fmt.Sprintf(`{"type":"function","function":{"name":"tool_%d","description":"operation %d","parameters":{"type":"object","properties":{"x":{"type":"string"}}}}}`, i, i))
 	}
 	s := ""
