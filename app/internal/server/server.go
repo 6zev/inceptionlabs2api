@@ -283,7 +283,7 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Tool-bearing requests take §4.1's path, which normalises history with
 	// tool payloads intact. A nil plan means the legacy one, and it must stay
 	// byte-identical for every request without tools.
-	plan, re := planTools(req)
+	plan, re := planTools(req, s.nativeSearchTool())
 	if re != nil {
 		s.fail(w, re)
 		return

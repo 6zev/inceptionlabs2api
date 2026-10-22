@@ -20,17 +20,28 @@ const maxRounds = 3
 type toolPlan struct {
 	manifest *tools.Manifest
 	hist     []openai.History
+	// native reports that the gateway's own web_search tool was added to the
+	// manifest, so its calls must be served internally rather than emitted.
+	native bool
 }
 
 // planTools builds the manifest and history for a tool-bearing request. It
-// returns a nil plan when the request must take the legacy path.
-func planTools(req *openai.ChatRequest) (*toolPlan, *openai.RequestError) {
+// returns a nil plan when the request must take the legacy path. native is the
+// optional gateway-served search tool; it is added only when the client did
+// not declare that name itself (a client tool always wins).
+func planTools(req *openai.ChatRequest, native *tools.Tool) (*toolPlan, *openai.RequestError) {
 	if len(req.Tools) == 0 || req.ToolChoice.Kind == openai.ToolChoiceNone {
 		return nil, nil
 	}
-	list := make([]tools.Tool, 0, len(req.Tools))
+	list := make([]tools.Tool, 0, len(req.Tools)+1)
 	for _, t := range req.Tools {
+		if t.Function.Name == tools.NativeSearchName {
+			native = nil
+		}
 		list = append(list, tools.Tool{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters})
+	}
+	if native != nil {
+		list = append(list, *native)
 	}
 	choice := tools.Choice{}
 	switch req.ToolChoice.Kind {
@@ -50,7 +61,7 @@ func planTools(req *openai.ChatRequest) (*toolPlan, *openai.RequestError) {
 	if re != nil {
 		return nil, re
 	}
-	return &toolPlan{manifest: manifest, hist: hist}, nil
+	return &toolPlan{manifest: manifest, hist: hist, native: native != nil}, nil
 }
 
 // chatWithTools answers a request whose tools are active. A tiered manifest is
@@ -67,10 +78,10 @@ func (s *Server) chatWithTools(w http.ResponseWriter, r *http.Request, req *open
 		return
 	}
 	if req.Stream {
-		s.streamTools(w, r, ureq, req.Model, plan.manifest)
+		s.streamTools(w, r, ureq, req.Model, plan.manifest, plan)
 		return
 	}
-	s.completeTools(w, r, ureq, req.Model, plan.manifest)
+	s.completeTools(w, r, ureq, req.Model, plan.manifest, plan)
 }
 
 // round is one upstream response with its parsing applied.
@@ -185,8 +196,15 @@ func emitToolCalls(w http.ResponseWriter, flusher http.Flusher, calls []tools.Ca
 	return emitted
 }
 
-// streamTools is the streaming path for a non-tiered manifest.
-func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, manifest *tools.Manifest) {
+// streamTools is the streaming path for a non-tiered manifest. With the
+// native search tool active it runs the internal loop first: every round is
+// consumed privately (no bytes) until the model stops calling web_search, and
+// only that final round is replayed as frames.
+func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, manifest *tools.Manifest, plan *toolPlan) {
+	if plan.native {
+		s.streamNative(w, r, ureq, model, plan)
+		return
+	}
 	stream, err := s.up.Chat(r.Context(), ureq, s.cfg.IdleTimeout, func(line string) {
 		s.logf("upstream: skipping malformed SSE line: %q", truncate(line, 200))
 	})
@@ -206,19 +224,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 
 	id := upstream.RandomID("chatcmpl")
 	created := s.now().Unix()
-	write := func(delta openai.Delta, finish *string) bool {
-		chunk := openai.Chunk{
-			ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-			Choices: []openai.ChunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
-		}
-		if err := writeEvent(w, chunk); err != nil {
-			return false
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return true
-	}
+	write := s.chunkWriter(w, flusher, id, created, model)
 	if !write(openai.Delta{Role: "assistant"}, nil) {
 		return
 	}
@@ -301,23 +307,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 			})
 			if readErr2 == nil {
 				cites = cites2
-				if tail := parser2.Flush(); len(tail) > 0 {
-					if !write(openai.Delta{Content: string(tail)}, nil) {
-						return
-					}
-				}
-				emitToolCalls(w, flusher, parser2.Calls(), emitted, write)
-				finish := "stop"
-				if len(parser2.Calls()) > 0 {
-					finish = "tool_calls"
-				}
-				if !write(openai.Delta{Annotations: cites.Citations()}, &finish) {
-					return
-				}
-				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-				if flusher != nil {
-					flusher.Flush()
-				}
+				s.finishStream(w, flusher, write, parser2, cites, emitted)
 				return
 			}
 			// Retry also failed at transport level: fall through to the
@@ -332,30 +322,126 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 		}
 	}
 	if readErr != nil {
-		if errors.Is(readErr, errClientGone) {
-			return
-		}
-		if errors.Is(readErr, context.Canceled) && r.Context().Err() != nil {
-			return
-		}
-		s.upErrors.Add(1)
-		s.logf("upstream: stream failed after headers: %v", readErr)
-		se := streamError(readErr)
-		_ = writeEvent(w, se.Envelope())
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
+		s.streamFailure(w, r, flusher, readErr)
 		return
 	}
+	s.finishStream(w, flusher, write, parser, cites, emitted)
+}
 
+// streamNative consumes rounds privately until the model stops calling the
+// gateway's web_search tool, then replays the final round as frames. Nothing
+// from an internal round is ever written, so the first client-visible frame
+// is always part of the answer the client asked for.
+func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, plan *toolPlan) {
+	res, calls, err := s.resolveNative(r.Context(), ureq, plan)
+	if err != nil {
+		if nativeAbort(r, err) {
+			return
+		}
+		s.fail(w, s.upstreamError(err))
+		return
+	}
+	// The measured empty-answer failure mode can land on the final round too.
+	// Nothing has been written yet, so the same one-shot retry applies.
+	if res.emptyToolAnswer() && len(calls) == 0 {
+		s.logf("tools: empty answer round (no text/call), retrying once")
+		if retry, retryCalls, err2 := s.resolveNative(r.Context(), ureq, plan); err2 == nil {
+			res, calls = retry, retryCalls
+		} else if nativeAbort(r, err2) {
+			return
+		} else {
+			s.logf("tools: native retry failed: %v", err2)
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	s.streams.Add(1)
+
+	write := s.chunkWriter(w, flusher, upstream.RandomID("chatcmpl"), s.now().Unix(), model)
+	if !write(openai.Delta{Role: "assistant"}, nil) {
+		return
+	}
+	s.replayRound(w, flusher, write, res, calls)
+}
+
+// resolveNative runs the internal web_search loop: read a round, serve every
+// native call, append its result, and re-ask. It returns the first round with
+// no native call plus any client calls accumulated from internal rounds (they
+// are emitted with the final answer so no client tool call is lost).
+func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, plan *toolPlan) (*round, []tools.Call, error) {
+	manifest := plan.manifest
+	hist := plan.hist
+	effort := ureq.ReasoningEffort
+	budget := 0
+	var pending []tools.Call
+	// One round per allowed search, plus the round that reports the budget
+	// exhaustion, plus a final round the model answers in. A model that keeps
+	// calling past that is resolved with the calls stripped rather than looped.
+	limit := nativeSearchBudget + 2
+	var last *round
+	for round := 0; round < limit; round++ {
+		res, err := s.readRound(ctx, upstream.NewToolChatRequestHistory(hist, effort, manifest), manifest)
+		if err != nil {
+			return nil, nil, err
+		}
+		last = res
+		native, client := nativeRound(res.calls)
+		if len(native) == 0 {
+			return res, append(pending, client...), nil
+		}
+		step, used, err := s.serveNativeCalls(ctx, native, res.content, budget)
+		if err != nil {
+			return nil, nil, err
+		}
+		budget = used
+		hist = append(hist, step...)
+		pending = append(pending, client...)
+	}
+	// The model ignored the budget and the round cap: answer with its last
+	// round, with the unresolved native calls stripped. A refusal-by-loop is
+	// not a client-visible error; the stream still closes normally.
+	s.logf("tools: native search round cap reached; answering with the last round")
+	return last, pending, nil
+}
+
+// replayRound writes an already-consumed round as the client-visible answer.
+// The tool_calls finish reason is decided by the calls that remain after the
+// native ones were served.
+func (s *Server) replayRound(w http.ResponseWriter, flusher http.Flusher, write func(openai.Delta, *string) bool, res *round, calls []tools.Call) {
+	if res.reasoning != "" && !write(openai.Delta{ReasoningContent: res.reasoning}, nil) {
+		return
+	}
+	if res.content != "" && !write(openai.Delta{Content: res.content}, nil) {
+		return
+	}
+	emitToolCalls(w, flusher, calls, 0, write)
+	finish := "stop"
+	if len(calls) > 0 {
+		finish = "tool_calls"
+	}
+	if !write(openai.Delta{Annotations: res.cites.Citations()}, &finish) {
+		return
+	}
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// finishStream flushes a parser's tail, emits its calls and closes the SSE
+// response.
+func (s *Server) finishStream(w http.ResponseWriter, flusher http.Flusher, write func(openai.Delta, *string) bool, parser *tools.Parser, cites upstream.CitationCollector, emitted int) {
 	if tail := parser.Flush(); len(tail) > 0 {
 		if !write(openai.Delta{Content: string(tail)}, nil) {
 			return
 		}
 	}
 	emitToolCalls(w, flusher, parser.Calls(), emitted, write)
-
 	finish := "stop"
 	if len(parser.Calls()) > 0 {
 		finish = "tool_calls"
@@ -369,14 +455,61 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 	}
 }
 
+// streamFailure writes the mid-stream error envelope unless the client is
+// already gone.
+func (s *Server) streamFailure(w http.ResponseWriter, r *http.Request, flusher http.Flusher, readErr error) {
+	if errors.Is(readErr, errClientGone) {
+		return
+	}
+	if errors.Is(readErr, context.Canceled) && r.Context().Err() != nil {
+		return
+	}
+	s.upErrors.Add(1)
+	s.logf("upstream: stream failed after headers: %v", readErr)
+	se := streamError(readErr)
+	_ = writeEvent(w, se.Envelope())
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// chunkWriter builds the frame writer for one streamed response.
+func (s *Server) chunkWriter(w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string) func(openai.Delta, *string) bool {
+	return func(delta openai.Delta, finish *string) bool {
+		chunk := openai.Chunk{
+			ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []openai.ChunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
+		}
+		if err := writeEvent(w, chunk); err != nil {
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
+}
+
 // completeTools is the non-streaming path for a non-tiered manifest.
-func (s *Server) completeTools(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, manifest *tools.Manifest) {
-	res, err := s.readRound(r.Context(), ureq, manifest)
+func (s *Server) completeTools(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, manifest *tools.Manifest, plan *toolPlan) {
+	var res *round
+	var calls []tools.Call
+	var err error
+	if plan.native {
+		res, calls, err = s.resolveNative(r.Context(), ureq, plan)
+	} else {
+		res, err = s.readRound(r.Context(), ureq, manifest)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
 			return
 		}
 		s.fail(w, s.upstreamError(err))
+		return
+	}
+	if plan.native {
+		s.writeToolCompletion(w, model, res.content, res.reasoning, calls, res.cites.Citations())
 		return
 	}
 	s.writeToolCompletion(w, model, res.content, res.reasoning, res.calls, res.cites.Citations())
