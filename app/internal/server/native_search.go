@@ -29,18 +29,24 @@ func (s *Server) nativeSearchTool() *tools.Tool {
 
 // nativeSearchContent serialises one retrieval run as the tool result the
 // model sees. It is the same envelope /v1/web_search returns, plus as_of so
-// the model can reason about recency.
+// the model can reason about recency. answer carries the upstream's
+// content-grounded synthesis when the run reached one; its [n] citation
+// markers refer to the results array (cite_index, 1-based, in this order —
+// never renumbered or reordered). The field is omitted when upstream
+// produced no answer, and the model works from titles/urls as before.
 func nativeSearchContent(res *upstream.SearchResult, asOf string) string {
 	body, err := json.Marshal(struct {
 		Object  string            `json:"object"`
 		AsOf    string            `json:"as_of"`
 		Queries []string          `json:"queries"`
 		Results []webSearchResult `json:"results"`
+		Answer  string            `json:"answer,omitempty"`
 	}{
 		Object:  "web_search",
 		AsOf:    asOf,
 		Queries: nonNil(res.Queries),
 		Results: results(res.Sources),
+		Answer:  res.Answer,
 	})
 	if err != nil {
 		return `{"error":"search result could not be encoded"}`
