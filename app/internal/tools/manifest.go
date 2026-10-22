@@ -32,9 +32,9 @@ var PreStyle = "hermes"
 // skeleton is one preamble wording option. Both skeletons render the same
 // definition lines; only the prose differs.
 type skeleton struct {
-	lead      string // opening sentence before the definition lines
-	contract  string // the call-contract sentence after the definitions
-	expanded  string // opening sentence used by Expand (tiered rebuild)
+	lead     string // opening sentence before the definition lines
+	contract string // the call-contract sentence after the definitions
+	expanded string // opening sentence used by Expand (tiered rebuild)
 }
 
 // hermesSkeleton is the hermes-compact skeleton from the 14-probe wording
@@ -42,7 +42,7 @@ type skeleton struct {
 // to N operations..." draft missed 3/3 locally — do not reword without a new
 // live matrix (DESIGN-TOOLS.md §1.1).
 var hermesSkeleton = skeleton{
-	lead:     "You are a helpful assistant with access to the following tools:",
+	lead: "You are a helpful assistant with access to the following tools:",
 	contract: "\nIf you need to use a tool, respond with a " + callStart + " JSON block " +
 		"containing {\"name\": \"tool name\", \"arguments\": {…}}. " +
 		"Use only the tools listed; never invent one. Otherwise answer normally.",
