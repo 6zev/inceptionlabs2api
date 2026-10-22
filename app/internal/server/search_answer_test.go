@@ -288,3 +288,52 @@ func sseCallRaw(name, args string) string {
 	_ = enc.Encode(upstream.Event{Type: upstream.EventTextStart, Snapshot: callOpenMarker() + string(raw) + callCloseMarker()})
 	return "data: " + strings.TrimRight(b.String(), "\n") + "\n\ndata: [DONE]\n\n"
 }
+
+// --- Component 4: the native recovery retry keeps the search history ---
+
+func TestNativeRetryCarriesSearchHistory(t *testing.T) {
+	// Round 1: the model searches. Round 2: a truncated call envelope, so
+	// retryKind fires the recovery retry. Round 3: the retry's clean prose.
+	call := sseCallRaw("web_search", `{"query":"go 1.27 release date"}`)
+	broken := callOpenMarker() + `{"name":"get_weather","arguments":{"city":"Nanning"` + callCloseMarker()
+	fixed := "It is sunny in Nanning today."
+	mock := &mockChatter{rounds: []string{call, sseText(broken), sseText(fixed)}}
+	se := &mockSearcher{runs: []*upstream.SearchResult{go127Run()}}
+	s := newNativeServer(t, mock, se)
+	w := postChat(t, s, weatherRequest(false))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	if got := mock.count(); got != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (search round + broken final + retry)", got)
+	}
+	if got := se.requestCount(); got != 1 {
+		t.Fatalf("search runs = %d, want 1", got)
+	}
+	var comp openai.Completion
+	if err := json.Unmarshal(w.Body.Bytes(), &comp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if comp.Choices[0].Message.Content != fixed {
+		t.Fatalf("retry prose must pass through verbatim: %q", comp.Choices[0].Message.Content)
+	}
+
+	// The retry request is the third upstream call. Its history must contain
+	// round 1's search turns: the assistant's web_search call and the tool
+	// result feeding it the retrieved sources.
+	retryReq := mock.request(2)
+	var sawResult, sawCall bool
+	for _, m := range retryReq.Messages {
+		joined := strings.Join(partTexts(m), "")
+		if strings.Contains(joined, "[Tool Result") && strings.Contains(joined, "go.dev/doc/go1.27") {
+			sawResult = true
+		}
+		if strings.Contains(joined, `"web_search"`) && strings.Contains(joined, "go 1.27 release date") {
+			sawCall = true
+		}
+	}
+	if !sawResult || !sawCall {
+		t.Fatalf("retry request lost the native search history (result=%v call=%v); messages: %+v", sawResult, sawCall, retryReq.Messages)
+	}
+}

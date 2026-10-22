@@ -236,6 +236,34 @@ func recoveryRequestFor(ureq *upstream.ChatRequest, res *round, kind tools.Recov
 	return ureq
 }
 
+// nativeRetryHistory builds the history a native recovery retry re-enters the
+// loop with: the accumulated history plus, for the broken-call kinds, the
+// broken round and the retry message as History turns — the same append
+// recoveryRequest performs on the wire, done at the history level because
+// resolveNative owns its own history threading and builds every round from
+// the history it was given, not from a request's message list. The empty
+// answer keeps the accumulated history unchanged (same-manifest re-ask).
+func nativeRetryHistory(hist []openai.History, res *round, kind tools.RecoveryKind) []openai.History {
+	var message string
+	switch {
+	case res.emptyToolAnswer():
+		return hist
+	case kind == tools.RecoveryTruncated:
+		message = tools.RetryMessageTruncated(res.content)
+	case kind == tools.RecoveryParseFailed:
+		message = tools.RetryMessageParseFailed(res.content)
+	default:
+		return hist
+	}
+	out := make([]openai.History, 0, len(hist)+2)
+	out = append(out, hist...)
+	if res.content != "" {
+		out = append(out, openai.History{Role: "assistant", Texts: []string{res.content}})
+	}
+	out = append(out, openai.History{Role: "user", Texts: []string{message}})
+	return out
+}
+
 // emitToolCalls writes one delta frame per parsed call and returns the number
 // emitted so far.
 func emitToolCalls(w http.ResponseWriter, flusher http.Flusher, calls []tools.Call, emitted int, write func(openai.Delta, *string) bool) int {
@@ -314,7 +342,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 // is always part of the answer the client asked for.
 func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, plan *toolPlan) {
 	rtag := wireTag()
-	res, calls, err := s.resolveNative(r.Context(), ureq, plan)
+	res, calls, hist, err := s.resolveNative(r.Context(), ureq, plan, plan.hist)
 	if err != nil {
 		if nativeAbort(r, err) {
 			return
@@ -325,8 +353,10 @@ func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upst
 	wireDumpRound(rtag, res.content, calls)
 	// The final round gets the same classification and one bounded retry as
 	// the plain path. Nothing has been written yet, so the retry is free.
+	// It re-enters the loop from the ACCUMULATED history plus the recovery
+	// turns, so the search the loop already served is never lost.
 	if kind, doRetry := s.retryKind(res, calls); doRetry {
-		if retryRes, retryCalls, err2 := s.resolveNative(r.Context(), recoveryRequestFor(ureq, res, kind), plan); err2 == nil {
+		if retryRes, retryCalls, _, err2 := s.resolveNative(r.Context(), ureq, plan, nativeRetryHistory(hist, res, kind)); err2 == nil {
 			res, calls = retryRes, retryCalls
 			wireDumpRound(rtag, res.content, calls)
 		} else if nativeAbort(r, err2) {
@@ -349,15 +379,18 @@ func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upst
 }
 
 // resolveNative runs the internal web_search loop: read a round, serve every
-// native call, append its result, and re-ask. It returns the first round with
-// no native call plus any client calls accumulated from internal rounds (they
-// are emitted with the final answer so no client tool call is lost). Every
-// source the loop retrieved is attached to the returned round as annotations,
-// so the client sees the citations the answer's [n] markers refer to even
-// though the tool path never fires source-url events.
-func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, plan *toolPlan) (*round, []tools.Call, error) {
+// native call, append its result, and re-ask. startHist is the history the
+// loop grows from — plan.hist on the initial call, the accumulated history
+// on a recovery retry, so the search turns already served are never lost.
+// It returns the first round with no native call plus any client calls
+// accumulated from internal rounds (they are emitted with the final answer so
+// no client tool call is lost), plus the accumulated history. Every source the
+// loop retrieved is attached to the returned round as annotations, so the
+// client sees the citations the answer's [n] markers refer to even though
+// the tool path never fires source-url events.
+func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, plan *toolPlan, startHist []openai.History) (*round, []tools.Call, []openai.History, error) {
 	manifest := plan.manifest
-	hist := plan.hist
+	hist := startHist
 	effort := ureq.ReasoningEffort
 	budget := 0
 	var pending []tools.Call
@@ -370,17 +403,17 @@ func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, 
 	for round := 0; round < limit; round++ {
 		res, err := s.readRound(ctx, upstream.NewToolChatRequestHistory(hist, effort, manifest), manifest)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		last = res
 		native, client := nativeRound(res.calls)
 		if len(native) == 0 {
 			res.nativeCites = cites.cites
-			return res, append(pending, client...), nil
+			return res, append(pending, client...), hist, nil
 		}
 		step, used, err := s.serveNativeCalls(ctx, native, res.content, budget, &cites)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		budget = used
 		hist = append(hist, step...)
@@ -391,7 +424,7 @@ func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, 
 	// not a client-visible error; the stream still closes normally.
 	s.logf("tools: native search round cap reached; answering with the last round")
 	last.nativeCites = cites.cites
-	return last, pending, nil
+	return last, pending, hist, nil
 }
 
 // replayRound writes an already-consumed round as the client-visible answer.
@@ -441,8 +474,9 @@ func (s *Server) completeTools(w http.ResponseWriter, r *http.Request, ureq *ups
 	var res *round
 	var calls []tools.Call
 	var err error
+	var hist []openai.History
 	if plan.native {
-		res, calls, err = s.resolveNative(r.Context(), ureq, plan)
+		res, calls, hist, err = s.resolveNative(r.Context(), ureq, plan, plan.hist)
 	} else {
 		res, err = s.readRound(r.Context(), ureq, manifest)
 	}
@@ -457,9 +491,11 @@ func (s *Server) completeTools(w http.ResponseWriter, r *http.Request, ureq *ups
 		// The native loop's final round gets the same classification and one
 		// bounded retry as the plain path. The retry re-enters the native
 		// loop (not a bare readRound) so a retry round that calls web_search
-		// is served internally rather than leaked to the client.
+		// is served internally rather than leaked to the client — and it
+		// starts from the ACCUMULATED history plus the recovery turns, so
+		// the search the loop already served is never lost.
 		if kind, doRetry := s.retryKind(res, calls); doRetry {
-			if retryRes, retryCalls, err2 := s.resolveNative(r.Context(), recoveryRequestFor(ureq, res, kind), plan); err2 == nil {
+			if retryRes, retryCalls, _, err2 := s.resolveNative(r.Context(), ureq, plan, nativeRetryHistory(hist, res, kind)); err2 == nil {
 				res, calls = retryRes, retryCalls
 			} else {
 				s.upErrors.Add(1)
