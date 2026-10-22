@@ -245,6 +245,16 @@ func (c *Client) Send(ctx context.Context, method, path string, body []byte, hea
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusTooManyRequests && !clear.IsChallenge(resp) {
+		// A plain 429 (no Vercel challenge markers): a rate limit. The slot
+		// that carried it is burned — retire it so the next live slot serves
+		// the next request — but the 429 itself passes through to the caller
+		// as today. No backoff retry, no replay (owner ruling): the pool
+		// rotation is the recovery.
+		c.logf("upstream: plain 429; retiring slot")
+		c.retireClearance(challengedCookie(resp))
+		return resp, nil
+	}
 	if !clear.IsChallenge(resp) {
 		return resp, nil
 	}
