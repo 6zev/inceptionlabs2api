@@ -30,10 +30,14 @@ type SearchSource struct {
 }
 
 // SearchResult is what a completed run yields: the rewritten queries seen so
-// far and the final ranked source list.
+// far, the final ranked source list, and — when the run reached synthesis —
+// the upstream's content-grounded answer. The answer's [n] citation markers
+// align with the sources order (the docs event's cite_index starts at 1 in
+// exactly the order Sources preserves).
 type SearchResult struct {
 	Queries []string
 	Sources []SearchSource
+	Answer  string
 }
 
 // SearchConfigResponse is the GET /api/search-lab/config response. Only the
@@ -63,16 +67,20 @@ type searchEvent struct {
 	Message string         `json:"message"`
 	Run     int            `json:"run"`
 	Of      int            `json:"of"`
+	// Answer is the run_done event's full synthesized answer.
+	Answer string `json:"answer"`
+	// D is one answer_delta event's incremental text.
+	D string `json:"d"`
 }
 
-// searchEventTypes the collector reacts to. Rounds, call_start, and run_done
-// are only used to recognise the end of the retrieval phase.
+// searchEventTypes the collector reacts to. call_start (synthesize included)
+// and rounds are NOT terminators: the measured 2026-10-22 capture shows the
+// content-grounded answer phase follows them, ending at run_done.
 const (
-	searchEventQueries   = "queries"
-	searchEventDocs      = "docs"
-	searchEventError     = "error"
-	searchEventRounds    = "rounds"
-	searchEventCallStart = "call_start"
-	searchEventRunDone   = "run_done"
-	searchKindSynthesize = "synthesize"
+	searchEventQueries     = "queries"
+	searchEventDocs        = "docs"
+	searchEventError       = "error"
+	searchEventCallStart   = "call_start"
+	searchEventRunDone     = "run_done"
+	searchEventAnswerDelta = "answer_delta"
 )

@@ -32,6 +32,10 @@ const (
 	maxCollectedQueries = 32
 	maxCollectedSources = 50
 	maxQueryRunes       = 2000
+	// maxAnswerBytes bounds the retained synthesized answer (delta fallback
+	// included). The captured real answers are a few KB; the cap keeps a
+	// hostile upstream from growing an unbounded string.
+	maxAnswerBytes = 1 << 20
 )
 
 // absoluteSearchCap bounds a whole run independently of the sliding idle
@@ -40,11 +44,13 @@ const (
 // (the smallest captured run took 3.1 s).
 func absoluteSearchCap(idle time.Duration) time.Duration { return 10 * idle }
 
-// Search runs POST /api/search-lab/run and collects the rewritten queries
-// and the final docs source list. It stops reading as soon as retrieval is
-// finished — the last round's docs, a synthesize call, or run_done — because
-// snippets do not exist upstream and synthesis is pure latency. With depth>1
-// the follow-up queries and the last round's docs are the ones that count.
+// Search runs POST /api/search-lab/run and collects the rewritten queries,
+// the final docs source list, and the synthesized answer. The backend
+// retrieves FULL page content: rerank and synthesize both read the complete
+// documents, and run_done carries a content-grounded answer whose [n] markers
+// align with the docs source order (measured 2026-10-22; synthesis costs
+// only ~300-400 ms on top of retrieval). The answer is the content-level
+// search result; queries and sources alone are the retrieval-level view.
 //
 // idle is a sliding watchdog reset by every received line; a stalled run is
 // abandoned with ErrIdleTimeout. The caller owns cancellation via ctx.
@@ -96,22 +102,39 @@ func decodedBody(body io.Reader, encoding string) (io.Reader, error) {
 	}
 }
 
-// collectSearch consumes NDJSON lines into a SearchResult. Malformed lines
-// and unknown event types are skipped, matching the playground's reader. It
-// runs on the shared line pump (lines, §6.1) with the search hard cap, so a
-// stalled body is abandoned and a keep-alive trickle cannot pin a request.
+// collectSearch consumes NDJSON lines into a SearchResult, reading through
+// the synthesis phase to the run_done answer. Malformed lines and unknown
+// event types are skipped, matching the playground's reader. It runs on the
+// shared line pump (lines, §6.1) with the search hard cap, so a stalled body
+// is abandoned and a keep-alive trickle cannot pin a request.
+//
+// Terminal rules (empirical stream shape, 2026-10-22):
+//   - run_done is the primary terminator: its answer (or, if it carries none,
+//     the accumulated answer_delta text) is captured and the run is complete.
+//   - call_start(synthesize) and rounds are NOT terminators; the answer
+//     phase follows them.
+//   - an error event before docs fails the run (SearchError): retrieval
+//     itself failed. An error event after docs returns the retrieval result
+//     with an empty answer instead: retrieval already succeeded, and the
+//     model keeps working from the sources rather than losing the search.
+//   - a body that ends without run_done but with docs is a complete
+//     retrieval whose answer is whatever deltas arrived (possibly none).
+//     A body that ends before docs is ErrSearchIncomplete, unchanged.
+//   - the watchdogs still bound the whole run: a synthesis that stalls is
+//     abandoned with the results so far (docs + partial answer), because
+//     retrieval already succeeded.
 func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*SearchResult, error) {
 	res := &SearchResult{}
 	seenQuery := make(map[string]bool)
 	haveDocs := false
+	var answer strings.Builder
 	var stopErr error
 
-	// finish ends the pump; it is what every terminal event returns.
-	finish := func() error {
-		if !haveDocs {
-			return ErrSearchIncomplete
+	// collectDelta bounds the retained answer text.
+	collectDelta := func(d string) {
+		if answer.Len() < maxAnswerBytes {
+			answer.WriteString(d)
 		}
-		return errStopLines
 	}
 
 	pumpErr := lines(ctx, r, idle, absoluteSearchCap(idle), func(line string) error {
@@ -139,18 +162,16 @@ func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*Searc
 		case searchEventDocs:
 			res.Sources = normalizeSources(ev.Sources)
 			haveDocs = true
-		case searchEventRounds:
-			// The last round's docs are in: retrieval is complete and
-			// only follow-up questions or synthesis remain.
-			if haveDocs && ev.Run >= ev.Of {
-				return finish()
-			}
-		case searchEventCallStart:
-			if ev.Kind == searchKindSynthesize {
-				return finish()
-			}
+		case searchEventAnswerDelta:
+			collectDelta(ev.D)
 		case searchEventRunDone:
-			return finish()
+			// The captured runs carry the full answer here; the delta
+			// fallback covers an upstream that omits it.
+			res.Answer = ev.Answer
+			if res.Answer == "" {
+				res.Answer = answer.String()
+			}
+			return errStopLines
 		case searchEventError:
 			stopErr = &SearchError{Message: ev.Message}
 			return errStopLines
@@ -158,19 +179,34 @@ func collectSearch(ctx context.Context, r io.Reader, idle time.Duration) (*Searc
 		return nil
 	})
 	if stopErr != nil {
+		// Retrieval already succeeded: an error from the synthesis phase
+		// must not discard it.
+		if haveDocs {
+			return res, nil
+		}
 		return nil, stopErr
 	}
 	switch {
 	case errors.Is(pumpErr, errStopLines):
 		return res, nil
 	case errors.Is(pumpErr, io.EOF):
-		// A docs event is already the product, so a body that closes after
-		// one is a complete answer; closing before one is truncation and must
-		// not look like an empty result set.
+		// A docs event is already the retrieval product, so a body that
+		// closes after one is complete — the answer is whatever deltas
+		// arrived; closing before one is truncation and must not look
+		// like an empty result set.
 		if !haveDocs {
 			return nil, ErrSearchIncomplete
 		}
+		res.Answer = answer.String()
 		return res, nil
+	case errors.Is(pumpErr, ErrIdleTimeout):
+		// A stalled synthesis is abandoned with the results so far:
+		// retrieval succeeded and its sources keep the model working.
+		if haveDocs {
+			res.Answer = answer.String()
+			return res, nil
+		}
+		return nil, pumpErr
 	default:
 		return nil, pumpErr
 	}
