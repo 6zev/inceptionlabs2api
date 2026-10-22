@@ -75,6 +75,7 @@ func decodeTools(raw map[string]json.RawMessage, req *ChatRequest) *RequestError
 		if err := json.Unmarshal(body, &items); err != nil || items == nil {
 			return Invalid("tools must be an array of function objects")
 		}
+		validated := make([]Tool, 0, len(items))
 		for i, item := range items {
 			var t Tool
 			if err := json.Unmarshal(item, &t); err != nil {
@@ -83,8 +84,11 @@ func decodeTools(raw map[string]json.RawMessage, req *ChatRequest) *RequestError
 			if t.Function.Name == "" {
 				return Invalid(fmt.Sprintf("tools[%d].function.name is required", i))
 			}
-			req.Tools = append(req.Tools, t)
+			validated = append(validated, t)
 		}
+		// Replace, not append: the plain unmarshal above already filled
+		// req.Tools from the same array.
+		req.Tools = validated
 	}
 
 	req.ToolChoice = ToolChoice{Kind: ToolChoiceAuto}

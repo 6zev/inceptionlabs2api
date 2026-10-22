@@ -300,3 +300,17 @@ func TestRequestErrorMessage(t *testing.T) {
 		t.Fatalf("Error() = %q", got)
 	}
 }
+
+// tools must be decoded exactly once: the plain unmarshal fills the field and
+// decodeTools validates the raw array, not append a second copy.
+func TestDecodeToolsAreNotDuplicated(t *testing.T) {
+	t.Parallel()
+	req, re := decodeStrict(t, `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[`+
+		`{"type":"function","function":{"name":"a"}},{"type":"function","function":{"name":"b"}}]}`)
+	if re != nil {
+		t.Fatalf("rejected: %+v", re)
+	}
+	if len(req.Tools) != 2 || req.Tools[0].Function.Name != "a" || req.Tools[1].Function.Name != "b" {
+		t.Fatalf("tools = %+v, want exactly [a b]", req.Tools)
+	}
+}
