@@ -207,38 +207,8 @@ func (m *Manifest) header() string {
 	return preamble + m.instructions
 }
 
-// example renders the call block's example. With one operation it uses that
-// operation's real name and first parameter, because the concrete form
-// answered where a placeholder form returned an empty answer repeatedly
-// (DESIGN-TOOLS.md §1.1). With several, a placeholder is the only truthful
-// example.
-func (m *Manifest) example() string {
-	if len(m.tools) == 1 {
-		t := m.tools[0]
-		arg := "value"
-		if p := firstProperty(t.Parameters); p != "" {
-			arg = p
-		}
-		return `{"name": ` + quoteJSON(t.Name) + `, "arguments": {` + quoteJSON(arg) + `: "…"}}`
-	}
-	return `{"name": "<operation>", "arguments": {"<arg>": "…"}}`
-}
-
-// firstProperty returns the first declared parameter name, or "".
-func firstProperty(raw json.RawMessage) string {
-	var schema struct {
-		Properties map[string]json.RawMessage `json:"properties"`
-	}
-	if json.Unmarshal(raw, &schema) != nil || len(schema.Properties) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(schema.Properties))
-	for k := range schema.Properties {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys[0]
-}
+// The skeleton carries the call contract in prose; it deliberately renders no
+// fabricated example block (the 14-probe matrix hit 7/8 without one).
 
 // instructions renders the tool_choice / parallel instructions.
 func instructions(c Choice, parallelOff bool) string {
