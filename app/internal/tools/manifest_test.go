@@ -296,3 +296,43 @@ func TestExpanded(t *testing.T) {
 		t.Fatalf("second expansion dropped the first schema")
 	}
 }
+
+// The native search tool is declared with a real parameter schema derived
+// from the search backend's request shape: query is required, config is
+// optional tuning.
+func TestNativeSearchToolDefinition(t *testing.T) {
+	t.Parallel()
+	tool := NativeSearchTool()
+	if tool.Name != NativeSearchName {
+		t.Fatalf("name = %q", tool.Name)
+	}
+	if tool.Description == "" {
+		t.Fatal("no description")
+	}
+	var schema struct {
+		Type       string                     `json:"type"`
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(tool.Parameters, &schema); err != nil {
+		t.Fatalf("parameters are not a schema: %v", err)
+	}
+	if schema.Type != "object" || schema.Properties["query"] == nil || schema.Properties["config"] == nil {
+		t.Fatalf("schema = %s", tool.Parameters)
+	}
+	if len(schema.Required) != 1 || schema.Required[0] != "query" {
+		t.Fatalf("required = %v", schema.Required)
+	}
+
+	// The manifest renders it like any client tool, with the schema inline.
+	m, err := BuildManifest([]Tool{tool}, Choice{Auto: true}, false)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if !strings.Contains(m.Preamble, `"name":"web_search"`) || !strings.Contains(m.Preamble, `"properties"`) {
+		t.Fatalf("preamble = %s", m.Preamble)
+	}
+	if len(m.Declared) != 1 || m.Declared[0] != NativeSearchName {
+		t.Fatalf("declared = %v", m.Declared)
+	}
+}

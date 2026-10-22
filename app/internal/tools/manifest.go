@@ -75,6 +75,32 @@ type Tool struct {
 	Parameters  json.RawMessage
 }
 
+// NativeSearchName is the gateway-served retrieval tool. It is offered as an
+// ordinary manifest entry, so the model sees it exactly like a client tool;
+// the server answers its calls itself and never emits them to the client.
+const NativeSearchName = "web_search"
+
+// NativeSearchTool is the definition of the gateway-served search tool. Its
+// parameters mirror the search backend's wire request (query plus the
+// search-lab config block); the server clamps and defaults them exactly as
+// /v1/web_search does.
+func NativeSearchTool() Tool {
+	return Tool{
+		Name:        NativeSearchName,
+		Description: "Search the web for current information. Use it when the answer depends on facts you cannot verify from memory.",
+		Parameters: json.RawMessage(`{"type":"object","properties":{` +
+			`"query":{"type":"string","description":"The search query, phrased as a question or a few keywords."},` +
+			`"config":{"type":"object","description":"Optional retrieval tuning; defaults are almost always right.",` +
+			`"properties":{` +
+			`"fanout":{"type":"integer","description":"Number of parallel query variants (1-5)."},` +
+			`"depth":{"type":"integer","description":"Retrieval rounds (1-3)."},` +
+			`"keep_top_k":{"type":"integer","description":"Sources to keep."},` +
+			`"effort":{"type":"string","description":"Retrieval effort, e.g. instant."}` +
+			`}}},` +
+			`"required":["query"]}`),
+	}
+}
+
 // Choice is tool_choice normalised by the decoder. Exactly one shape is set;
 // Auto is also the zero value (OpenAI's default when tools are present).
 type Choice struct {
