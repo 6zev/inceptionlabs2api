@@ -28,11 +28,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 	defer stream.Close()
 	s.streams.Add(1)
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
+	setStreamHeaders(w)
 	flusher, _ := w.(http.Flusher)
 
 	id := upstream.RandomID("chatcmpl")

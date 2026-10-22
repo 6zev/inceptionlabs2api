@@ -177,15 +177,7 @@ func recoveryRequest(ureq *upstream.ChatRequest, res *round, message string) *up
 // verbatim — call or prose, empty or not; a transport failure keeps the
 // ORIGINAL round rather than failing a client who already has an answer.
 func (s *Server) recoverRound(ctx context.Context, ureq *upstream.ChatRequest, manifest *tools.Manifest, res *round, kind tools.RecoveryKind) *round {
-	retryReq := ureq
-	switch {
-	case res.emptyToolAnswer():
-		// Legacy empty branch: fresh stream, same manifest.
-	case kind == tools.RecoveryTruncated:
-		retryReq = recoveryRequest(ureq, res, tools.RetryMessageTruncated(res.content))
-	case kind == tools.RecoveryParseFailed:
-		retryReq = recoveryRequest(ureq, res, tools.RetryMessageParseFailed(res.content))
-	}
+	retryReq := recoveryRequestFor(ureq, res, kind)
 	s.logf("tools: %s, retrying once", retryLogReason(kind, res))
 	retry, err := s.readRound(ctx, retryReq, manifest)
 	if err != nil {
@@ -204,9 +196,10 @@ func retryLogReason(kind tools.RecoveryKind, res *round) string {
 	return fmt.Sprintf("[recovery kind=%s] broken-call round", kind)
 }
 
-// recoveryRequestFor builds the ureq a broken-round native retry re-asks
-// with. The empty answer keeps the same manifest (legacy); the broken-call
-// kinds carry the original output plus the retry message.
+// recoveryRequestFor builds the ureq a recovery retry re-asks with, shared by
+// every retry path (stream/non-stream × plain/native). The empty answer
+// keeps the same manifest (legacy); the broken-call kinds carry the original
+// output appended as history plus the retry message.
 func recoveryRequestFor(ureq *upstream.ChatRequest, res *round, kind tools.RecoveryKind) *upstream.ChatRequest {
 	switch {
 	case res.emptyToolAnswer():
@@ -240,6 +233,18 @@ func emitToolCalls(w http.ResponseWriter, flusher http.Flusher, calls []tools.Ca
 	return emitted
 }
 
+// setStreamHeaders commits the SSE response headers shared by every streaming
+// path (plain chat, tools, native). Headers are set only after the upstream
+// stream is open and the round(s) are classified, so early failures still
+// carry a proper HTTP status.
+func setStreamHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+}
+
 // streamTools is the streaming path for a plain manifest. With the
 // native search tool active it runs the internal loop first: every round is
 // consumed privately (no bytes) until the model stops calling web_search, and
@@ -268,11 +273,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 	}
 	wireDumpRound(rtag, res.content, res.calls)
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
+	setStreamHeaders(w)
 	flusher, _ := w.(http.Flusher)
 	s.streams.Add(1)
 
@@ -312,11 +313,7 @@ func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upst
 		}
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
+	setStreamHeaders(w)
 	flusher, _ := w.(http.Flusher)
 	s.streams.Add(1)
 
