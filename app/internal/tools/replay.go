@@ -40,10 +40,15 @@ func RenderAssistant(text string, calls []EncodedCall) string {
 	}
 	var b strings.Builder
 	b.WriteString(text)
+	// Each rendered block ends with '\n', so only the transition out of the
+	// opening text can need a separator — tracked instead of re-reading the
+	// builder's tail (which would copy the whole buffer per call).
+	needNL := b.Len() > 0 && !strings.HasSuffix(text, "\n")
 	for _, c := range calls {
-		if b.Len() > 0 && !strings.HasSuffix(b.String(), "\n") {
+		if needNL {
 			b.WriteByte('\n')
 		}
+		needNL = false
 		b.WriteString(callStart)
 		b.WriteString(`{"id":`)
 		b.WriteString(quoteJSON(c.ID))

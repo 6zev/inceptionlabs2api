@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"unicode/utf8"
@@ -23,6 +24,14 @@ const (
 	// emitted as prose and scanning stops, so a hostile stream cannot grow
 	// the buffer without limit (DESIGN-TOOLS.md §2, §7 T17).
 	maxBlockBytes = 64 << 10
+)
+
+// Byte-slice views of the start markers, hoisted once: Feed runs per chunk
+// and every scan of buf goes through bytes.Index instead of a string copy
+// of the whole buffer.
+var (
+	callStartBytes  = []byte(callStart)
+	blockStartBytes = []byte(blockStart)
 )
 
 // Call is one parsed tool invocation with its arguments still JSON-encoded.
@@ -86,8 +95,8 @@ func (p *Parser) Calls() []Call { return p.calls }
 
 // findStart returns the earliest start marker index in buf.
 func (p *Parser) findStart() (int, string) {
-	ci := strings.Index(string(p.buf), callStart)
-	bi := strings.Index(string(p.buf), blockStart)
+	ci := bytes.Index(p.buf, callStartBytes)
+	bi := bytes.Index(p.buf, blockStartBytes)
 	switch {
 	case ci < 0 && bi < 0:
 		return -1, ""
@@ -246,9 +255,9 @@ func parseInvoke(s string) (string, string, bool) {
 			b.WriteByte(',')
 		}
 		first = false
-		writeJSONString(&b, key)
+		b.WriteString(quoteJSON(key))
 		b.WriteByte(':')
-		writeJSONString(&b, val)
+		b.WriteString(quoteJSON(val))
 	}
 	b.WriteByte('}')
 	return name, b.String(), true
@@ -342,11 +351,4 @@ func runeFloor(buf []byte, cut int) int {
 		cut--
 	}
 	return cut
-}
-
-// writeJSONString writes s as a JSON string literal. It uses the encoder so
-// quotes, backslashes, control characters and invalid UTF-8 are handled.
-func writeJSONString(b *strings.Builder, s string) {
-	enc, _ := json.Marshal(s)
-	b.Write(enc)
 }

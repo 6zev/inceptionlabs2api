@@ -1,6 +1,9 @@
 package tools
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // RecoveryKind classifies a zero-call round by whether it looks like a broken
 // attempt at a tool call and therefore deserves one recovery retry.
@@ -56,6 +59,18 @@ func ForeignOpenMarker(s string) bool {
 	return false
 }
 
+// foreignEnvelopes lists the XML-ish envelope shapes the upstream model was
+// observed reproducing (ToolForge's detector set), each with its closer. A
+// detector that does not recognize a marker simply leaves it uncounted.
+var foreignEnvelopes = []struct{ open, close string }{
+	{"<tool_calls>", "</tool_calls>"},
+	{"<tool_use>", "</tool_use>"},
+}
+
+// foreignJSONOpeners are the JSON-field openers with no closer shape; a
+// single occurrence is an opened envelope.
+var foreignJSONOpeners = []string{`"tool_calls":`, "function.name:"}
+
 // ClassifyNoCall classifies a round that produced zero parsed calls.
 // hasOpenMarker, when non-nil, additionally recognizes foreign envelope
 // shapes; nil restricts classification to our own protocol.
@@ -82,30 +97,27 @@ func ClassifyNoCall(text string, hasOpenMarker func(string) bool) RecoveryKind {
 	// Envelope balance over our own protocol markers.
 	nOpen := strings.Count(text, callStart)
 	nClose := strings.Count(text, callEnd)
-	// Foreign openers count as opens only when a detector is attached; their
+	// Foreign markers count only when the detector recognizes them. Their
 	// closers are unknown to us, so any foreign open with zero parsed calls
 	// is at best parse-failed and at worst truncated — truncated when it
 	// never closed, which strings.Count of the closer decides.
-	foreignClosed := false
+	foreignSeen := false
 	if hasOpenMarker != nil {
-		for _, probe := range []string{
-			"<tool_calls>", "</tool_calls>",
-			"<tool_use>", "</tool_use>",
-		} {
-			if hasOpenMarker(probe) {
-				if strings.HasSuffix(probe, ">") && !strings.Contains(probe, "</") {
-					nOpen += strings.Count(text, probe)
-				} else {
-					nClose += strings.Count(text, probe)
-				}
+		for _, env := range foreignEnvelopes {
+			if hasOpenMarker(env.open) {
+				n := strings.Count(text, env.open)
+				nOpen += n
+				foreignSeen = foreignSeen || n > 0
+			}
+			if hasOpenMarker(env.close) {
+				nClose += strings.Count(text, env.close)
 			}
 		}
-		// The JSON-field openers ("tool_calls":, function.name:) have no
-		// closer shape; a single occurrence is an opened envelope.
-		for _, probe := range []string{`"tool_calls":`, "function.name:"} {
+		for _, probe := range foreignJSONOpeners {
 			if hasOpenMarker(probe) {
-				nOpen += strings.Count(text, probe)
-				foreignClosed = foreignClosed || strings.Count(text, probe) > 0
+				n := strings.Count(text, probe)
+				nOpen += n
+				foreignSeen = foreignSeen || n > 0
 			}
 		}
 	}
@@ -123,7 +135,7 @@ func ClassifyNoCall(text string, hasOpenMarker func(string) bool) RecoveryKind {
 		}
 	}
 
-	if opened || foreignClosed {
+	if opened || foreignSeen {
 		return RecoveryParseFailed
 	}
 	return RecoveryClean
@@ -164,15 +176,20 @@ func unbalancedJSONTail(s string) bool {
 	return depth > 0
 }
 
-// lastNonSpace returns the final non-space rune of s, 0 for empty.
+// lastNonSpace returns the final non-space rune of s, 0 for empty. It walks
+// backwards rune-by-rune (utf8.DecodeLastRuneInString) so no rune slice is
+// materialized.
 func lastNonSpace(s string) rune {
-	runes := []rune(s)
-	for i := len(runes) - 1; i >= 0; i-- {
-		switch runes[i] {
+	for s != "" {
+		r, size := utf8.DecodeLastRuneInString(s)
+		if r == utf8.RuneError && size <= 1 {
+			return r // malformed tail byte: treat as a real character
+		}
+		switch r {
 		case ' ', '\t', '\n', '\r':
-			continue
+			s = s[:len(s)-size]
 		default:
-			return runes[i]
+			return r
 		}
 	}
 	return 0
