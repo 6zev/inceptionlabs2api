@@ -2,6 +2,18 @@ package upstream
 
 // Event is one parsed `data:` payload from the upstream stream
 // (x-vercel-ai-ui-message-stream: v1).
+//
+// Empirical note (measured 2026-10-22, 55 rounds of wire logs incl. real
+// client traffic): the upstream /api/chat endpoint never emits
+// reasoning-delta events. It sends reasoning-start/reasoning-end pairs with
+// nothing between them — A/B with reasoningEffort high vs medium is
+// byte-identical, and reasoning tokens are only observable on /api/voice/turn,
+// not chat. Clients therefore see no thinking because the upstream emits
+// none; that is upstream behavior, not a gateway bug. DO NOT "fix" the empty
+// deltas by inventing reasoning content. The start/end pair still gates UI
+// spinners on some clients, so both events must keep being consumed (they
+// are: only the delta events carry text, and the reasoning handlers in
+// internal/server forward whatever arrives — empty strings included).
 type Event struct {
 	Type string `json:"type"`
 	// Delta is the incremental text for reasoning-delta and text-delta.
