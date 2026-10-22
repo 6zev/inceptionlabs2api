@@ -18,6 +18,7 @@ const (
 	CodeUpstreamStream      = "upstream_stream_error"
 	CodeUpstreamAuth        = "upstream_auth_failed"
 	CodeUpstreamClearance   = "upstream_clearance_failed"
+	CodeUpstreamEmpty       = "upstream_empty_response"
 	CodeRequestTooLarge     = "request_too_large"
 )
 
