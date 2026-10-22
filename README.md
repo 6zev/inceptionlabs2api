@@ -132,6 +132,7 @@ curl -N http://localhost:3000/v1/chat/completions \
 | `IL2API_SEARCH_TIMEOUT` | `60s` | `/v1/web_search` 的滑动空闲看门狗（每个 NDJSON 行都会重置） |
 | `IL2API_SEARCH_CONFIG_CHECK` | `on` | `on`/`off`，是否在启动时后台探测一次 `/api/search-lab/config`；`off` 时 `search.available` 恒为 `null` |
 | `IL2API_SEARCH_PROBE_TIMEOUT` | `15s` | 单次启动探测的超时上限 |
+| `IL2API_NATIVE_WEB_SEARCH` | `off` | `on`/`off`。工具请求未自带 `web_search` 时，网关自动声明并内部执行 `web_search`（最多 3 次/请求，复用 `/v1/web_search` 后端），最终只把模型的最终回答返回客户端；客户端自己声明了 `web_search` 时不接管 |
 | `IL2API_AUDIO_TIMEOUT` | `120s` | `/api/tts`、`/api/stt` 单次调用的整体超时（响应头 + 响应体） |
 | `IL2API_AUDIO_MAX_BYTES` | `26214400`（25 MiB） | `/v1/audio/transcriptions` 上传上限，超出直接 413，不调用上游 |
 | `IL2API_DECISIONS_TIMEOUT` | `120s` | `/api/decide/run` 单次调用的整体超时（响应头 + 响应体） |

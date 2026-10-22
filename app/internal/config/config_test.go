@@ -358,3 +358,43 @@ func TestDecisionConfigValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestNativeWebSearchToggle(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		value   string
+		want    bool
+		wantErr bool
+	}{
+		{"default off", "", false, false},
+		{"on", "on", true, false},
+		{"true", "TRUE", true, false},
+		{"1", "1", true, false},
+		{"off", "off", false, false},
+		{"0", "0", false, false},
+		{"garbage", "maybe", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := map[string]string{}
+			if tc.value != "" {
+				env["IL2API_NATIVE_WEB_SEARCH"] = tc.value
+			}
+			cfg, err := FromEnv(envMap(env))
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "NATIVE_WEB_SEARCH") {
+					t.Fatalf("err = %v, want NATIVE_WEB_SEARCH error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FromEnv: %v", err)
+			}
+			if cfg.NativeWebSearch != tc.want {
+				t.Fatalf("NativeWebSearch = %v, want %v", cfg.NativeWebSearch, tc.want)
+			}
+		})
+	}
+}

@@ -71,6 +71,10 @@ type Config struct {
 	// PreambleStyle selects the tool preamble skeleton ("hermes" or
 	// "inception"). Empty keeps the measured hermes default.
 	PreambleStyle string
+	// NativeWebSearch auto-declares web_search on tool-bearing chat requests
+	// and serves its calls from the attached Searcher. A request that already
+	// declares web_search, or a server without a Searcher, keeps the tool off.
+	NativeWebSearch bool
 	// Logf is optional; nil means log.Printf.
 	Logf func(format string, args ...any)
 }

@@ -77,6 +77,7 @@ func run() error {
 		AudioMaxBytes:      cfg.AudioMaxBytes,
 		DecisionTimeout:    cfg.DecisionTimeout,
 		PreambleStyle:      cfg.PreambleStyle,
+		NativeWebSearch:    cfg.NativeWebSearch,
 		Logf:               logf,
 	}, up, p)
 	srv.SetSearcher(up)

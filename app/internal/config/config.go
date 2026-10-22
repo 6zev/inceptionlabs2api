@@ -27,6 +27,10 @@ type Config struct {
 	// PreambleStyle selects the tool preamble skeleton ("hermes" or
 	// "inception"); wired to tools.PreStyle at boot.
 	PreambleStyle string
+	// NativeWebSearch auto-declares a gateway-served web_search tool on
+	// tool-bearing chat requests and executes its calls against the search
+	// backend. Off by default.
+	NativeWebSearch bool
 	// ContextChars is a deprecated no-op, retained so existing deployments do
 	// not fail to boot. There is no client-side length guard (SPEC §1.1).
 	ContextChars   int
@@ -55,15 +59,16 @@ type Config struct {
 // Defaults returns the configuration used when no environment variable is set.
 func Defaults() Config {
 	return Config{
-		Addr:           ":3000",
-		UpstreamBase:   "https://chat.inceptionlabs.ai",
-		Model:          "mercury-3",
-		PoolMin:        2,
-		PoolMax:        8,
-		PoolTTL:        30 * time.Minute,
-		IdleTimeout:    60 * time.Second,
-		ContextChars:   0,
-		SessionTimeout: 15 * time.Second,
+		Addr:            ":3000",
+		UpstreamBase:    "https://chat.inceptionlabs.ai",
+		Model:           "mercury-3",
+		PoolMin:         2,
+		PoolMax:         8,
+		PoolTTL:         30 * time.Minute,
+		IdleTimeout:     60 * time.Second,
+		ContextChars:    0,
+		SessionTimeout:  15 * time.Second,
+		NativeWebSearch: false,
 
 		SearchTimeout:      60 * time.Second,
 		SearchConfigCheck:  true,
@@ -174,6 +179,16 @@ func FromEnv(getenv func(string) string) (Config, error) {
 			c.SearchConfigCheck = false
 		default:
 			return Config{}, fmt.Errorf("config: IL2API_SEARCH_CONFIG_CHECK must be on or off, got %q", v)
+		}
+	}
+	if v := strings.TrimSpace(strings.ToLower(getenv("IL2API_NATIVE_WEB_SEARCH"))); v != "" {
+		switch v {
+		case "on", "1", "true":
+			c.NativeWebSearch = true
+		case "off", "0", "false":
+			c.NativeWebSearch = false
+		default:
+			return Config{}, fmt.Errorf("config: IL2API_NATIVE_WEB_SEARCH must be on or off, got %q", v)
 		}
 	}
 
