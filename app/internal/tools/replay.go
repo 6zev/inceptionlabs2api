@@ -124,13 +124,15 @@ func RenderResults(results []Result) string {
 }
 
 // attrEscape makes a value safe inside a double-quoted bracket attribute: it
-// removes the characters that could terminate the attribute or forge a new
-// line. XML entity escaping is intentionally NOT applied — the block is not
-// XML and entities would reach the model literally.
+// replaces the characters that could terminate the attribute or forge a new
+// line with visible substitutes (] becomes the fullwidth 〕, U+3015, so a
+// client id or name containing ] stays recognizably readable instead of being
+// silently destroyed). XML entity escaping is intentionally NOT applied — the
+// block is not XML and entities would reach the model literally.
 func attrEscape(s string) string {
 	r := strings.NewReplacer(
 		`"`, `'`,
-		"]", "",
+		"]", "〕",
 		"\n", " ",
 		"\r", " ",
 	)
