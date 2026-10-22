@@ -18,6 +18,9 @@ type toolPlan struct {
 	// native reports that the gateway's own web_search tool was added to the
 	// manifest, so its calls must be served internally rather than emitted.
 	native bool
+	// folded reports that hist was folded into a transcript bubble, so the
+	// preamble carries the history-format teaching section.
+	folded bool
 }
 
 // planTools builds the manifest and history for a tool-bearing request. It
@@ -56,7 +59,19 @@ func planTools(req *openai.ChatRequest, native *tools.Tool) (*toolPlan, *openai.
 	if re != nil {
 		return nil, re
 	}
-	return &toolPlan{manifest: manifest, hist: hist, native: native != nil}, nil
+	// Fold before any upstream conversion and exactly once per client
+	// request: the native loop and every recovery retry append to the
+	// already-folded history, so folding never re-runs and the bubble never
+	// grows a second layer. The manifest preamble occupies one upstream
+	// slot, so it counts toward the fold trigger.
+	hist, folded := openai.FoldHistory(hist, true)
+	if folded {
+		// Additive preamble protocol (wire-format law: the measured skeleton
+		// sentences stay byte-identical; the section is appended only when
+		// folding fires, so unfolded requests keep today's preamble).
+		manifest.Preamble += "\n\n" + openai.HistoryFormatSection + "\n"
+	}
+	return &toolPlan{manifest: manifest, hist: hist, native: native != nil, folded: folded}, nil
 }
 
 // chatWithTools answers a request whose tools are active. A plain manifest

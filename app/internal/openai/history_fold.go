@@ -23,6 +23,10 @@ const (
 	// fold. The count is the client-side normalized history length plus one
 	// when a tool preamble will occupy a slot.
 	foldTrigger = 80
+	// FoldTrigger is the exported trigger for callers that decide whether to
+	// attempt a fold before converting their message shape (the plain chat
+	// path converts TextMessages only when a fold is possible).
+	FoldTrigger = foldTrigger
 	// foldKeepRecent is the number of newest turn-group messages kept
 	// verbatim after the fold boundary.
 	foldKeepRecent = 20
