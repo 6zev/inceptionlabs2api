@@ -16,6 +16,8 @@ import (
 // the upstream stream is open, so pool and upstream failures still carry a
 // proper HTTP status.
 func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string) {
+	rtag := wireTag()
+	wireLog(rtag, "PLAIN STREAM (no tools path)")
 	stream, err := s.up.Chat(r.Context(), ureq, s.cfg.IdleTimeout, func(line string) {
 		s.logf("upstream: skipping malformed SSE line: %q", truncate(line, 200))
 	})
@@ -61,6 +63,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 	var cites upstream.CitationCollector
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
 		cites.Observe(ev, s.logf)
+		defer wireDumpEvent(rtag, ev, 0, 0)
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
 			if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {

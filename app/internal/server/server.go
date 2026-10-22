@@ -270,6 +270,8 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, re)
 		return
 	}
+	tag := wireTag()
+	wireDumpRequest(tag, body)
 	req, re := openai.Decode(body)
 	if re != nil {
 		s.fail(w, re)

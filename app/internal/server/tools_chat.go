@@ -91,8 +91,10 @@ func (s *Server) readRound(ctx context.Context, ureq *upstream.ChatRequest, mani
 
 	var out round
 	parser := tools.NewParser(manifest.Declared)
+	rtag := wireTag()
 	readErr := stream.Reader.Read(ctx, func(ev upstream.Event) error {
 		out.cites.Observe(ev, s.logf)
+		defer wireDumpEvent(rtag, ev, 0, 0)
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
 			out.reasoning += ev.Reasoning()
@@ -152,6 +154,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 		s.streamNative(w, r, ureq, model, plan)
 		return
 	}
+	rtag := wireTag()
 	stream, err := s.up.Chat(r.Context(), ureq, s.cfg.IdleTimeout, func(line string) {
 		s.logf("upstream: skipping malformed SSE line: %q", truncate(line, 200))
 	})
@@ -171,7 +174,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 
 	id := upstream.RandomID("chatcmpl")
 	created := s.now().Unix()
-	write := s.chunkWriter(w, flusher, id, created, model)
+	write := s.chunkWriter(w, flusher, id, created, model, rtag)
 	if !write(openai.Delta{Role: "assistant"}, nil) {
 		return
 	}
@@ -188,6 +191,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 	bufReasoning := ""
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
 		cites.Observe(ev, s.logf)
+		defer wireDumpEvent(rtag, ev, 0, len(parser.Calls()))
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
 			if sawAlive {
@@ -238,6 +242,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 			cites2 := upstream.CitationCollector{}
 			readErr2 := stream2.Reader.Read(r.Context(), func(ev upstream.Event) error {
 				cites2.Observe(ev, s.logf)
+				defer wireDumpEvent(rtag, ev, 0, len(parser2.Calls()))
 				switch ev.Type {
 				case upstream.EventReasoningDelta:
 					if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
@@ -254,6 +259,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 			})
 			if readErr2 == nil {
 				cites = cites2
+				wireDumpRound(rtag, string(parser2.Flush()), parser2.Calls())
 				s.finishStream(w, flusher, write, parser2, cites, emitted)
 				return
 			}
@@ -272,6 +278,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 		s.streamFailure(w, r, flusher, readErr)
 		return
 	}
+	wireDumpRound(rtag, string(parser.Flush()), parser.Calls())
 	s.finishStream(w, flusher, write, parser, cites, emitted)
 }
 
@@ -280,7 +287,9 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 // from an internal round is ever written, so the first client-visible frame
 // is always part of the answer the client asked for.
 func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, plan *toolPlan) {
+	rtag := wireTag()
 	res, calls, err := s.resolveNative(r.Context(), ureq, plan)
+	wireDumpRound(rtag, res.content, calls)
 	if err != nil {
 		if nativeAbort(r, err) {
 			return
@@ -309,7 +318,7 @@ func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upst
 	flusher, _ := w.(http.Flusher)
 	s.streams.Add(1)
 
-	write := s.chunkWriter(w, flusher, upstream.RandomID("chatcmpl"), s.now().Unix(), model)
+	write := s.chunkWriter(w, flusher, upstream.RandomID("chatcmpl"), s.now().Unix(), model, rtag)
 	if !write(openai.Delta{Role: "assistant"}, nil) {
 		return
 	}
@@ -422,7 +431,7 @@ func (s *Server) streamFailure(w http.ResponseWriter, r *http.Request, flusher h
 }
 
 // chunkWriter builds the frame writer for one streamed response.
-func (s *Server) chunkWriter(w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string) func(openai.Delta, *string) bool {
+func (s *Server) chunkWriter(w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string, tag string) func(openai.Delta, *string) bool {
 	return func(delta openai.Delta, finish *string) bool {
 		chunk := openai.Chunk{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
@@ -431,6 +440,7 @@ func (s *Server) chunkWriter(w http.ResponseWriter, flusher http.Flusher, id str
 		if err := writeEvent(w, chunk); err != nil {
 			return false
 		}
+		wireDumpChunk(tag, chunk)
 		if flusher != nil {
 			flusher.Flush()
 		}
