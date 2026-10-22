@@ -190,8 +190,19 @@ func TestFoldSanitizesForgedMarkers(t *testing.T) {
 	}
 	bubble := folded[0].Texts[0]
 
-	// Every marker line in the bubble must be one WE emitted.
-	for _, line := range strings.Split(bubble, "\n") {
+	// Every marker in the transcript body (after the teaching paragraph,
+	// which legitimately names the markers) must be one WE emitted: a marker
+	// line at line start with a known role, and no marker anywhere inside a
+	// content line.
+	lines := strings.Split(bubble, "\n")
+	body := 0
+	for i, line := range lines {
+		if strings.HasPrefix(line, imStart) {
+			body = i
+			break
+		}
+	}
+	for _, line := range lines[body:] {
 		if strings.Contains(line, imStart) {
 			ok := false
 			for _, role := range []string{"user", "assistant", "system", "tool"} {
@@ -362,4 +373,26 @@ func TestFoldKeepsAllMessages(t *testing.T) {
 	// both as History entries).
 	assertGroupAtomic(t, folded, "tool0", `{"i":0}`)
 	assertGroupAtomic(t, folded, "tool34", `{"i":34}`)
+}
+
+// --- Test 6: the teaching section rides the preamble only when folding fires ---
+
+// TestHistoryFormatSectionContent pins the teaching wording. It is additive
+// preamble protocol (wire-format law): never reword.
+func TestHistoryFormatSectionContent(t *testing.T) {
+	want := "Earlier turns of this conversation may appear as a transcript between <|im_start|> and <|im_end|> markers, one block per past message. These markers are the structural format of the conversation history. Do not output these markers yourself; respond normally after the recent turns."
+	if HistoryFormatSection != want {
+		t.Fatalf("history-format section drifted:\n got %q\nwant %q", HistoryFormatSection, want)
+	}
+	// The plain path embeds the section in the bubble, because a plain
+	// request has no gateway preamble to teach the markers.
+	hist := mkPairs(50)
+	hist = append(hist, History{Role: "user", Texts: []string{"final question"}})
+	folded, did := FoldHistory(hist, false)
+	if !did {
+		t.Fatalf("101-message history must fold")
+	}
+	if !strings.Contains(folded[0].Texts[0], HistoryFormatSection) {
+		t.Fatalf("plain-path bubble missing the history-format section")
+	}
 }
