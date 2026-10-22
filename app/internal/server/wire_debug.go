@@ -2,9 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"inceptionlabs2api/internal/openai"
 	"inceptionlabs2api/internal/tools"
-	"fmt"
 	"log"
 	"os"
 	"strings"
