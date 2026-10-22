@@ -248,7 +248,7 @@ func (c *Client) SearchConfig(ctx context.Context) (*SearchConfigResponse, error
 	// token retries like every other family instead of failing first try.
 	resp, err := c.authed(ctx, http.MethodGet, "/api/search-lab/config", "search-config", nil, c.timeout, func(r *http.Request) {
 		r.Header.Set("Accept", "application/json")
-	})
+	}, nil)
 	if err != nil {
 		return nil, err
 	}

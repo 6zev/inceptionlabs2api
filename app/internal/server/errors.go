@@ -43,6 +43,8 @@ func (s *Server) upstreamError(err error) *openai.RequestError {
 	case errors.Is(err, context.Canceled):
 		return openai.New(http.StatusRequestTimeout, "invalid_request_error", openai.CodeInvalidRequest, "",
 			"request canceled by the client")
+	case errors.Is(err, errUpstreamEmpty):
+		return upstreamEmpty()
 	}
 	var se *upstream.StatusError
 	if errors.As(err, &se) {
@@ -71,6 +73,19 @@ func (s *Server) upstreamError(err error) *openai.RequestError {
 	}
 	return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamError, "",
 		"upstream request failed")
+}
+
+// errUpstreamEmpty marks the empty-completion failure mode: an upstream
+// stream that ended without ever producing visible text. It is never
+// returned by the transport; the streaming paths raise it locally when the
+// read loop finishes (or fails) with no text delta seen, so the client gets
+// a real HTTP 502 instead of a 200 with an empty SSE body.
+var errUpstreamEmpty = fmt.Errorf("upstream: empty response")
+
+// upstreamEmpty maps the empty-completion error to its client envelope.
+func upstreamEmpty() *openai.RequestError {
+	return openai.New(http.StatusBadGateway, "upstream_error", openai.CodeUpstreamEmpty, "",
+		"upstream returned an empty response")
 }
 
 // streamError maps a mid-stream read failure to an SSE error payload. Same

@@ -245,6 +245,16 @@ func (c *Client) Send(ctx context.Context, method, path string, body []byte, hea
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusTooManyRequests && !clear.IsChallenge(resp) {
+		// A plain 429 (no Vercel challenge markers): a rate limit. The slot
+		// that carried it is burned — retire it so the next live slot serves
+		// the next request — but the 429 itself passes through to the caller
+		// as today. No backoff retry, no replay (owner ruling): the pool
+		// rotation is the recovery.
+		c.logf("upstream: plain 429; retiring slot")
+		c.retireClearance(challengedCookie(resp))
+		return resp, nil
+	}
 	if !clear.IsChallenge(resp) {
 		return resp, nil
 	}
@@ -390,19 +400,61 @@ type Stream struct {
 // Close closes the response body.
 func (s *Stream) Close() error { return s.Body.Close() }
 
+// maxUpstreamMessages is the upstream's hard per-request message cap. A
+// "conversation is too long" rejection of a request at or below it can only
+// come from server-side per-session accumulation, which a fresh session
+// fixes; above it the request itself is over the line.
+const maxUpstreamMessages = 100
+
+// tooLongMarker is the upstream's own error phrase for the conversation
+// length rejection (case-insensitive match on the response body).
+const tooLongMarker = "conversation is too long"
+
+// isTooLong reports whether se is the upstream's conversation-length
+// rejection.
+func isTooLong(se *StatusError) bool {
+	return strings.Contains(strings.ToLower(se.Body), tooLongMarker)
+}
+
 // Chat opens a stream for req. It acquires a token, POSTs, and retries with a
 // fresh token on 401/403, at most maxAuthRetries times. It returns a typed
 // *StatusError for other non-200 responses and an error wrapping
 // ErrUnavailable when the pool cannot supply a token. Client cancellation and
 // transport failures never discard a token.
+//
+// When the upstream answers the "conversation is too long" rejection and the
+// request we sent carried at most maxUpstreamMessages — so the rejection is
+// session-accumulated, not ours — the token that carried it is discarded and
+// the IDENTICAL request is replayed once on the next live token (the lazy
+// session switch). A replay that fails for any reason surfaces the ORIGINAL
+// error verbatim; there are no loops. A request over the cap is legitimately
+// ours: plain passthrough, no switch.
 func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration, onMalformed func(string)) (*Stream, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("upstream: marshal chat request: %w", err)
 	}
-	resp, err := c.postAuthed(ctx, "/api/chat", "chat", body, idle, func(req *http.Request) {
-		req.Header.Set("Accept", "text/event-stream, application/json")
-	})
+	prepare := func(r *http.Request) {
+		r.Header.Set("Accept", "text/event-stream, application/json")
+	}
+	// tooLongSwitch is the lazy session switch: it runs INSIDE authed, where
+	// the failing token is in scope, so exactly that token is retired.
+	tooLongSwitch := func(failedToken string, se *StatusError) *http.Response {
+		if !isTooLong(se) || len(req.Messages) > maxUpstreamMessages {
+			return nil
+		}
+		c.logf("upstream: conversation too long on a %d-message request; retiring the session token and replaying once", len(req.Messages))
+		c.pool.Discard(failedToken)
+		retry, rerr := c.authed(ctx, http.MethodPost, "/api/chat", "chat", body, idle, prepare, nil)
+		if rerr != nil {
+			// One lazy retry, no loops: the original error passes through
+			// verbatim, exactly as before the switch existed.
+			c.logf("upstream: too-long replay failed: %v (passing the original error through)", rerr)
+			return nil
+		}
+		return retry
+	}
+	resp, err := c.authed(ctx, http.MethodPost, "/api/chat", "chat", body, idle, prepare, tooLongSwitch)
 	if err != nil {
 		return nil, err
 	}
@@ -418,10 +470,17 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration,
 // are a typed *StatusError and keep the token, since the pool never poisons a
 // token for an upstream fault. prepare may customise headers.
 //
+// onStatusError, when non-nil, is the caller's last-chance recovery hook: it
+// receives the token that carried the failed request and the typed error,
+// and may answer a replacement response (the chat family's lazy session
+// switch on "conversation is too long" is the one user). A nil return falls
+// through to the typed error. The hook's response is returned as-is: it is
+// the caller's contract that a successful hook replay is a valid 200.
+//
 // This is the one token-bearing request path (§6.1): chat, search, TTS, STT
 // and the search-config probe all call it, so none of them can grow its own
 // retry loop or forget to discard a rejected token.
-func (c *Client) authed(ctx context.Context, method, path, label string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
+func (c *Client) authed(ctx context.Context, method, path, label string, body []byte, headerTimeout time.Duration, prepare func(*http.Request), onStatusError func(failedToken string, se *StatusError) *http.Response) (*http.Response, error) {
 	if c.pool == nil {
 		return nil, fmt.Errorf("%w: no pool bound", ErrUnavailable)
 	}
@@ -460,7 +519,13 @@ func (c *Client) authed(ctx context.Context, method, path, label string, body []
 			bodyText, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 			resp.Body.Close()
 			c.logf("upstream: %s status %d: %s", label, resp.StatusCode, truncate(string(bodyText), 500))
-			return nil, &StatusError{Status: resp.StatusCode, Body: string(bodyText)}
+			se := &StatusError{Status: resp.StatusCode, Body: string(bodyText)}
+			if onStatusError != nil {
+				if retry := onStatusError(token, se); retry != nil {
+					return retry, nil
+				}
+			}
+			return nil, se
 		}
 	}
 	return nil, lastErr
@@ -468,7 +533,7 @@ func (c *Client) authed(ctx context.Context, method, path, label string, body []
 
 // postAuthed is the POST form of authed, used by every JSON/audio family.
 func (c *Client) postAuthed(ctx context.Context, path, label string, body []byte, headerTimeout time.Duration, prepare func(*http.Request)) (*http.Response, error) {
-	return c.authed(ctx, http.MethodPost, path, label, body, headerTimeout, prepare)
+	return c.authed(ctx, http.MethodPost, path, label, body, headerTimeout, prepare, nil)
 }
 
 func truncate(s string, n int) string {

@@ -324,6 +324,11 @@ func setStreamHeaders(w http.ResponseWriter) {
 // truncated call envelope, an unparseable block — BEFORE the client has seen
 // a byte, so a broken round never streams half its narration and the retry
 // result (call or prose) is passed through verbatim.
+//
+// The SSE headers and the role frame are committed only when the final round
+// is replayed: a round that is still empty after the recovery retry is
+// exhausted returns a real HTTP 502 instead of a 200 with an empty SSE
+// stream, so the client can treat the empty answer as an HTTP error.
 func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, manifest *tools.Manifest, plan *toolPlan) {
 	if plan.native {
 		s.streamNative(w, r, ureq, model, plan)
@@ -338,23 +343,25 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 	if kind, retry := s.retryKind(res, nil); retry {
 		res = s.recoverRound(r.Context(), ureq, manifest, res, kind)
 	}
-	wireDumpRound(rtag, res.content, res.calls)
-
-	setStreamHeaders(w)
-	flusher, _ := w.(http.Flusher)
-	s.streams.Add(1)
-
-	write := s.chunkWriter(w, flusher, upstream.RandomID("chatcmpl"), s.now().Unix(), model, rtag)
-	if !write(openai.Delta{Role: "assistant"}, nil) {
+	if res.emptyToolAnswer() {
+		s.logf("tools: [recovery exhausted] round still empty after retry; returning 502")
+		s.fail(w, upstreamEmpty())
 		return
 	}
+	wireDumpRound(rtag, res.content, res.calls)
+
+	flusher, _ := w.(http.Flusher)
+	write := s.chunkWriter(w, flusher, upstream.RandomID("chatcmpl"), s.now().Unix(), model, rtag)
 	s.replayRound(w, flusher, write, res, res.calls)
 }
 
 // streamNative consumes rounds privately until the model stops calling the
 // gateway's web_search tool, then replays the final round as frames. Nothing
 // from an internal round is ever written, so the first client-visible frame
-// is always part of the answer the client asked for.
+// is always part of the answer the client asked for. The SSE headers and
+// the role frame are committed only when the final round is replayed; a
+// final round that is still empty after the recovery retry returns a real
+// HTTP 502 (same rule as the plain tools path).
 func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string, plan *toolPlan) {
 	rtag := wireTag()
 	res, calls, hist, err := s.resolveNative(r.Context(), ureq, plan, plan.hist, rtag)
@@ -379,15 +386,14 @@ func (s *Server) streamNative(w http.ResponseWriter, r *http.Request, ureq *upst
 			s.logf("tools: native recovery retry failed: %v (passing original round through)", err2)
 		}
 	}
-
-	setStreamHeaders(w)
-	flusher, _ := w.(http.Flusher)
-	s.streams.Add(1)
-
-	write := s.chunkWriter(w, flusher, upstream.RandomID("chatcmpl"), s.now().Unix(), model, rtag)
-	if !write(openai.Delta{Role: "assistant"}, nil) {
+	if res.emptyToolAnswer() {
+		s.logf("tools: [recovery exhausted] native final round still empty after retry; returning 502")
+		s.fail(w, upstreamEmpty())
 		return
 	}
+
+	flusher, _ := w.(http.Flusher)
+	write := s.chunkWriter(w, flusher, upstream.RandomID("chatcmpl"), s.now().Unix(), model, rtag)
 	s.replayRound(w, flusher, write, res, calls)
 }
 
@@ -444,9 +450,18 @@ func (s *Server) resolveNative(ctx context.Context, ureq *upstream.ChatRequest, 
 }
 
 // replayRound writes an already-consumed round as the client-visible answer.
-// The tool_calls finish reason is decided by the calls that remain after the
-// native ones were served.
+// It owns the delayed header commit: the SSE headers, the streams counter,
+// and the role frame are written here — the first client-visible bytes of
+// the response — and only for a round that is provably non-empty (the
+// callers screen the empty case into a 502 first). The tool_calls finish
+// reason is decided by the calls that remain after the native ones were
+// served.
 func (s *Server) replayRound(w http.ResponseWriter, flusher http.Flusher, write func(openai.Delta, *string) bool, res *round, calls []tools.Call) {
+	setStreamHeaders(w)
+	s.streams.Add(1)
+	if !write(openai.Delta{Role: "assistant"}, nil) {
+		return
+	}
 	if res.reasoning != "" && !write(openai.Delta{ReasoningContent: res.reasoning}, nil) {
 		return
 	}

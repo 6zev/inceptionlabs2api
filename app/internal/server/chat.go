@@ -12,9 +12,17 @@ import (
 	"inceptionlabs2api/internal/upstream"
 )
 
-// stream writes the OpenAI SSE response. Headers are committed only after
-// the upstream stream is open, so pool and upstream failures still carry a
-// proper HTTP status.
+// stream writes the OpenAI SSE response with a DELAYED header commit: the
+// SSE headers and the role frame are not written until the first visible
+// text delta arrives, and every delta seen before then (reasoning deltas
+// included) is buffered in memory and replayed in upstream order once the
+// commit fires. An empty completion — the stream ends with zero visible
+// text — therefore surfaces as a real HTTP 502 via the error envelope
+// instead of a 200 with an empty SSE body; a mid-stream failure before any
+// text surfaces as its mapped status. Once text has arrived the response is
+// a committed SSE stream, and later failures ride the in-stream error frame
+// as before. The frame order of a non-empty stream is unchanged: role,
+// buffered reasoning, text, finish.
 func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string) {
 	rtag := wireTag()
 	wireLog(rtag, "PLAIN STREAM (no tools path)")
@@ -26,14 +34,24 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 		return
 	}
 	defer stream.Close()
-	s.streams.Add(1)
 
-	setStreamHeaders(w)
-	flusher, _ := w.(http.Flusher)
+	// delayed is the writer state until the first visible text arrives: the
+	// headers are not committed, and reasoning deltas buffer in order. The
+	// upstream sends whole answers in single events on this diffusion model,
+	// so the buffer is one short reasoning string in practice.
+	var (
+		committed  bool
+		buffered   []openai.Delta
+		id         = upstream.RandomID("chatcmpl")
+		created    = s.now().Unix()
+		flusher    http.Flusher
+		hasFlusher bool
+	)
 
-	id := upstream.RandomID("chatcmpl")
-	created := s.now().Unix()
 	write := func(delta openai.Delta, finish *string) bool {
+		if !committed {
+			return true // pre-commit writes buffer via the read loop, not here
+		}
 		chunk := openai.Chunk{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 			Choices: []openai.ChunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
@@ -41,33 +59,66 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 		if err := writeEvent(w, chunk); err != nil {
 			return false
 		}
-		if flusher != nil {
+		if hasFlusher {
 			flusher.Flush()
 		}
 		return true
 	}
 
-	// Role-first frame: clients get a valid chunk immediately even when the
-	// diffusion model spends the next many seconds thinking.
-	if !write(openai.Delta{Role: "assistant"}, nil) {
-		return
+	// commit writes the SSE headers, the role frame, and every buffered
+	// delta in original order. It fires exactly once, on the first visible
+	// text delta.
+	commit := func() bool {
+		if committed {
+			return true
+		}
+		committed = true
+		setStreamHeaders(w)
+		s.streams.Add(1)
+		flusher, hasFlusher = w.(http.Flusher)
+		if !write(openai.Delta{Role: "assistant"}, nil) {
+			return false
+		}
+		for _, d := range buffered {
+			if !write(d, nil) {
+				return false
+			}
+		}
+		buffered = nil
+		return true
 	}
 
 	// Sources are collected as they arrive and ride the finish frame
 	// (SPEC §2.4): the upstream interleaves text-end → sources → text-start,
 	// so no earlier chunk is known to be the last one.
 	var cites upstream.CitationCollector
+	sawText := false
 	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
 		cites.Observe(ev, s.logf)
 		defer wireDumpEvent(rtag, ev, 0, 0)
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
-			if text := ev.Reasoning(); text != "" && !write(openai.Delta{ReasoningContent: text}, nil) {
-				return errClientGone
+			if text := ev.Reasoning(); text != "" {
+				if committed {
+					if !write(openai.Delta{ReasoningContent: text}, nil) {
+						return errClientGone
+					}
+				} else {
+					// Buffer only: the header commit waits for visible text.
+					buffered = append(buffered, openai.Delta{ReasoningContent: text})
+				}
 			}
 		case upstream.EventTextStart, upstream.EventTextDelta:
-			if text := ev.ContentText(); text != "" && !write(openai.Delta{Content: text}, nil) {
-				return errClientGone
+			if text := ev.ContentText(); text != "" {
+				if !sawText {
+					sawText = true
+					if !commit() {
+						return errClientGone
+					}
+				}
+				if !write(openai.Delta{Content: text}, nil) {
+					return errClientGone
+				}
 			}
 		}
 		return nil
@@ -83,13 +134,30 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 			return
 		}
 		s.upErrors.Add(1)
+		if !committed {
+			// The failure happened before any visible text: the client has
+			// seen nothing, so it gets a real HTTP status for it.
+			s.logf("upstream: stream failed before any text: %v", readErr)
+			s.fail(w, s.upstreamError(readErr))
+			return
+		}
 		s.logf("upstream: stream failed after headers: %v", readErr)
 		se := streamError(readErr)
 		_ = writeEvent(w, se.Envelope())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		if flusher != nil {
+		if hasFlusher {
 			flusher.Flush()
 		}
+		return
+	}
+
+	if !sawText {
+		// The empty completion: the stream finished cleanly but never
+		// produced a visible text delta. Nothing has been written, so the
+		// client gets a proper 502 rather than a 200 empty SSE stream — the
+		// same shape the non-streaming empty path returns.
+		s.logf("upstream: plain stream ended with no visible text")
+		s.fail(w, s.upstreamError(errUpstreamEmpty))
 		return
 	}
 
@@ -98,7 +166,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 		return
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-	if flusher != nil {
+	if hasFlusher {
 		flusher.Flush()
 	}
 }
