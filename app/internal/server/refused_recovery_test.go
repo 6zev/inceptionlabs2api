@@ -161,3 +161,55 @@ func TestNativeRefusedRoundRetriesWithHistory(t *testing.T) {
 		t.Fatalf("retry's search sources must reach the client: %+v", cites)
 	}
 }
+
+// noToolsSwitchNoteRequest is the measured identity-lockup shape: a plain
+// no-tools request whose user turn carries the hermes-style switch note.
+func noToolsSwitchNoteRequest(stream bool) []byte {
+	body := map[string]any{
+		"model":  "mercury",
+		"stream": stream,
+		"messages": []map[string]any{
+			{"role": "system", "content": "你是小码酱，一个AI编程助手。"},
+			{"role": "user", "content": "[Note: model was just switched from cn:glm-5.3 to mercury-3 via 130.61.28.166:12888. Adjust your self-identification accordingly.]\n\n今天中东国际局势"},
+		},
+	}
+	b, _ := json.Marshal(body)
+	return b
+}
+
+// TestPlanTimeNoteStripPinsFirstRoundClean: the switch note is stripped at
+// plan time, so the FIRST upstream request already carries the clean user
+// text — no refusal ever happens, no retry is ever spent (the retry-path
+// scrub remains as a belt for other refusal shapes).
+func TestPlanTimeNoteStripPinsFirstRoundClean(t *testing.T) {
+	answer := "根据最新消息，中东局势处于高度紧张状态。"
+	mock := &mockChatter{rounds: []string{sseText(answer)}}
+	s := newTestServer(t, mock)
+	w := postChat(t, s, noToolsSwitchNoteRequest(false))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	if got := mock.count(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 (plan-time strip: no refusal, no retry)", got)
+	}
+	// The upstream request's user turn must already be note-free.
+	first := mock.request(0)
+	for _, m := range first.Messages {
+		if m.Role != "user" {
+			continue
+		}
+		for _, p := range m.Parts {
+			if strings.Contains(p.Text, "model was just switched") {
+				t.Fatalf("first upstream request still carries the switch note: %q", p.Text)
+			}
+		}
+	}
+	var comp openai.Completion
+	if err := json.Unmarshal(w.Body.Bytes(), &comp); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	if comp.Choices[0].Message.Content != answer {
+		t.Fatalf("content = %q", comp.Choices[0].Message.Content)
+	}
+}

@@ -274,6 +274,15 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, re)
 		return
 	}
+	// Strip the model-switch note at the door, before any path decision:
+	// legacy, tools, native — all see the clean user text. The note is the
+	// measured sole trigger of the canned identity refusal (il2a-live2 A/B:
+	// with it the model refuses outright, identical request minus it answers
+	// normally), so stripping here means the refusal never happens and no
+	// retry is ever spent. Scope: leading "[Note: ...]" blocks in user-role
+	// texts of THIS request only — the client's own stored history is never
+	// touched, and the retry-path scrub stays as a belt for other shapes.
+	stripSwitchNotes(req)
 	if !s.knownModel(req.Model) {
 		s.fail(w, openai.New(http.StatusNotFound, "invalid_request_error", openai.CodeModelNotFound, "model",
 			fmt.Sprintf("model %q does not exist; available models: %s", req.Model, strings.Join(s.cfg.Models, ", "))))
