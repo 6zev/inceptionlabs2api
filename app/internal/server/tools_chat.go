@@ -236,6 +236,44 @@ func recoveryRequest(ureq *upstream.ChatRequest, res *round, message string) *up
 	return &clone
 }
 
+// recoveryRequestScrubbed is recoveryRequest with the switch-note scrub: on
+// the REFUSAL retry only, the model-switch note is stripped from the
+// historical user turns too, not just the retry re-anchor. The note is the
+// measured sole trigger of the canned identity refusal (il2a-live2: with it
+// the model refuses twice, identical request minus it answers normally), so
+// a retry that leaves it in history re-fires the reflex and burns the one
+// bounded retry the budget allows. Scrubbing is retry-scoped: the clone is
+// a gateway-owned request and the client's own history is never touched.
+func recoveryRequestScrubbed(ureq *upstream.ChatRequest, res *round, message string) *upstream.ChatRequest {
+	clone := *ureq
+	msgs := make([]upstream.Message, len(ureq.Messages), len(ureq.Messages)+2)
+	for i, m := range ureq.Messages {
+		if m.Role == "user" {
+			scrubbed := false
+			parts := make([]upstream.Part, len(m.Parts))
+			for j, p := range m.Parts {
+				if p.Type == "text" {
+					t := tools.StripSwitchNote(p.Text)
+					if t != p.Text {
+						scrubbed = true
+					}
+					parts[j] = p
+					parts[j].Text = t
+				} else {
+					parts[j] = p
+				}
+			}
+			if scrubbed {
+				m = upstream.Message{Parts: parts, ID: m.ID, Role: m.Role}
+			}
+		}
+		msgs[i] = m
+	}
+	clone.Messages = msgs
+	clone.ID = upstream.RandomID("c")
+	return recoveryRequest(&clone, res, message)
+}
+
 // recoverRound runs the ONE bounded recovery retry for a retry-worthy
 // zero-call round: the empty answer re-asks with the same manifest (legacy
 // behavior), the broken-call kinds re-ask with the original output appended
@@ -330,8 +368,10 @@ func recoveryRequestFor(ureq *upstream.ChatRequest, res *round, kind tools.Recov
 		// assistant turn — the model must see what it emitted — while the
 		// refusal-retry message carries the re-instruction plus the user's
 		// last real request re-anchoring the retry on the task (the canned
-		// shape is to be dropped, not repaired).
-		return recoveryRequest(ureq, res, tools.RetryMessageRefusal(res.content, lastUserText(ureq)))
+		// shape is to be dropped, not repaired). The scrubbed variant also
+		// strips the switch note from the historical user turns: leaving it
+		// in re-fires the identity reflex and burns the one retry.
+		return recoveryRequestScrubbed(ureq, res, tools.RetryMessageRefusal(res.content, lastUserText(ureq)))
 	}
 	return ureq
 }
@@ -345,6 +385,7 @@ func recoveryRequestFor(ureq *upstream.ChatRequest, res *round, kind tools.Recov
 // answer keeps the accumulated history unchanged (same-manifest re-ask).
 func nativeRetryHistory(hist []openai.History, res *round, kind tools.RecoveryKind) []openai.History {
 	var message string
+	scrub := false
 	switch {
 	case res.emptyToolAnswer():
 		return hist
@@ -356,12 +397,29 @@ func nativeRetryHistory(hist []openai.History, res *round, kind tools.RecoveryKi
 		// Same shape as the truncated branch: the refused round's content is
 		// non-empty and must ride the history verbatim, followed by the
 		// refusal-retry instruction re-anchoring on the user's last request.
+		// The switch note is scrubbed from historical user turns too: it is
+		// the measured sole trigger of the identity reflex (il2a-live2) and
+		// leaving it in re-fires the refusal on the retry the budget allows.
 		message = tools.RetryMessageRefusal(res.content, lastUserHistoryText(hist))
+		scrub = true
 	default:
 		return hist
 	}
 	out := make([]openai.History, 0, len(hist)+2)
-	out = append(out, hist...)
+	for _, h := range hist {
+		if scrub && h.Role == "user" && len(h.Results) == 0 {
+			ts := make([]string, len(h.Texts))
+			changed := false
+			for i, t := range h.Texts {
+				ts[i] = tools.StripSwitchNote(t)
+				changed = changed || ts[i] != t
+			}
+			if changed {
+				h = openai.History{Role: h.Role, Texts: ts, Calls: h.Calls, Results: h.Results}
+			}
+		}
+		out = append(out, h)
+	}
 	if res.content != "" {
 		out = append(out, openai.History{Role: "assistant", Texts: []string{res.content}})
 	}

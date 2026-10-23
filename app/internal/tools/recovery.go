@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -278,6 +279,22 @@ func ClassifyRefusal(text string) bool {
 	return false
 }
 
+// notePattern matches the model-switch note hermes-style clients prepend to
+// the user turn: "[Note: model was just switched from X to Y via Z. Adjust
+// your self-identification accordingly.]" — measured trigger (il2a-live2) of
+// the canned identity refusal. One leading block, square-bracketed.
+var notePattern = regexp.MustCompile(`(?s)^\s*\[Note:[^\]]*\]\s*`)
+
+// stripSwitchNote removes a leading model-switch note from a user text so the
+// refusal retry never re-injects the very identity instruction that caused
+// the refusal. Non-matching text returns unchanged.
+func stripSwitchNote(s string) string {
+	return notePattern.ReplaceAllString(strings.TrimSpace(s), "")
+}
+
+// StripSwitchNote is the exported form for the server's retry scrubbing.
+func StripSwitchNote(s string) string { return stripSwitchNote(s) }
+
 // RetryMessageRefusal builds the retry turn for a refused round: a direct
 // instruction in the same register as the truncated/parse-failed messages —
 // the tools are real, re-emit the call or run it now. The refused content is
@@ -293,10 +310,14 @@ func ClassifyRefusal(text string) bool {
 // the canned identity line with zero reasoning (il2a-live r3). Re-injecting
 // the user's own words re-anchors attention on the task — the goal-drift
 // re-anchoring pattern — which the identity reflex cannot preempt.
+// A leading model-switch note is stripped first: replaying "adjust your
+// self-identification" would re-fire the very reflex the retry breaks
+// (il2a-live2: the note is the measured sole trigger — the identical
+// request minus the note answers normally).
 // Empty userRequest (no user text found) degrades to the bare instruction.
 func RetryMessageRefusal(snippet, userRequest string) string {
 	msg := "Your previous answer was a refusal, but the tools in this conversation are real and connected. Do not ask the user to search manually and do not describe limitations. Re-emit the COMPLETE tool call block for the request, or run the tool call now and answer from its result."
-	if q := strings.TrimSpace(userRequest); q != "" {
+	if q := strings.TrimSpace(stripSwitchNote(userRequest)); q != "" {
 		msg += "\n\nThe request the user is waiting for an answer to is:\n" + q
 	}
 	return msg
