@@ -140,7 +140,7 @@ func (p *Parser) drain(final bool) []byte {
 			return out
 		}
 
-		end := strings.Index(string(p.buf), p.closer)
+		end, used := p.findClose()
 		if end < 0 {
 			if final {
 				out = append(out, p.open...)
@@ -152,8 +152,8 @@ func (p *Parser) drain(final bool) []byte {
 		}
 
 		body := string(p.buf[:end])
-		rest := p.buf[end+len(p.closer):]
-		opened, closed := p.open, p.closer
+		rest := p.buf[end+len(used):]
+		opened := p.open
 		p.open, p.closer = "", ""
 		p.buf = append(p.buf[:0], rest...)
 
@@ -162,9 +162,33 @@ func (p *Parser) drain(final bool) []byte {
 		} else {
 			out = append(out, opened...)
 			out = append(out, body...)
-			out = append(out, closed...)
+			out = append(out, used...)
 		}
 	}
+}
+
+// findClose locates the closer that ends the open block. For a marker block
+// (callStart) the PLURAL form is scanned first and the canonical singular
+// closer second: the singular is a strict prefix of the plural (it is
+// blockEnd minus the "s"), so a short-first scan would cut a genuine plural
+// close one byte early and leak the stray "s" as prose — the mixed-protocol
+// drift the wire showed (dbg4 r7/r8: model opens with the singular marker but
+// closes with the plural form, which previously never closed the block at
+// all). A foreign block keeps its own single closer.
+func (p *Parser) findClose() (int, string) {
+	if p.open == callStart && p.closer == callEnd {
+		plural := strings.Index(string(p.buf), blockEnd)
+		singular := strings.Index(string(p.buf), callEnd)
+		switch {
+		case plural >= 0 && (singular < 0 || plural <= singular):
+			return plural, blockEnd
+		case singular >= 0:
+			return singular, callEnd
+		default:
+			return -1, ""
+		}
+	}
+	return strings.Index(string(p.buf), p.closer), p.closer
 }
 
 // parseBody turns one closed block body into a call. It returns false for any

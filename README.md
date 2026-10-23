@@ -119,7 +119,8 @@ curl http://localhost:3000/v1/chat/completions \
 ```
 
 **内置联网搜索**：网关自带 `web_search` 工具（默认开启）。开启后模型在
-回答中途自主发起实时搜索并引用结果，客户端无需声明任何工具。
+回答中途自主发起实时搜索并引用结果，客户端无需声明任何工具。默认开启，
+`IL2API_NATIVE_WEB_SEARCH=off` 关闭。
 
 ## 长对话自动折叠（transcript fold）
 

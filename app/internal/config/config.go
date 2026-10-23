@@ -29,7 +29,7 @@ type Config struct {
 	PreambleStyle string
 	// NativeWebSearch auto-declares a gateway-served web_search tool on
 	// tool-bearing chat requests and executes its calls against the search
-	// backend. Off by default.
+	// backend. On by default; IL2API_NATIVE_WEB_SEARCH=off disables it.
 	NativeWebSearch bool
 	// ContextChars is a deprecated no-op, retained so existing deployments do
 	// not fail to boot. There is no client-side length guard (SPEC §1.1).
@@ -68,7 +68,7 @@ func Defaults() Config {
 		IdleTimeout:     60 * time.Second,
 		ContextChars:    0,
 		SessionTimeout:  15 * time.Second,
-		NativeWebSearch: false,
+		NativeWebSearch: true,
 
 		SearchTimeout:      60 * time.Second,
 		SearchConfigCheck:  true,
