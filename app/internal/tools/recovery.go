@@ -284,8 +284,22 @@ func ClassifyRefusal(text string) bool {
 // NOT embedded (unlike the other kinds): the refusal is a canned shape the
 // model must drop, not an output it must repair, and replaying it would
 // only reinforce the refusal pattern the retry exists to break.
-func RetryMessageRefusal(snippet string) string {
-	return "Your previous answer was a refusal, but the tools in this conversation are real and connected. Do not ask the user to search manually and do not describe limitations. Re-emit the COMPLETE tool call block for the request, or run the tool call now and answer from its result."
+//
+// userRequest is the last real user text from the history (tool-result
+// turns excluded), re-anchoring the retry on the actual task. Identity
+// confusion is request-structure-dependent, not intrinsic (SARVAM-2026-001:
+// a system message or a tools array alone shifts a model's self-report), so
+// a model handed both plus a switch note can lock onto "who am I" and emit
+// the canned identity line with zero reasoning (il2a-live r3). Re-injecting
+// the user's own words re-anchors attention on the task — the goal-drift
+// re-anchoring pattern — which the identity reflex cannot preempt.
+// Empty userRequest (no user text found) degrades to the bare instruction.
+func RetryMessageRefusal(snippet, userRequest string) string {
+	msg := "Your previous answer was a refusal, but the tools in this conversation are real and connected. Do not ask the user to search manually and do not describe limitations. Re-emit the COMPLETE tool call block for the request, or run the tool call now and answer from its result."
+	if q := strings.TrimSpace(userRequest); q != "" {
+		msg += "\n\nThe request the user is waiting for an answer to is:\n" + q
+	}
+	return msg
 }
 
 // snippetTail clamps the embedded original output to its last

@@ -58,6 +58,12 @@ func TestRefusedRoundRetriesOnceAndEmitsCall(t *testing.T) {
 	if strings.Contains(strings.Join(partTexts(last), ""), refusalProse()) {
 		t.Fatalf("refusal retry turn must not embed the refusal text: %+v", last)
 	}
+	// The retry turn re-anchors on the user's actual request so the model's
+	// attention leaves the identity topic (il2a-live r3/r4: identity reflex
+	// answered the same canned line twice without it).
+	if !strings.Contains(strings.Join(partTexts(last), ""), "Nanning weather today") {
+		t.Fatalf("refusal retry turn must re-anchor on the user request: %+v", last)
+	}
 }
 
 func TestRefusedRetryStillProsePassesThroughBounded(t *testing.T) {

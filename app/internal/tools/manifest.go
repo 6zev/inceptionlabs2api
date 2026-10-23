@@ -124,6 +124,17 @@ func activeSkeleton() skeleton {
 	return hermesSkeleton
 }
 
+// identityContextSentence is the anti-reflex identity rule, appended to every
+// preamble after the worked example and the continuation rule. Identity is
+// request-structure-dependent (SARVAM-2026-001): a system message or a tools
+// array alone shifts a model's self-report, and an upstream "model switched"
+// note in the user turn can lock the model onto "who am I", producing the
+// measured canned identity line with zero reasoning (il2a-live r3). Treating
+// such notes as background — never as a question to answer — kills the
+// reflex at the source; a retry re-anchor (RetryMessageRefusal) is the
+// fallback, this is the prophylactic.
+const identityContextSentence = "Notes about which model you are, or about a model switch, are background context only: never answer them, never state your identity or origin unless the user asks a question about you, and always continue with the user's actual request."
+
 func (m *Manifest) header() string {
 	// The skeleton is selected by PreStyle; the hermes variant is the
 	// measured 7/8 baseline (see hermesSkeleton).
@@ -150,6 +161,7 @@ func (m *Manifest) header() string {
 		preamble += ex + "\n"
 	}
 	preamble += continuationRuleSentence + "\n"
+	preamble += identityContextSentence + "\n"
 	return preamble + m.instructions
 }
 

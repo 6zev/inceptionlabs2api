@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"inceptionlabs2api/internal/openai"
 	"inceptionlabs2api/internal/tools"
@@ -253,6 +254,57 @@ func (s *Server) recoverRound(ctx context.Context, ureq *upstream.ChatRequest, m
 	return retry
 }
 
+// lastUserText returns the last real user text from a wire request: the
+// trailing-most message with role "user" that carries a text part, skipping
+// tool-result turns (they are Results-bearing History on the other path but
+// plain user messages on the wire; the retry history carries them as text,
+// so both shapes are checked by role and non-empty text alone). Clamped to
+// lastUserLimit bytes so a huge final message cannot balloon the retry turn.
+func lastUserText(ureq *upstream.ChatRequest) string {
+	for i := len(ureq.Messages) - 1; i >= 0; i-- {
+		m := ureq.Messages[i]
+		if m.Role != "user" {
+			continue
+		}
+		for j := len(m.Parts) - 1; j >= 0; j-- {
+			if p := m.Parts[j]; p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+				return clampUser(p.Text)
+			}
+		}
+	}
+	return ""
+}
+
+// lastUserHistoryText is lastUserText over the History shape the native loop
+// threads: the last role "user" turn with a non-empty Texts entry, skipping
+// turns that carry tool Results.
+func lastUserHistoryText(hist []openai.History) string {
+	for i := len(hist) - 1; i >= 0; i-- {
+		h := hist[i]
+		if h.Role != "user" || len(h.Results) > 0 {
+			continue
+		}
+		for j := len(h.Texts) - 1; j >= 0; j-- {
+			if strings.TrimSpace(h.Texts[j]) != "" {
+				return clampUser(h.Texts[j])
+			}
+		}
+	}
+	return ""
+}
+
+// lastUserLimit bounds the user request embedded in a refusal retry message.
+const lastUserLimit = 4000
+
+// clampUser trims and length-clamps a user request for the retry message.
+func clampUser(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > lastUserLimit {
+		s = s[:lastUserLimit]
+	}
+	return s
+}
+
 // retryLogReason names the retry for the log line.
 func retryLogReason(kind tools.RecoveryKind, res *round) string {
 	if res.emptyToolAnswer() {
@@ -276,9 +328,10 @@ func recoveryRequestFor(ureq *upstream.ChatRequest, res *round, kind tools.Recov
 	case kind == tools.RecoveryRefused:
 		// recoveryRequest appends the refused round's original content as the
 		// assistant turn — the model must see what it emitted — while the
-		// refusal-retry message carries only the re-instruction (the canned
+		// refusal-retry message carries the re-instruction plus the user's
+		// last real request re-anchoring the retry on the task (the canned
 		// shape is to be dropped, not repaired).
-		return recoveryRequest(ureq, res, tools.RetryMessageRefusal(res.content))
+		return recoveryRequest(ureq, res, tools.RetryMessageRefusal(res.content, lastUserText(ureq)))
 	}
 	return ureq
 }
@@ -302,8 +355,8 @@ func nativeRetryHistory(hist []openai.History, res *round, kind tools.RecoveryKi
 	case kind == tools.RecoveryRefused:
 		// Same shape as the truncated branch: the refused round's content is
 		// non-empty and must ride the history verbatim, followed by the
-		// refusal-retry instruction.
-		message = tools.RetryMessageRefusal(res.content)
+		// refusal-retry instruction re-anchoring on the user's last request.
+		message = tools.RetryMessageRefusal(res.content, lastUserHistoryText(hist))
 	default:
 		return hist
 	}
