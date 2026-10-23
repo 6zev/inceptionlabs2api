@@ -25,6 +25,12 @@ const (
 	// RecoveryParseFailed: the text contains call-envelope-ish openers that
 	// did balance, but none produced a parseable call. Retry-worthy.
 	RecoveryParseFailed
+	// RecoveryRefused: the zero-call round is a canned refusal — measured
+	// production shape "I'm Mercury, built by Inception. I'm not able to get
+	// into the details..." (dbg4 r10) — delivered as prose with zero call
+	// blocks, which ClassifyNoCall would call clean and pass through. The
+	// gateway re-instructs once: the tools are real, use them.
+	RecoveryRefused
 )
 
 // String names the kind for wire-log lines ([recovery kind=...]).
@@ -34,6 +40,8 @@ func (k RecoveryKind) String() string {
 		return "truncated"
 	case RecoveryParseFailed:
 		return "parse_failed"
+	case RecoveryRefused:
+		return "refused"
 	default:
 		return "clean"
 	}
@@ -92,6 +100,14 @@ func ClassifyNoCall(text string, hasOpenMarker func(string) bool) RecoveryKind {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return RecoveryClean
+	}
+	// The refusal shape is checked FIRST (SDD-refusal-recovery T3): a canned
+	// refusal arrives as plain prose, so the envelope logic below would call
+	// it clean and pass the refusal through verbatim — the main channel
+	// through which refusals reached users (dbg4 r10). The three existing
+	// kinds keep their semantics unchanged below.
+	if ClassifyRefusal(trimmed) {
+		return RecoveryRefused
 	}
 
 	// Envelope balance over our own protocol markers.
@@ -208,6 +224,68 @@ func RetryMessageTruncated(snippet string) string {
 func RetryMessageParseFailed(snippet string) string {
 	return "Your previous tool-call output could not be parsed. Re-emit a valid tool call protocol block for the listed tools only. Your previous output was:\n\n" +
 		snippetTail(snippet)
+}
+
+// ClassifyRefusal reports whether text is a canned refusal shape: prose that
+// denies the model's own abilities or access instead of using the tools the
+// manifest just declared. The signatures cover the measured production
+// sentence (dbg4 r10: "I'm Mercury... I'm not able to get into the details")
+// plus the standard English and Chinese capability-denial phrasings the same
+// model family produces.
+//
+// False-positive cost model (the same philosophy the JSON-tail heuristic
+// documents): a benign answer that happens to match costs exactly ONE
+// bounded recovery retry whose result passes through verbatim — no content
+// loss, no unbounded loop. Refusing to detect the real shape costs the user
+// a canned refusal. Greedy beats blind here.
+func ClassifyRefusal(text string) bool {
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "not able to get into the details"),
+		strings.Contains(lower, "i'm mercury"):
+		return true
+	}
+	// "i cannot" / "i can't" + an access-flavored verb, and the standalone
+	// denial shapes.
+	if strings.Contains(lower, "i cannot") &&
+		(strings.Contains(lower, "access") || strings.Contains(lower, "browse") ||
+			strings.Contains(lower, "search") || strings.Contains(lower, "web")) {
+		return true
+	}
+	if strings.Contains(lower, "unable to access") ||
+		strings.Contains(lower, "i can't browse") ||
+		strings.Contains(lower, "i can't access the web") {
+		return true
+	}
+	if re := "i don't have "; strings.Contains(lower, re) {
+		rest := lower[strings.Index(lower, re)+len(re):]
+		if strings.HasPrefix(rest, "the ") {
+			rest = rest[len("the "):]
+		}
+		if strings.HasPrefix(rest, "ability") || strings.HasPrefix(rest, "access") {
+			return true
+		}
+	}
+	if strings.Contains(lower, "no internet access") || strings.Contains(lower, "no web access") {
+		return true
+	}
+	// Chinese capability-denial phrasings.
+	for _, sig := range []string{"无法访问互联网", "不能联网", "没有联网", "无法联网"} {
+		if strings.Contains(text, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// RetryMessageRefusal builds the retry turn for a refused round: a direct
+// instruction in the same register as the truncated/parse-failed messages —
+// the tools are real, re-emit the call or run it now. The refused content is
+// NOT embedded (unlike the other kinds): the refusal is a canned shape the
+// model must drop, not an output it must repair, and replaying it would
+// only reinforce the refusal pattern the retry exists to break.
+func RetryMessageRefusal(snippet string) string {
+	return "Your previous answer was a refusal, but the tools in this conversation are real and connected. Do not ask the user to search manually and do not describe limitations. Re-emit the COMPLETE tool call block for the request, or run the tool call now and answer from its result."
 }
 
 // snippetTail clamps the embedded original output to its last

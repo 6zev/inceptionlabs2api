@@ -273,6 +273,12 @@ func recoveryRequestFor(ureq *upstream.ChatRequest, res *round, kind tools.Recov
 		return recoveryRequest(ureq, res, tools.RetryMessageTruncated(res.content))
 	case kind == tools.RecoveryParseFailed:
 		return recoveryRequest(ureq, res, tools.RetryMessageParseFailed(res.content))
+	case kind == tools.RecoveryRefused:
+		// recoveryRequest appends the refused round's original content as the
+		// assistant turn — the model must see what it emitted — while the
+		// refusal-retry message carries only the re-instruction (the canned
+		// shape is to be dropped, not repaired).
+		return recoveryRequest(ureq, res, tools.RetryMessageRefusal(res.content))
 	}
 	return ureq
 }
@@ -293,6 +299,11 @@ func nativeRetryHistory(hist []openai.History, res *round, kind tools.RecoveryKi
 		message = tools.RetryMessageTruncated(res.content)
 	case kind == tools.RecoveryParseFailed:
 		message = tools.RetryMessageParseFailed(res.content)
+	case kind == tools.RecoveryRefused:
+		// Same shape as the truncated branch: the refused round's content is
+		// non-empty and must ride the history verbatim, followed by the
+		// refusal-retry instruction.
+		message = tools.RetryMessageRefusal(res.content)
 	default:
 		return hist
 	}
