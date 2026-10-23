@@ -27,9 +27,27 @@ type toolPlan struct {
 // returns a nil plan when the request must take the legacy path. native is the
 // optional gateway-served search tool; it is added only when the client did
 // not declare that name itself (a client tool always wins).
+//
+// A request with NO client tools also takes the tools path when the native
+// search tool is available (SDD-refusal-recovery T2): a plain chat turn has
+// no preamble and no search guidance otherwise, so time-sensitive questions
+// get answered from memory alone. The gateway then declares its own
+// web_search, serves the calls internally, and the client sees only the
+// final grounded answer. tool_choice:"none" is the client's explicit opt-out
+// and keeps the legacy path byte-identical; so does every configuration
+// where nativeSearchTool() is nil (NativeWebSearch off, no searcher).
 func planTools(req *openai.ChatRequest, native *tools.Tool) (*toolPlan, *openai.RequestError) {
-	if len(req.Tools) == 0 || req.ToolChoice.Kind == openai.ToolChoiceNone {
+	if req.ToolChoice.Kind == openai.ToolChoiceNone {
 		return nil, nil
+	}
+	if len(req.Tools) == 0 {
+		if native == nil {
+			return nil, nil
+		}
+		// The auto-declared manifest carries only the gateway's search tool
+		// with the default auto choice, so the model may answer in prose when
+		// memory suffices and calls web_search only when it does not.
+		return buildPlan(req, []tools.Tool{*native}, tools.Choice{Auto: true}, false, true)
 	}
 	list := make([]tools.Tool, 0, len(req.Tools)+1)
 	for _, t := range req.Tools {
@@ -51,6 +69,14 @@ func planTools(req *openai.ChatRequest, native *tools.Tool) (*toolPlan, *openai.
 		choice.Auto = true
 	}
 	parallelOff := req.ParallelToolCalls != nil && !*req.ParallelToolCalls
+	return buildPlan(req, list, choice, parallelOff, native != nil)
+}
+
+// buildPlan renders the manifest and folds the history for one request,
+// shared by the client-tools and the native-only shapes. isNative reports
+// whether the gateway's web_search is in the list, so its calls are served
+// internally rather than emitted.
+func buildPlan(req *openai.ChatRequest, list []tools.Tool, choice tools.Choice, parallelOff, isNative bool) (*toolPlan, *openai.RequestError) {
 	manifest, err := tools.BuildManifest(list, choice, parallelOff)
 	if err != nil {
 		return nil, openai.Invalid(err.Error())
@@ -71,7 +97,7 @@ func planTools(req *openai.ChatRequest, native *tools.Tool) (*toolPlan, *openai.
 		// folding fires, so unfolded requests keep today's preamble).
 		manifest.Preamble += "\n\n" + openai.HistoryFormatSection + "\n"
 	}
-	return &toolPlan{manifest: manifest, hist: hist, native: native != nil, folded: folded}, nil
+	return &toolPlan{manifest: manifest, hist: hist, native: isNative, folded: folded}, nil
 }
 
 // chatWithTools answers a request whose tools are active. A plain manifest
