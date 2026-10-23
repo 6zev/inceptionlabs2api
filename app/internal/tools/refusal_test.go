@@ -76,21 +76,24 @@ func TestRecoveryRefusedKind(t *testing.T) {
 }
 
 func TestRetryMessageRefusalWording(t *testing.T) {
-	msg := RetryMessageRefusal("I'm Mercury, built by Inception. I'm not able...", "")
+	msg := RetryMessageRefusal("I'm Mercury, built by Inception. I'm not able...")
 	const want = "Your previous answer was a refusal, but the tools in this conversation are real and connected. Do not ask the user to search manually and do not describe limitations. Re-emit the COMPLETE tool call block for the request, or run the tool call now and answer from its result."
 	if msg != want {
 		t.Fatalf("refusal retry message drifted:\n got %q\nwant %q", msg, want)
 	}
 }
 
-func TestRetryMessageRefusalReAnchorsUserRequest(t *testing.T) {
-	msg := RetryMessageRefusal("I'm Mercury...", "今天中东国际局势")
-	if !strings.Contains(msg, "The request the user is waiting for an answer to is:\n今天中东国际局势") {
-		t.Fatalf("retry message must re-anchor on the user request, got %q", msg)
+func TestStripSwitchNote(t *testing.T) {
+	const note = "[Note: model was just switched from cn:glm-5.3 to mercury-3 via 130.61.28.166:12888. Adjust your self-identification accordingly.]"
+	if got := stripSwitchNote(note + "\n\n今天中东国际局势"); got != "今天中东国际局势" {
+		t.Fatalf("stripSwitchNote must remove the leading note, got %q", got)
 	}
-	// The refused content is never embedded (the canned shape is dropped,
-	// not repaired) — the user request re-anchor is the ONLY quoted text.
-	if strings.Contains(msg, "I'm Mercury") {
-		t.Fatalf("retry message must not embed the refusal text, got %q", msg)
+	if got := stripSwitchNote("今天中东国际局势"); got != "今天中东国际局势" {
+		t.Fatalf("plain text must pass unchanged, got %q", got)
+	}
+	// A note that is NOT leading stays: only the trigger position is the
+	// measured reflex shape.
+	if got := stripSwitchNote("你好 [Note: x] 世界"); got != "你好 [Note: x] 世界" {
+		t.Fatalf("non-leading note must stay, got %q", got)
 	}
 }
