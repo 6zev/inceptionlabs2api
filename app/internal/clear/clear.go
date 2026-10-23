@@ -786,7 +786,7 @@ func (c *Clearance) fetchChallenge(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("clear: build challenge request: %w", err)
 	}
-	browserHeaders(req)
+	apiProbeHeaders(req)
 	// A probe is about whether the edge challenges; a cookie that happens to
 	// be in the shared client's jar would answer it with a 200 and mask the
 	// challenge. Live acquisition never runs through a jar (the stdlib client
@@ -852,20 +852,14 @@ func (c *Clearance) submitSolution(ctx context.Context, token, solution string) 
 	return "", errors.New("clear: no _vcrc* cookie in Set-Cookie")
 }
 
-// browserHeaders applies the navigation header set. Only the UA is required by
-// the edge (the cookie is UA-bound); the rest is cheap realism.
-func browserHeaders(req *http.Request) {
+// apiProbeHeaders applies the API request header set, matching the shape of
+// real business requests (upstream client.go): UA + JSON accept, no navigation
+// headers. The edge challenges API-shaped requests but waves navigate-shaped
+// ones through with a 200, so the probe must not look like a navigation.
+func apiProbeHeaders(req *http.Request) {
 	req.Header.Set("user-agent", UserAgent)
-	req.Header.Set("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	req.Header.Set("accept", "*/*")
 	req.Header.Set("accept-language", "en-US,en;q=0.9")
-	req.Header.Set("sec-ch-ua", `"Not-A.Brand";v="24", "Chromium";v="141"`)
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", `"Linux"`)
-	req.Header.Set("sec-fetch-site", "same-origin")
-	req.Header.Set("sec-fetch-mode", "navigate")
-	req.Header.Set("sec-fetch-user", "?1")
-	req.Header.Set("sec-fetch-dest", "document")
-	req.Header.Set("upgrade-insecure-requests", "1")
 }
 
 // TransportOptions configures the shared HTTP transport.
