@@ -24,4 +24,6 @@ services:
       - IL2API_DECISIONS_TIMEOUT=${IL2API_DECISIONS_TIMEOUT:-120s}
       - IL2API_SEARCH_CONFIG_CHECK=${IL2API_SEARCH_CONFIG_CHECK:-on}
       - IL2API_SEARCH_PROBE_TIMEOUT=${IL2API_SEARCH_PROBE_TIMEOUT:-15s}
+      # Gateway-served web_search tool. On by default; set off to disable.
+      - IL2API_NATIVE_WEB_SEARCH=${IL2API_NATIVE_WEB_SEARCH:-on}
     restart: unless-stopped
