@@ -55,6 +55,14 @@ type Config struct {
 	Model       string
 	Models      []string
 	IdleTimeout time.Duration
+	// MaxMessages caps one chat request's message count after folding, as a
+	// last-resort trim. Zero disables it. The upstream rejects >100 messages
+	// with "This conversation is too long".
+	MaxMessages int
+	// EmptyRetries is how many extra upstream attempts an empty completion
+	// (no visible text) gets before the gateway reports 502. Zero keeps the
+	// single-attempt behaviour.
+	EmptyRetries int
 	// SearchTimeout bounds /v1/web_search's sliding idle watchdog. Zero means
 	// IdleTimeout.
 	SearchTimeout time.Duration
@@ -299,6 +307,15 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if plan != nil {
 		s.chatWithTools(w, r, req, plan)
 		return
+	}
+
+	// Last-resort cap BEFORE folding: the trim is lossy, the fold is not, so
+	// trimming first means the fold still gets to compress what survives. It
+	// only fires above MaxMessages (which sits well past the fold trigger), so
+	// in practice the fold alone handles long histories and this is a belt.
+	if trimmed, dropped := trimMessages(req.Messages, s.cfg.MaxMessages); dropped > 0 {
+		s.logf("chat: trimmed %d oldest messages (%d -> %d) for the upstream message cap", dropped, len(req.Messages), len(trimmed))
+		req.Messages = trimmed
 	}
 
 	msgs, _, re := openai.NormalizeMessages(req.Messages)

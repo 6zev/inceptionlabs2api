@@ -273,6 +273,44 @@ func recoveryRequestScrubbed(ureq *upstream.ChatRequest, res *round, message str
 	return recoveryRequest(&clone, res, message)
 }
 
+// recoverRoundWithRetries applies the empty-answer budget on top of
+// recoverRound. A broken-call round keeps its single recovery retry (that
+// retry carries the model's own output back as history, which is the whole
+// point and does not benefit from repetition). An EMPTY round is different:
+// the upstream intermittently ends a stream with no text and no call at all
+// (completion_tokens=0 on very large prompts), so re-asking is worth up to
+// EmptyRetries attempts. The result passes through verbatim either way.
+//
+// When EmptyRetries is 0 this is exactly the old single-retry behaviour, so
+// the default deployment is unchanged.
+func (s *Server) recoverRoundWithRetries(ctx context.Context, ureq *upstream.ChatRequest, manifest *tools.Manifest, res *round) *round {
+	kind, retry := s.retryKind(res, nil)
+	if !retry {
+		return res
+	}
+	empties := 0
+	for {
+		if res.emptyToolAnswer() && empties >= s.cfg.EmptyRetries {
+			return res
+		}
+		isEmpty := res.emptyToolAnswer()
+		res = s.recoverRound(ctx, ureq, manifest, res, kind)
+		if !isEmpty {
+			return res
+		}
+		empties++
+		if res.emptyToolAnswer() {
+			s.logf("tools: still empty after retry %d/%d", empties, s.cfg.EmptyRetries)
+		}
+		// The retry may now be clean, broken, or still empty: reclassify it.
+		if kind2, again := s.retryKind(res, nil); !again {
+			return res
+		} else {
+			kind = kind2
+		}
+	}
+}
+
 // recoverRound runs the ONE bounded recovery retry for a retry-worthy
 // zero-call round: the empty answer re-asks with the same manifest (legacy
 // behavior), the broken-call kinds re-ask with the original output appended
@@ -435,9 +473,7 @@ func (s *Server) streamTools(w http.ResponseWriter, r *http.Request, ureq *upstr
 		s.fail(w, s.upstreamError(err))
 		return
 	}
-	if kind, retry := s.retryKind(res, nil); retry {
-		res = s.recoverRound(r.Context(), ureq, manifest, res, kind)
-	}
+	res = s.recoverRoundWithRetries(r.Context(), ureq, manifest, res)
 	if res.emptyToolAnswer() {
 		s.logf("tools: [recovery exhausted] round still empty after retry; returning 502")
 		s.fail(w, upstreamEmpty())
@@ -637,8 +673,10 @@ func (s *Server) completeTools(w http.ResponseWriter, r *http.Request, ureq *ups
 		s.writeToolCompletion(w, model, res.content, res.reasoning, calls, res.annotations())
 		return
 	}
-	if kind, retry := s.retryKind(res, nil); retry {
-		res = s.recoverRound(r.Context(), ureq, manifest, res, kind)
+	res = s.recoverRoundWithRetries(r.Context(), ureq, manifest, res)
+	if res.emptyToolAnswer() {
+		s.fail(w, upstreamEmpty())
+		return
 	}
 	s.writeToolCompletion(w, model, res.content, res.reasoning, res.calls, res.annotations())
 }

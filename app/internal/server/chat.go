@@ -175,19 +175,45 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, ureq *upstream.C
 var errClientGone = errors.New("server: client write failed")
 
 // complete aggregates the upstream stream into a single chat.completion.
+//
+// An empty completion — the upstream ends the stream cleanly carrying no text
+// at all (measured: completion_tokens=0 on very large prompts) — is retried
+// EmptyRetries more times and then reported as 502. Passing it through as a
+// 200 with "" would be indistinguishable downstream from a broken turn.
 func (s *Server) complete(w http.ResponseWriter, r *http.Request, ureq *upstream.ChatRequest, model string) {
-	stream, err := s.up.Chat(r.Context(), ureq, s.cfg.IdleTimeout, func(line string) {
+	attempts := s.emptyAttempts()
+	for attempt := 1; attempt <= attempts; attempt++ {
+		completion, empty, err := s.readCompletion(r.Context(), ureq, model)
+		if err != nil {
+			if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+				return
+			}
+			s.fail(w, s.upstreamError(err))
+			return
+		}
+		if !empty {
+			writeJSON(w, http.StatusOK, completion)
+			return
+		}
+		s.logf("upstream: empty completion on attempt %d/%d (no text)", attempt, attempts)
+	}
+	s.fail(w, upstreamEmpty())
+}
+
+// readCompletion consumes one upstream stream into a chat.completion and
+// reports whether the answer carried no visible text at all.
+func (s *Server) readCompletion(ctx context.Context, ureq *upstream.ChatRequest, model string) (openai.Completion, bool, error) {
+	stream, err := s.up.Chat(ctx, ureq, s.cfg.IdleTimeout, func(line string) {
 		s.logf("upstream: skipping malformed SSE line: %q", truncate(line, 200))
 	})
 	if err != nil {
-		s.fail(w, s.upstreamError(err))
-		return
+		return openai.Completion{}, false, err
 	}
 	defer stream.Close()
 
 	var content, reasoning strings.Builder
 	var cites upstream.CitationCollector
-	readErr := stream.Reader.Read(r.Context(), func(ev upstream.Event) error {
+	readErr := stream.Reader.Read(ctx, func(ev upstream.Event) error {
 		cites.Observe(ev, s.logf)
 		switch ev.Type {
 		case upstream.EventReasoningDelta:
@@ -198,14 +224,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, ureq *upstream
 		return nil
 	})
 	if readErr != nil {
-		if errors.Is(readErr, context.Canceled) && r.Context().Err() != nil {
-			return
-		}
-		s.fail(w, s.upstreamError(readErr))
-		return
+		return openai.Completion{}, false, readErr
 	}
 
-	writeJSON(w, http.StatusOK, openai.Completion{
+	completion := openai.Completion{
 		ID:      upstream.RandomID("chatcmpl"),
 		Object:  "chat.completion",
 		Created: s.now().Unix(),
@@ -220,7 +242,18 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, ureq *upstream
 			},
 			FinishReason: "stop",
 		}},
-	})
+	}
+	return completion, content.Len() == 0, nil
+}
+
+// emptyAttempts is the total number of upstream tries for one client request
+// (1 initial + EmptyRetries), never below 1.
+func (s *Server) emptyAttempts() int {
+	n := s.cfg.EmptyRetries + 1
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // writeEvent writes one SSE data frame.

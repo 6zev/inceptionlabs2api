@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   go:
     runs-on: ubuntu-latest
@@ -12,8 +15,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
-          cache-dependency-path: app/go.sum
+          # No go.sum: the module has zero dependencies. Caching on it would
+          # fail the step; the build cache is keyed on go.mod instead.
+          go-version-file: app/go.mod
+          cache: false
       - name: build
         working-directory: app
         run: go build ./...

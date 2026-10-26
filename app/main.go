@@ -18,6 +18,14 @@ import (
 	"inceptionlabs2api/internal/upstream"
 )
 
+// Build metadata, injected at release time with -ldflags "-X main.version=...".
+// They default to developer values so an ordinary `go build` still works.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -37,14 +45,22 @@ func run() error {
 		BaseURL:           cfg.UpstreamBase,
 		Proxy:             cfg.Proxy,
 		SessionTimeout:    cfg.SessionTimeout,
+		SessionPerRequest: cfg.SessionPerRequest,
 		ClearanceRefresh:  cfg.ClearanceRefresh,
 		ClearanceCooldown: cfg.ClearanceCooldown,
 		ClearancePool:     cfg.ClearancePool,
 		Logf:              logf,
 	})
 
+	// With a fresh session per request the pool's prewarm would only mint
+	// tokens nobody draws from, so it stays empty (Max still bounds any
+	// incidental use by other callers).
+	poolMin := cfg.PoolMin
+	if cfg.SessionPerRequest {
+		poolMin = 0
+	}
 	p := pool.New(pool.Config{
-		Min:      cfg.PoolMin,
+		Min:      poolMin,
 		Max:      cfg.PoolMax,
 		TTL:      cfg.PoolTTL,
 		Interval: 15 * time.Second,
@@ -71,6 +87,8 @@ func run() error {
 		Model:              cfg.Model,
 		Models:             cfg.Models,
 		IdleTimeout:        cfg.IdleTimeout,
+		MaxMessages:        cfg.MaxMessages,
+		EmptyRetries:       cfg.EmptyRetries,
 		SearchTimeout:      cfg.SearchTimeout,
 		SearchProbeTimeout: cfg.SearchProbeTimeout,
 		AudioTimeout:       cfg.AudioTimeout,
@@ -101,8 +119,8 @@ func run() error {
 	defer stop()
 
 	go func() {
-		logf("inceptionlabs2api listening on %s (upstream=%s proxy=%q models=%v)",
-			cfg.Addr, cfg.UpstreamBase, config.RedactProxy(cfg.Proxy), cfg.Models)
+		logf("inceptionlabs2api %s (commit %s, built %s) listening on %s (upstream=%s proxy=%q models=%v session_per_request=%v)",
+			version, commit, date, cfg.Addr, cfg.UpstreamBase, config.RedactProxy(cfg.Proxy), cfg.Models, cfg.SessionPerRequest)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server: %v", err)
 		}

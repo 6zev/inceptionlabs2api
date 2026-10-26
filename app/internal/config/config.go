@@ -23,7 +23,19 @@ type Config struct {
 	PoolMin      int
 	PoolMax      int
 	PoolTTL      time.Duration
-	IdleTimeout  time.Duration
+	// MaxMessages caps one chat request's message count before it reaches the
+	// upstream, which hard-rejects the 101st message ("This conversation is
+	// too long") regardless of payload size. Zero disables the cap.
+	MaxMessages int
+	// EmptyRetries is how many extra upstream attempts an empty completion
+	// (no visible text at all) gets before the gateway reports 502.
+	EmptyRetries int
+	// SessionPerRequest fetches a brand-new anonymous session token for every
+	// upstream call instead of reusing a pooled one. The upstream accumulates
+	// conversation history on a session token, so long-lived tokens eventually
+	// hit the too-long wall.
+	SessionPerRequest bool
+	IdleTimeout       time.Duration
 	// PreambleStyle selects the tool preamble skeleton ("hermes" or
 	// "inception"); wired to tools.PreStyle at boot.
 	PreambleStyle string
@@ -59,12 +71,16 @@ type Config struct {
 // Defaults returns the configuration used when no environment variable is set.
 func Defaults() Config {
 	return Config{
-		Addr:            ":3000",
-		UpstreamBase:    "https://chat.inceptionlabs.ai",
-		Model:           "mercury-3",
-		PoolMin:         2,
-		PoolMax:         8,
-		PoolTTL:         30 * time.Minute,
+		Addr:         ":3000",
+		UpstreamBase: "https://chat.inceptionlabs.ai",
+		Model:        "mercury-3",
+		PoolMin:      2,
+		PoolMax:      8,
+		PoolTTL:      30 * time.Minute,
+		// The upstream accepts exactly 100 messages; 96 leaves headroom for
+		// the tools preamble and the fold's bubble. 0 would disable the cap.
+		MaxMessages:     96,
+		EmptyRetries:    1,
 		IdleTimeout:     60 * time.Second,
 		ContextChars:    0,
 		SessionTimeout:  15 * time.Second,
@@ -141,6 +157,12 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if c.PoolTTL, err = envDuration(getenv, "IL2API_POOL_TTL", c.PoolTTL); err != nil {
 		return Config{}, err
 	}
+	if c.MaxMessages, err = envInt(getenv, "IL2API_MAX_MESSAGES", c.MaxMessages); err != nil {
+		return Config{}, err
+	}
+	if c.EmptyRetries, err = envInt(getenv, "IL2API_EMPTY_RETRIES", c.EmptyRetries); err != nil {
+		return Config{}, err
+	}
 	if c.IdleTimeout, err = envDuration(getenv, "IL2API_IDLE_TIMEOUT", c.IdleTimeout); err != nil {
 		return Config{}, err
 	}
@@ -191,6 +213,16 @@ func FromEnv(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("config: IL2API_NATIVE_WEB_SEARCH must be on or off, got %q", v)
 		}
 	}
+	if v := strings.TrimSpace(strings.ToLower(getenv("IL2API_SESSION_PER_REQUEST"))); v != "" {
+		switch v {
+		case "on", "1", "true", "yes":
+			c.SessionPerRequest = true
+		case "off", "0", "false", "no":
+			c.SessionPerRequest = false
+		default:
+			return Config{}, fmt.Errorf("config: IL2API_SESSION_PER_REQUEST must be on or off, got %q", v)
+		}
+	}
 
 	if err := c.validate(); err != nil {
 		return Config{}, err
@@ -210,6 +242,17 @@ func (c Config) validate() error {
 	}
 	if c.PoolTTL <= 0 {
 		return fmt.Errorf("config: IL2API_POOL_TTL must be positive, got %s", c.PoolTTL)
+	}
+	if c.MaxMessages < 0 {
+		return fmt.Errorf("config: IL2API_MAX_MESSAGES must be >= 0, got %d", c.MaxMessages)
+	}
+	// A cap below 4 cannot hold a system turn plus one user/assistant exchange
+	// and would trim every request into nonsense; 0 disables it explicitly.
+	if c.MaxMessages > 0 && c.MaxMessages < 4 {
+		return fmt.Errorf("config: IL2API_MAX_MESSAGES must be 0 (off) or >= 4, got %d", c.MaxMessages)
+	}
+	if c.EmptyRetries < 0 {
+		return fmt.Errorf("config: IL2API_EMPTY_RETRIES must be >= 0, got %d", c.EmptyRetries)
 	}
 	if c.IdleTimeout <= 0 {
 		return fmt.Errorf("config: IL2API_IDLE_TIMEOUT must be positive, got %s", c.IdleTimeout)

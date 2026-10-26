@@ -38,3 +38,87 @@ func TestNativeWebSearchOffEnvDisables(t *testing.T) {
 		t.Errorf("NativeWebSearch with IL2API_NATIVE_WEB_SEARCH=off = true, want false")
 	}
 }
+
+func TestNewLimitsDefaults(t *testing.T) {
+	c, err := FromEnv(func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if c.MaxMessages != 96 {
+		t.Errorf("MaxMessages default = %d, want 96", c.MaxMessages)
+	}
+	if c.EmptyRetries != 1 {
+		t.Errorf("EmptyRetries default = %d, want 1", c.EmptyRetries)
+	}
+	if c.SessionPerRequest {
+		t.Errorf("SessionPerRequest default = true, want false")
+	}
+}
+
+func TestNewLimitsFromEnv(t *testing.T) {
+	env := map[string]string{
+		"IL2API_MAX_MESSAGES":        "64",
+		"IL2API_EMPTY_RETRIES":       "3",
+		"IL2API_SESSION_PER_REQUEST": "on",
+	}
+	c, err := FromEnv(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if c.MaxMessages != 64 || c.EmptyRetries != 3 || !c.SessionPerRequest {
+		t.Fatalf("got MaxMessages=%d EmptyRetries=%d SessionPerRequest=%v", c.MaxMessages, c.EmptyRetries, c.SessionPerRequest)
+	}
+}
+
+func TestMaxMessagesZeroDisablesCap(t *testing.T) {
+	c, err := FromEnv(func(k string) string {
+		if k == "IL2API_MAX_MESSAGES" {
+			return "0"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("0 must be accepted as 'cap off': %v", err)
+	}
+	if c.MaxMessages != 0 {
+		t.Fatalf("MaxMessages = %d, want 0", c.MaxMessages)
+	}
+}
+
+func TestMaxMessagesTooSmallRejected(t *testing.T) {
+	for _, v := range []string{"1", "3"} {
+		_, err := FromEnv(func(k string) string {
+			if k == "IL2API_MAX_MESSAGES" {
+				return v
+			}
+			return ""
+		})
+		if err == nil {
+			t.Errorf("IL2API_MAX_MESSAGES=%s must be rejected (min 4 or 0)", v)
+		}
+	}
+}
+
+func TestEmptyRetriesNegativeRejected(t *testing.T) {
+	_, err := FromEnv(func(k string) string {
+		if k == "IL2API_EMPTY_RETRIES" {
+			return "-1"
+		}
+		return ""
+	})
+	if err == nil {
+		t.Error("negative IL2API_EMPTY_RETRIES must be rejected")
+	}
+}
+
+func TestSessionPerRequestInvalidRejected(t *testing.T) {
+	_, err := FromEnv(func(k string) string {
+		if k == "IL2API_SESSION_PER_REQUEST" {
+			return "maybe"
+		}
+		return ""
+	})
+	if err == nil {
+		t.Error("invalid IL2API_SESSION_PER_REQUEST must be rejected")
+	}
+}

@@ -24,6 +24,10 @@ services:
       - IL2API_DECISIONS_TIMEOUT=${IL2API_DECISIONS_TIMEOUT:-120s}
       - IL2API_SEARCH_CONFIG_CHECK=${IL2API_SEARCH_CONFIG_CHECK:-on}
       - IL2API_SEARCH_PROBE_TIMEOUT=${IL2API_SEARCH_PROBE_TIMEOUT:-15s}
+      # Message-count cap and empty-completion retry (see app/.env.example).
+      - IL2API_MAX_MESSAGES=${IL2API_MAX_MESSAGES:-96}
+      - IL2API_EMPTY_RETRIES=${IL2API_EMPTY_RETRIES:-1}
+      - IL2API_SESSION_PER_REQUEST=${IL2API_SESSION_PER_REQUEST:-off}
       # Gateway-served web_search tool. On by default; set off to disable.
       - IL2API_NATIVE_WEB_SEARCH=${IL2API_NATIVE_WEB_SEARCH:-on}
     restart: unless-stopped

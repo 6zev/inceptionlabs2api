@@ -24,9 +24,9 @@ go.work.sum
 # local task brief
 TASK.md
 
-# documentation and tests stay local, out of the published tree
-*.md
-docs/
-*_test.go
-integration_test.go
-testdata/
+# Local-only design notes stay out of the tree; the shipped docs and the test
+# suite do not. CI runs build/vet/test on this shape.
+docs/design/
+*.local.md
+.hive/
+.hive2/

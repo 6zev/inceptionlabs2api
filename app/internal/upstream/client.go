@@ -93,9 +93,12 @@ type Client struct {
 	base    string
 	pool    *pool.Pool
 	timeout time.Duration
-	logf    func(format string, args ...any)
-	clear   *clear.Clearance
-	hc      *http.Client
+	// sessionPerRequest fetches a brand-new session token for every upstream
+	// call instead of drawing from the pool.
+	sessionPerRequest bool
+	logf              func(format string, args ...any)
+	clear             *clear.Clearance
+	hc                *http.Client
 }
 
 // Config configures a Client.
@@ -105,6 +108,12 @@ type Config struct {
 	Pool    *pool.Pool
 	// SessionTimeout bounds one /api/session fetch.
 	SessionTimeout time.Duration
+	// SessionPerRequest fetches a fresh anonymous session token for every
+	// upstream call instead of reusing a pooled one. The upstream accumulates
+	// conversation history per session token, so a long-lived token eventually
+	// fails with "This conversation is too long"; a fresh token per request
+	// sidesteps that at the cost of one extra round trip per call.
+	SessionPerRequest bool
 	// ClearanceRefresh is the proactive cookie refresh age. Zero means 45m.
 	ClearanceRefresh time.Duration
 	// ClearanceCooldown is the minimum retry interval after a failed
@@ -141,11 +150,12 @@ func NewClient(cfg Config) (*Client, pool.Fetcher) {
 	// diffusion generations. The sliding idle watchdog lives in Reader.
 	hc := &http.Client{Transport: tr, CheckRedirect: checkRedirect}
 	c := &Client{
-		base:    strings.TrimRight(cfg.BaseURL, "/"),
-		pool:    cfg.Pool,
-		timeout: cfg.SessionTimeout,
-		logf:    logf,
-		hc:      hc,
+		base:              strings.TrimRight(cfg.BaseURL, "/"),
+		pool:              cfg.Pool,
+		timeout:           cfg.SessionTimeout,
+		sessionPerRequest: cfg.SessionPerRequest,
+		logf:              logf,
+		hc:                hc,
 	}
 	c.clear = clear.New(clear.Config{
 		BaseURL:  c.base,
@@ -443,6 +453,12 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration,
 		if !isTooLong(se) || len(req.Messages) > maxUpstreamMessages {
 			return nil
 		}
+		if c.sessionPerRequest {
+			// Every call already gets a brand-new session, and the request
+			// itself is under the cap, so a fresh token is not a different
+			// lever here — there is nothing left to switch to.
+			return nil
+		}
 		c.logf("upstream: conversation too long on a %d-message request; retiring the session token and replaying once", len(req.Messages))
 		c.pool.Discard(failedToken)
 		retry, rerr := c.authed(ctx, http.MethodPost, "/api/chat", "chat", body, idle, prepare, nil)
@@ -462,6 +478,17 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, idle time.Duration,
 		Body:   resp.Body,
 		Reader: NewReader(resp.Body, idle, onMalformed),
 	}, nil
+}
+
+// sessionToken returns the token to use for one request: a freshly fetched
+// session when SessionPerRequest is on, otherwise a pooled one. A fresh token
+// lives only for this call, so there is nothing to discard when it is
+// rejected — the pool is the only thing whose accounting matters.
+func (c *Client) sessionToken(ctx context.Context) (string, error) {
+	if c.sessionPerRequest {
+		return c.FetchSession(ctx)
+	}
+	return c.pool.Get(ctx)
 }
 
 // authed issues one request with a pooled token, retrying with a fresh token
@@ -486,7 +513,7 @@ func (c *Client) authed(ctx context.Context, method, path, label string, body []
 	}
 	var lastErr error
 	for attempt := 0; attempt <= maxAuthRetries; attempt++ {
-		token, err := c.pool.Get(ctx)
+		token, err := c.sessionToken(ctx)
 		if err != nil {
 			// A pool that could not fill because the checkpoint refused us is
 			// a clearance failure, not a generic "no token": the operator can
@@ -511,7 +538,11 @@ func (c *Client) authed(ctx context.Context, method, path, label string, body []
 		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
 			resp.Body.Close()
-			c.pool.Discard(token)
+			if !c.sessionPerRequest {
+				// A per-request token was never in the pool: discarding it
+				// would retire an unrelated pooled token.
+				c.pool.Discard(token)
+			}
 			c.logf("upstream: session token rejected (status %d), retrying", resp.StatusCode)
 			lastErr = fmt.Errorf("%w: status %d", ErrAuthRejected, resp.StatusCode)
 			continue

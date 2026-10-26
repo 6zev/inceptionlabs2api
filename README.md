@@ -157,6 +157,36 @@ curl http://localhost:3000/v1/chat/completions \
 **错误仍然原样透传**：折叠只是让 502 "conversation is too long" 在正常
 对话中不可达；网关不做任何错误映射或拦截。
 
+### 最后一道防线：条数裁剪
+
+折叠负责压缩历史，裁剪负责兜底。当 `IL2API_MAX_MESSAGES`（默认 96）仍然被
+突破时——例如尾部全是大体积回合、折叠不允许触碰的热窗口本身就超限——网关会
+从**最旧**的消息开始整组丢弃（assistant 的 `tool_calls` 与其 `tool` 结果作为
+原子组，绝不拆散），并保留开头所有 system 消息与最新的轮次。
+
+裁剪是有损的，所以它的顺序在折叠**之后**：先让无损的折叠尽量压缩，只有在折叠
+之后仍超限时才丢。低于上限的请求完全不受影响。
+
+### 空补全重试
+
+上游偶尔会在超长提示词下返回**完全没有任何文本**的补全（`completion_tokens=0`）。
+透传成 `200` + 空 body 会让客户端无法与"坏掉的回合"区分，所以：
+
+- 非流式：最多重试 `IL2API_EMPTY_RETRIES` 次（默认 1，即最多 2 次尝试）；
+  仍为空则返回 `502 upstream_empty_response`。
+- 流式：响应头延迟到第一个可见文本才提交，因此全空应答返回的是真正的 HTTP
+  502，而不是先 200 再报错。reasoning 增量在提交前按原顺序缓冲，不会丢失。
+- 工具调用路径同样遵守该预算；"空回合"重试，而"坏的调用块"仍按原有逻辑做一次
+  带上下文的恢复重试。
+
+### 每请求新会话
+
+上游把对话历史累积在 **session token** 上，长期复用同一个 token 最终会撞上
+"too long"。设置 `IL2API_SESSION_PER_REQUEST=on` 后，每次上游调用都新取一个
+匿名 session，用一次往返换取隔离；此时会话池不再预热（`Min=0`），
+且不会再有"切换 token 重放"的逻辑（因为已经在换）。
+
+
 ## 独立搜索 `/v1/web_search`
 
 ```json
@@ -271,11 +301,26 @@ Mercury Decide：给一段场景文本 + 若干结构化问题，返回带概率
 | `IL2API_MODEL` | `mercury-3` | 模型 ID |
 | `IL2API_POOL_MIN` / `MAX` | 2 / 8 | 会话池上下限 |
 | `IL2API_IDLE_TIMEOUT` | 60s | 上游空闲看门狗 |
-| `IL2API_CONTEXT_CHARS` | 0 | 提示词字符上限（0 = 不限制） |
+| `IL2API_CONTEXT_CHARS` | 0 | 提示词字符上限（0 = 不限制，已废弃） |
 | `IL2API_PROXY` | — | 可选 HTTP 代理 |
+| `IL2API_MAX_MESSAGES` | 96 | 单次请求消息条数上限；超限先折叠再裁掉最旧轮次。0 = 关闭 |
+| `IL2API_EMPTY_RETRIES` | 1 | 上游返回空补全（无任何文本）时的额外重试次数，用尽后返回 502 |
+| `IL2API_SESSION_PER_REQUEST` | off | 每次上游调用新取一个匿名 session，不复用池中 token |
 
 完整变量清单见 [`app/.env.example`](./app/.env.example)。
 
 ## 许可
 
 **CC BY-NC-SA 4.0** — 禁止商用，需署名、相同方式共享。见 [`LICENSE`](./LICENSE)。
+
+## 发布
+
+推送 semver tag 即触发 GitHub Actions 发布：
+
+```bash
+git tag v1.2.3 && git push origin v1.2.3
+```
+
+产出 GitHub Release（linux / darwin / windows × amd64 / arm64 静态二进制 +
+sha256）与多架构容器镜像 `ghcr.io/<owner>/inceptionlabs2api:1.2.3`。
+详见 [`docs/RELEASING.md`](./docs/RELEASING.md)。
