@@ -19,11 +19,16 @@ type Config struct {
 	APIKey       string
 	UpstreamBase string
 	Models       []string
-	Model        string
-	Proxy        string
-	PoolMin      int
-	PoolMax      int
-	PoolTTL      time.Duration
+	// Model is the model id advertised and accepted by default. It is a LABEL,
+	// not a selector: the upstream ignores the model field entirely (measured
+	// 2026-10-26 — gpt-4 and totally-fake-model-xyz both answer normally) and
+	// always serves the same Mercury model. Keep Models narrow; widening it
+	// only makes the gateway accept more names for the same backend.
+	Model   string
+	Proxy   string
+	PoolMin int
+	PoolMax int
+	PoolTTL time.Duration
 	// MaxMessages caps one chat request's message count before it reaches the
 	// upstream, which hard-rejects the 101st message ("This conversation is
 	// too long") regardless of payload size. Zero disables the cap.
@@ -131,6 +136,10 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	setString("IL2API_MODEL", &c.Model)
 	setString("IL2API_PREAMBLE_STYLE", &c.PreambleStyle)
 
+	// IL2API_MODELS is an accept-list of NAMES, not a catalogue of distinct
+	// models: the upstream ignores the model field and always serves one
+	// Mercury model. Listing extra names does not unlock anything — it only
+	// makes /v1/models advertise ids the backend cannot differentiate.
 	if v := strings.TrimSpace(getenv("IL2API_MODELS")); v != "" {
 		for _, part := range strings.Split(v, ",") {
 			if m := strings.TrimSpace(part); m != "" {

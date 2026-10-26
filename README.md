@@ -69,7 +69,7 @@ docker build -t inceptionlabs2api . && docker run -p 3000:3000 --env-file app/.e
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `model` | string | 必填，当前为 `mercury-3` |
+| `model` | string | 必填，默认且唯一为 `mercury-3`（见下方说明） |
 | `messages` | array | 必填，`system` / `user` / `assistant` / `tool` 轮次历史 |
 | `stream` | bool | 默认 `false`；`true` 时返回 SSE 流 |
 | `reasoning_effort` | string | 思考强度 `instant` / `low` / `high`（默认映射 medium） |
@@ -85,6 +85,21 @@ curl http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"mercury-3","messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+### 关于 `model`：只有一个模型
+
+**上游只有一个模型。** 实测（2026-10-26）上游 `/api/chat` **完全忽略**
+`model` 字段：`gpt-4`、`claude-3-opus`、甚至 `totally-fake-model-xyz`
+都能得到正常回答（空字符串则报 `model is required`）。不存在按名字切换模型
+的机制，也没有可供列举的模型清单接口。
+
+因此网关的 `model` 字段是**标签**而非**选择器**：
+
+- 默认只接受 `mercury-3`，`/v1/models` 也只返回它。
+- `IL2API_MODELS` 是**接受名单**，不是模型目录。往里加 `mercury-4`
+  只会让网关多接受一个名字，后端仍是同一个模型——不解决任何问题，
+  反而让客户端误以为存在多个模型可选。
+- 判断"是否能用某个模型"的正确依据是上游，而不是这个名单。
 
 ## 工具调用
 
@@ -298,7 +313,7 @@ Mercury Decide：给一段场景文本 + 若干结构化问题，返回带概率
 |---|---|---|
 | `IL2API_API_KEY` | — | 网关鉴权 Bearer |
 | `IL2API_ADDR` | `:3000` | 监听地址 |
-| `IL2API_MODEL` | `mercury-3` | 模型 ID |
+| `IL2API_MODEL` | `mercury-3` | 模型 ID（标签，非选择器；上游只有一个模型） |
 | `IL2API_POOL_MIN` / `MAX` | 2 / 8 | 会话池上下限 |
 | `IL2API_IDLE_TIMEOUT` | 60s | 上游空闲看门狗 |
 | `IL2API_CONTEXT_CHARS` | 0 | 提示词字符上限（0 = 不限制，已废弃） |

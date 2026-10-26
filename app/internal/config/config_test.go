@@ -122,3 +122,34 @@ func TestSessionPerRequestInvalidRejected(t *testing.T) {
 		t.Error("invalid IL2API_SESSION_PER_REQUEST must be rejected")
 	}
 }
+
+// The default model surface is one name. Widening IL2API_MODELS does not
+// unlock a different backend (the upstream ignores the model field), so the
+// default must stay narrow rather than shipping speculative aliases.
+func TestDefaultModelsIsSingleMercury3(t *testing.T) {
+	c, err := FromEnv(func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if c.Model != "mercury-3" {
+		t.Errorf("Model default = %q, want mercury-3", c.Model)
+	}
+	if len(c.Models) != 1 || c.Models[0] != "mercury-3" {
+		t.Errorf("Models default = %v, want [mercury-3]", c.Models)
+	}
+}
+
+func TestModelsAllowlistFromEnv(t *testing.T) {
+	c, err := FromEnv(func(k string) string {
+		if k == "IL2API_MODELS" {
+			return "mercury-3, mercury-4"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if len(c.Models) != 2 || c.Models[1] != "mercury-4" {
+		t.Fatalf("Models = %v, want both listed names", c.Models)
+	}
+}
