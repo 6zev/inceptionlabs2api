@@ -309,6 +309,29 @@ Mercury Decide：给一段场景文本 + 若干结构化问题，返回带概率
 
 完整变量清单见 [`app/.env.example`](./app/.env.example)。
 
+### 用 `.env` 文件
+
+二进制没有命令行参数，但会**自动读取工作目录下的 `.env`**：
+
+```bash
+cp app/.env.example .env
+# 编辑 .env，去掉需要启用的变量前的 #
+./inceptionlabs2api
+```
+
+启动日志会说明读了哪个文件：
+
+```
+config: loaded environment from .env
+```
+
+- 用 `IL2API_ENV_FILE=/path/to/file` 指定其它路径；**显式指定的文件不存在会直接报错**，
+  避免"以为读到了、其实没读到"。
+- **进程环境变量优先**：`.env` 只补环境里没有的变量，所以
+  `IL2API_ADDR=:4000 ./inceptionlabs2api` 会覆盖文件中的值。
+- 支持 `KEY=value`、`export KEY=value`、`KEY="带 空格 和 \n 转义"`、
+  `KEY='原样保留'` 以及行尾 `# 注释`。格式错误的行会让启动失败而不是被静默忽略。
+
 ## 许可
 
 **CC BY-NC-SA 4.0** — 禁止商用，需署名、相同方式共享。见 [`LICENSE`](./LICENSE)。

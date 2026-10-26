@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strconv"
@@ -100,8 +101,19 @@ func Defaults() Config {
 	}
 }
 
-// Load reads IL2API_* variables from the process environment.
-func Load() (Config, error) { return FromEnv(os.Getenv) }
+// Load reads IL2API_* variables from the process environment, after filling
+// in anything a .env file provides that the environment does not already set
+// (see LoadDotEnv). Variables already present always win.
+func Load() (Config, error) {
+	path, err := LoadDotEnv()
+	if err != nil {
+		return Config{}, err
+	}
+	if path != "" {
+		log.Printf("config: loaded environment from %s", path)
+	}
+	return FromEnv(os.Getenv)
+}
 
 // FromEnv parses configuration using getenv, which makes it testable without
 // touching the process environment.
