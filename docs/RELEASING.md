@@ -41,6 +41,17 @@ Trigger the workflow manually (`workflow_dispatch`) to run verify + build
 without publishing anything. Both the binary and Docker jobs build, but only
 tag pushes push or publish.
 
+## Pre-releases
+
+A tag containing a hyphen (`v1.2.3-rc1`) builds and publishes a release, but
+does **not** move the `latest` image tag — `latest` tracks stable tags only.
+
+## Job graph
+
+`verify` gates both artifact jobs, and `release` waits for **both** `binaries`
+and `docker`, so a release is never published pointing at an image that failed
+to push.
+
 ## Version metadata
 
 `app/main.go` carries `version`, `commit`, and `date` variables that default

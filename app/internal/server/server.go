@@ -296,6 +296,18 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("model %q does not exist; available models: %s", req.Model, strings.Join(s.cfg.Models, ", "))))
 		return
 	}
+	// Last-resort message-count cap, applied BEFORE planTools and folding so
+	// that (a) tool groups stay atomic, since the trim works on raw messages,
+	// and (b) the lossless fold still compresses whatever survives. It only
+	// fires above MaxMessages, which sits well past the fold trigger, so in
+	// practice the fold alone handles long histories and this is a belt.
+	// It runs for every request, tool-bearing or not: a long agent loop is
+	// exactly the shape most likely to exceed the upstream cap.
+	if trimmed, dropped := trimMessages(req.Messages, s.cfg.MaxMessages); dropped > 0 {
+		s.logf("chat: trimmed %d oldest messages (%d -> %d) for the upstream message cap", dropped, len(req.Messages), len(trimmed))
+		req.Messages = trimmed
+	}
+
 	// Tool-bearing requests take §4.1's path, which normalises history with
 	// tool payloads intact. A nil plan means the legacy one, and it must stay
 	// byte-identical for every request without tools.
@@ -307,15 +319,6 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if plan != nil {
 		s.chatWithTools(w, r, req, plan)
 		return
-	}
-
-	// Last-resort cap BEFORE folding: the trim is lossy, the fold is not, so
-	// trimming first means the fold still gets to compress what survives. It
-	// only fires above MaxMessages (which sits well past the fold trigger), so
-	// in practice the fold alone handles long histories and this is a belt.
-	if trimmed, dropped := trimMessages(req.Messages, s.cfg.MaxMessages); dropped > 0 {
-		s.logf("chat: trimmed %d oldest messages (%d -> %d) for the upstream message cap", dropped, len(req.Messages), len(trimmed))
-		req.Messages = trimmed
 	}
 
 	msgs, _, re := openai.NormalizeMessages(req.Messages)

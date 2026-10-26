@@ -82,8 +82,18 @@ func trimMessages(msgs []openai.Message, max int) ([]openai.Message, int) {
 	out = append(out, msgs[keepFrom:]...)
 
 	// Drop leading non-user turns left over from the cut so the upstream sees
-	// a prompt first, then a normal alternating conversation.
+	// a prompt first, then a normal alternating conversation. Never leave an
+	// orphaned tool result behind: a role:"tool" message whose assistant
+	// tool_calls turn was just stripped is invalid history, so it goes with it.
 	for len(out) > head && out[head].Role != "user" {
+		if out[head].Role == "tool" {
+			// The orphan and any remaining consecutive results belong to the
+			// same broken group; drop the whole run.
+			for len(out) > head && out[head].Role == "tool" {
+				out = append(out[:head], out[head+1:]...)
+			}
+			continue
+		}
 		out = append(out[:head], out[head+1:]...)
 	}
 	return out, len(msgs) - len(out)
