@@ -123,9 +123,11 @@ func TestSessionPerRequestInvalidRejected(t *testing.T) {
 	}
 }
 
-// The default model surface is one name. Widening IL2API_MODELS does not
-// unlock a different backend (the upstream ignores the model field), so the
-// default must stay narrow rather than shipping speculative aliases.
+// The default model surface is one real name plus its "-thinking" alias.
+// Widening IL2API_MODELS does not unlock a different backend (the upstream
+// ignores the model field), so the real surface must stay narrow: the alias is
+// a label for a reasoning-aware client, never a second backend. See
+// ThinkingSuffix for the measured client (Cherry Studio) this serves.
 func TestDefaultModelsIsSingleMercury3(t *testing.T) {
 	c, err := FromEnv(func(string) string { return "" })
 	if err != nil {
@@ -134,8 +136,62 @@ func TestDefaultModelsIsSingleMercury3(t *testing.T) {
 	if c.Model != "mercury-3" {
 		t.Errorf("Model default = %q, want mercury-3", c.Model)
 	}
-	if len(c.Models) != 1 || c.Models[0] != "mercury-3" {
-		t.Errorf("Models default = %v, want [mercury-3]", c.Models)
+	want := []string{"mercury-3", "mercury-3" + ThinkingSuffix}
+	if len(c.Models) != len(want) {
+		t.Fatalf("Models default = %v, want %v", c.Models, want)
+	}
+	for i := range want {
+		if c.Models[i] != want[i] {
+			t.Errorf("Models[%d] = %q, want %q", i, c.Models[i], want[i])
+		}
+	}
+}
+
+// TestThinkingAliasIsDerivedFromNames pins the alias rule: each non-reasoning
+// name gains one suffix, a name that already advertises reasoning gains none,
+// and an explicitly listed alias is not duplicated.
+func TestThinkingAliasIsDerivedFromNames(t *testing.T) {
+	c, err := FromEnv(func(k string) string {
+		switch k {
+		case "IL2API_MODELS":
+			return "mercury-3, mercury-thinking, mercury-3-thinking"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	want := []string{"mercury-3", "mercury-thinking", "mercury-3-thinking"}
+	if len(c.Models) != len(want) {
+		t.Fatalf("Models = %v, want %v (explicit alias must not duplicate)", c.Models, want)
+	}
+	for i := range want {
+		if c.Models[i] != want[i] {
+			t.Errorf("Models[%d] = %q, want %q", i, c.Models[i], want[i])
+		}
+	}
+}
+
+// TestThinkingAliasFollowsRenamedModel covers IL2API_MODEL=foo: the alias must
+// follow the configured name rather than being hard-coded to mercury-3.
+func TestThinkingAliasFollowsRenamedModel(t *testing.T) {
+	c, err := FromEnv(func(k string) string {
+		if k == "IL2API_MODEL" {
+			return "custom-model"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	want := []string{"custom-model", "custom-model" + ThinkingSuffix}
+	if len(c.Models) != len(want) {
+		t.Fatalf("Models = %v, want %v", c.Models, want)
+	}
+	for i := range want {
+		if c.Models[i] != want[i] {
+			t.Errorf("Models[%d] = %q, want %q", i, c.Models[i], want[i])
+		}
 	}
 }
 
@@ -149,7 +205,27 @@ func TestModelsAllowlistFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FromEnv: %v", err)
 	}
-	if len(c.Models) != 2 || c.Models[1] != "mercury-4" {
-		t.Fatalf("Models = %v, want both listed names", c.Models)
+	// Operator names keep their order at the front; each gains a thinking
+	// alias afterwards. Both listed names must still be accepted.
+	want := []string{"mercury-3", "mercury-4", "mercury-3-thinking", "mercury-4-thinking"}
+	if len(c.Models) != len(want) {
+		t.Fatalf("Models = %v, want %v", c.Models, want)
+	}
+	for i := range want {
+		if c.Models[i] != want[i] {
+			t.Errorf("Models[%d] = %q, want %q", i, c.Models[i], want[i])
+		}
+	}
+	// The accept-list must still accept what the operator wrote.
+	for _, listed := range []string{"mercury-3", "mercury-4"} {
+		found := false
+		for _, m := range c.Models {
+			if m == listed {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%q missing from the accept-list", listed)
+		}
 	}
 }
