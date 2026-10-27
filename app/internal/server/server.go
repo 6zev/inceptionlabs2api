@@ -377,9 +377,48 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	created := s.now().Unix()
 	list := openai.ModelList{Object: "list", Data: make([]openai.Model, 0, len(s.cfg.Models))}
 	for _, m := range s.cfg.Models {
-		list.Data = append(list.Data, openai.Model{ID: m, Object: "model", Created: created, OwnedBy: "inceptionlabs"})
+		list.Data = append(list.Data, s.modelEntry(m, created))
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// modelEntry builds one /v1/models row from what the gateway can actually
+// vouch for. This is the only place a client learns that thinking exists at
+// all: without a capability signal, a UI never offers a level selector and
+// never sends reasoning_effort, so the reasoning_content the chat handlers
+// already forward goes unread.
+//
+// The values are configuration and measurement, never fabrication. In
+// particular no token window is reported, because the upstream enforces
+// message and byte caps instead (see Model in the openai package).
+func (s *Server) modelEntry(id string, created int64) openai.Model {
+	limits := openai.ModelLimits{
+		// MaxMessages already reserves headroom under the upstream's hard 100
+		// (default 96). Zero disables the trim, which means the upstream's own
+		// 100 applies, so that is what is advertised.
+		MaxMessages:   s.cfg.MaxMessages,
+		MaxInputBytes: upstream.MaxInputBytes,
+	}
+	if limits.MaxMessages <= 0 {
+		limits.MaxMessages = upstream.MaxUpstreamMessages
+	}
+	return openai.Model{
+		ID:      id,
+		Object:  "model",
+		Created: created,
+		OwnedBy: "inceptionlabs",
+		Capabilities: openai.ModelCapabilities{
+			Streaming: true,
+			Tools:     true,
+			// Reasoning exists at effort >= low, which is the gateway default
+			// (medium). See ReasoningLevels for the caveat on instant.
+			Reasoning: true,
+			WebSearch: s.cfg.NativeWebSearch && s.se != nil,
+		},
+		SupportsReasoning: true,
+		ReasoningLevels:   []string{"instant", "low", "medium", "high"},
+		Limits:            limits,
+	}
 }
 
 // healthz reports liveness, pool size, and request counters. It is never

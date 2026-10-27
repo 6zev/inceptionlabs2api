@@ -101,6 +101,15 @@ curl http://localhost:3000/v1/chat/completions \
   反而让客户端误以为存在多个模型可选。
 - 判断"是否能用某个模型"的正确依据是上游，而不是这个名单。
 
+**自动别名 `mercury-3-thinking`**：唯一的例外。网关会自动为每个名字追加
+一个 `<名字>-thinking` 别名（同一个后端，只是标签）。原因是部分客户端
+**只根据模型 ID 判断是否显示"思考强度"选项**，不读 `/v1/models` 的
+capabilities——Cherry Studio 即实测案例（其 `REASONING_REGEX` 匹配包含
+`reasoning` / `reasoner` / `thinking` / `think` 的 ID）。在 Cherry Studio
+里选 `mercury-3-thinking`，思考选项就会出现，客户端才会发送
+`reasoning_effort`，进而收到 `reasoning_content`。名字本身已含这些词的
+不再追加别名。
+
 ### `reasoning_effort` 实测：实际只有三档
 
 **结论先说：日常用 `medium`（也就是不传）；`low` 适合要快又要对的场景；

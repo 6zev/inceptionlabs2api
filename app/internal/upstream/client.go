@@ -416,6 +416,16 @@ func (s *Stream) Close() error { return s.Body.Close() }
 // fixes; above it the request itself is over the line.
 const maxUpstreamMessages = 100
 
+// MaxUpstreamMessages exports the hard message cap for capability reporting
+// (/v1/models), so the advertised limit and the enforced one cannot drift.
+const MaxUpstreamMessages = maxUpstreamMessages
+
+// MaxInputBytes is the upstream's measured request-body ceiling: 3.9 MB passed
+// and 4.4 MB failed with "Request Entity Too Large" (README, measured
+// 2026-10-22). It is advertised as a byte limit, not converted to tokens,
+// because the upstream publishes no token accounting to convert with.
+const MaxInputBytes = 4 << 20
+
 // tooLongMarker is the upstream's own error phrase for the conversation
 // length rejection (case-insensitive match on the response body).
 const tooLongMarker = "conversation is too long"

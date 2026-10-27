@@ -82,11 +82,58 @@ type Message struct {
 }
 
 // Model is one entry of GET /v1/models.
+//
+// The capability fields exist so a client can tell what the model can do
+// without guessing: without them a UI has no way to know that thinking is
+// available at all, and therefore never sends reasoning_effort nor shows the
+// reasoning_content the gateway already forwards.
+//
+// Every value here is measured, not inferred. Two deliberate omissions:
+//
+//   - No context_length / context_window token budget. The upstream has no
+//     token window to report; it caps at 100 messages and ~4 MB of body
+//     (README, measured 2026-10-22). Advertising a token count would make a
+//     client size prompts it cannot actually send and meet a 502 instead.
+//   - No pricing. The gateway does not bill.
 type Model struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
+
+	// Capabilities is the nested form LiteLLM/OpenRouter-style clients read.
+	Capabilities ModelCapabilities `json:"capabilities"`
+	// The flat duplicates below cost nothing and help clients that look for a
+	// top-level key instead of the nested object. No model object schema
+	// standardises these, so more than one shape is offered.
+	SupportsReasoning bool     `json:"supports_reasoning"`
+	ReasoningLevels   []string `json:"reasoning_levels"`
+	// Limits reports the real upstream boundaries, named for what they are
+	// rather than pretending to be a token window.
+	Limits ModelLimits `json:"limits"`
+}
+
+// ModelCapabilities are what the backend can do.
+type ModelCapabilities struct {
+	Streaming bool `json:"streaming"`
+	Tools     bool `json:"tools"`
+	// Reasoning is true because reasoning is available at effort >= low. It is
+	// not true of every request: reasoning_effort=instant produces no
+	// reasoning at all (measured 2026-10-26, 0/4 samples), so a client must not
+	// assume reasoning_content is always present.
+	Reasoning bool `json:"reasoning"`
+	// WebSearch is the gateway-served tool, so it follows configuration rather
+	// than the backend.
+	WebSearch bool `json:"web_search"`
+}
+
+// ModelLimits are the measured upstream request boundaries. These are message
+// and byte counts, not tokens: the upstream publishes no token accounting, so
+// there is nothing truer to report.
+type ModelLimits struct {
+	MaxMessages int `json:"max_messages"`
+	// MaxInputBytes is the observed ~4 MB body ceiling.
+	MaxInputBytes int64 `json:"max_input_bytes"`
 }
 
 // ModelList is the GET /v1/models envelope.
