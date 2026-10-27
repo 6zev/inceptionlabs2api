@@ -11,6 +11,12 @@ import (
 // reasoningEfforts maps the one OpenAI value Mercury has no equivalent for.
 // Every other value is passed through: the upstream owns its enum, and a
 // gateway-invented 400 would be a policy the caller never agreed to (§1.1).
+//
+// Measured 2026-10-26 on a reasoning-heavy prompt (4 samples per level):
+// instant reasons not at all (0 B reasoning, 4.2 s) and fails multi-step
+// arithmetic; low reasons briefly (11.6 s); medium reasons for about 30 s;
+// high is indistinguishable from medium (30.9 s). The gateway therefore
+// invents no extra levels — it forwards what the caller asked for.
 var reasoningEfforts = map[string]string{
 	"minimal": "low",
 }

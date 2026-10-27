@@ -72,7 +72,7 @@ docker build -t inceptionlabs2api . && docker run -p 3000:3000 --env-file app/.e
 | `model` | string | 必填，默认且唯一为 `mercury-3`（见下方说明） |
 | `messages` | array | 必填，`system` / `user` / `assistant` / `tool` 轮次历史 |
 | `stream` | bool | 默认 `false`；`true` 时返回 SSE 流 |
-| `reasoning_effort` | string | 思考强度 `instant` / `low` / `high`（默认映射 medium） |
+| `reasoning_effort` | string | 思考强度 `instant` / `low` / `medium` / `high`；**不传 = `medium`**（见下方实测） |
 | `tools` | array | OpenAI function 工具定义（见下） |
 | `tool_choice` | string/object | `"auto"` / `"required"` / `{"type":"function","function":{"name":"..."}}` |
 | `parallel_tool_calls` | bool | 是否允许一轮并行调用多个工具 |
@@ -100,6 +100,61 @@ curl http://localhost:3000/v1/chat/completions \
   只会让网关多接受一个名字，后端仍是同一个模型——不解决任何问题，
   反而让客户端误以为存在多个模型可选。
 - 判断"是否能用某个模型"的正确依据是上游，而不是这个名单。
+
+### `reasoning_effort` 实测：实际只有三档
+
+**结论先说：日常用 `medium`（也就是不传）；`low` 适合要快又要对的场景；
+`instant` 只适合闲聊；`high` 相比 `medium` 没有可测收益，不建议用。**
+
+网关把这个字段原样透传给上游（仅 `minimal`→`low` 做映射，空值补 `medium`），
+所以差异来自上游本身。以下数据为 2026-10-26 对线上上游实测，每组 4–5 次
+采样、串行发送并在请求之间留间隔（否则会撞上游 429）。
+
+**测试一：多步算术**（3 台机器产量 → 扣次品 → 装箱，唯一正确答案）
+
+| effort | 答对 | 平均耗时 |
+|---|---|---|
+| `instant` | **0 / 5** | 0.55s |
+| `low` | 5 / 5 | 0.87s |
+| `medium` | 5 / 5 | 1.08s |
+| `high` | 5 / 5 | 0.83s |
+
+`instant` 全错——它做不了多步计算。其余三档在这题上没有差别（题目太浅）。
+
+**测试二：重度推理**（3 天会议排期，多重约束，无现成公式）
+
+| effort | 平均耗时 | `reasoning_content` 平均 | 出现 reasoning | 回答正文平均 |
+|---|---|---|---|---|
+| `instant` | **4.2s** | **0 B** | **0/4** | 7531 B |
+| `low` | 11.6s | 421 B | 4/4 | 2606 B |
+| `medium` | 29.8s | 437 B | 4/4 | 1565 B |
+| `high` | **30.9s** | 462 B | 4/4 | 1768 B |
+
+由此可以读出各档的真实行为：
+
+- **`instant`**：完全不思考（`reasoning_content` 恒为空），靠一次性输出，
+  回答又长又容易错。只适合闲聊、改写、简单问答。
+- **`low`**：开启思考，思考量小，速度约为 `medium` 的 1/3。
+- **`medium`**：思考时间显著拉长（约 30s），正文更短更集中。
+- **`high` ≈ `medium`**：耗时和 reasoning 量都在噪声范围内
+  （`medium` 波动 23.8–35.0s，`high` 23.7–37.7s）。**没有理由为此多付等待。**
+
+> **耗时取决于题目难度，不是固定值**：同一个 `medium`，在多步算术题上只要
+> 1.08s，在排期题上要 29.8s。倍数关系（`instant` < `low` < `medium`）
+> 比绝对秒数更值得参考。
+
+> **客户端超时设置**：重度推理下单次回答可能接近 30s，`high` 甚至到 38s。
+> 如果你的 HTTP 客户端有 10–30s 的超时，请调到 60s 以上，否则会话会在
+> 上游还在思考时被本地掐断（网关的流式空闲看门狗默认 60s，
+> 见 `IL2API_IDLE_TIMEOUT`）。
+
+> 关于 `reasoning_content`：它**只有在上游真正思考时才出现**。简单问题下
+> 上游不产出 reasoning（这是上游行为，不是网关丢弃）。上面的流式测试也确认
+> 网关会把 reasoning 增量按原始顺序转发：`instant` 为 0 字节，`medium`
+> 为 377 字节。
+
+> **注意 429**：连续快速发请求会被上游限流（`Too Many Requests`）。网关对
+> 普通 429 采取**原样透传、不自动退避**的策略，所以批量压测时请自行间隔请求。
 
 ## 工具调用
 
