@@ -34,11 +34,15 @@ func TestUpdateMode(t *testing.T) {
 		env  string
 		want bool
 	}{
-		{"flag", []string{"inceptionlabs2api", "-update"}, "", true},
-		{"double dash flag", []string{"inceptionlabs2api", "--update"}, "", true},
-		{"bare word", []string{"inceptionlabs2api", "update"}, "", true},
+		{"long flag", []string{"inceptionlabs2api", "--update"}, "", true},
+		{"short flag alias", []string{"inceptionlabs2api", "-update"}, "", true},
+		{"subcommand", []string{"inceptionlabs2api", "update"}, "", true},
+		{"subcommand after other args", []string{"inceptionlabs2api", "--verbose", "update"}, "", true},
 		{"env on", []string{"inceptionlabs2api"}, "1", true},
 		{"plain serve", []string{"inceptionlabs2api"}, "", false},
+		// A misspelled subcommand must not start a gateway that looks healthy
+		// while the operator believes it updated.
+		{"typo", []string{"inceptionlabs2api", "updte"}, "", true},
 		// The exec'd child: -serve must win over a stale env var, or the new
 		// image would re-enter update mode and loop forever.
 		{"serve beats env", []string{"inceptionlabs2api", "-serve"}, "1", false},

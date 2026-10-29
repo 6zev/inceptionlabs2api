@@ -454,8 +454,13 @@ IL2API_PROXY=http://127.0.0.1:2203       # HTTP CONNECT 隧道
 二进制自带一条更新路径，不需要重新下载或改启动方式：
 
 ```bash
-./inceptionlabs2api -update          # 也接受 --update / update / IL2API_UPDATE=1
+./inceptionlabs2api update           # 子命令写法（推荐）
+./inceptionlabs2api --update         # 长参数
+./inceptionlabs2api -update          # 单横线别名，兼容旧 cron
+IL2API_UPDATE=1 ./inceptionlabs2api  # 环境变量
 ```
+
+参数拼错（例如 `updte`）会进入更新模式而不是悄悄起服务，避免"以为更新了、其实在跑旧进程"。
 
 `-update` 只做更新这一件事：**不解析 `.env`、不启动服务**，所以代理写错也不会挡住更新。
 更新成功后 exec 新二进制并带 `-serve` 参数，这时才按正常方式启动 API。

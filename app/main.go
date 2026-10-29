@@ -166,31 +166,50 @@ func run() error {
 
 // updateMode reports whether the process was started to self-update.
 //
-// The flag is read from os.Args and IL2API_UPDATE, not from config: the config
-// package is the capture's configuration contract and an update is an action,
-// not a setting. `-update` / `--update` / `update` all mean the same thing, so
-// a typo in a cron line fails loudly instead of silently serving.
+// The command line is parsed here, not in the config package: an update is an
+// action, not a setting, and it must be decidable before config.Load (a broken
+// gateway setting must never block an update).
+//
+// Accepted forms:
+//
+//	inceptionlabs2api update        (subcommand)
+//	inceptionlabs2api --update      (long flag)
+//	inceptionlabs2api -update       (accepted alias, kept so older cron lines work)
+//	IL2API_UPDATE=1                 (env, for cron/systemd one-liners)
+//
+// "-serve" (what the exec'd child gets) always wins: it must SERVE even when
+// IL2API_UPDATE=1 is still in the environment that started the update, or the
+// new image would re-enter update mode and loop.
 func updateMode() bool {
-	for _, a := range os.Args[1:] {
+	args := os.Args[1:]
+	for _, a := range args {
+		if a == "-serve" || a == "--serve" {
+			return false
+		}
+	}
+	for _, a := range args {
 		switch a {
 		case "-update", "--update", "update":
 			return true
 		}
 	}
-	// The exec'd child is started with "-serve", which wins: it must SERVE even
-	// when IL2API_UPDATE=1 is still in the environment from the cron line that
-	// started the update. Otherwise the new image would re-enter update mode
-	// and loop.
-	for _, a := range os.Args[1:] {
-		if a == "-serve" || a == "--serve" {
-			return false
-		}
-	}
 	if v := strings.TrimSpace(strings.ToLower(os.Getenv("IL2API_UPDATE"))); v == "1" || v == "true" || v == "on" {
 		return true
 	}
+	// A bare unknown word is a typo, not a request to serve something else:
+	// `./inceptionlabs2api updte` must not silently start a gateway that looks
+	// healthy while the operator believes it updated.
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			return true
+		}
+	}
 	return false
 }
+
+// serveArgv is the argument list handed to the exec'd image: it always carries
+// -serve, so the new binary serves instead of trying to update itself again.
+func serveArgv() []string { return []string{"-serve"} }
 
 // runSelfUpdate performs the update. On success it execs the new binary, so the
 // gateway comes back up in the same PID and serves normally; the function only
@@ -201,9 +220,9 @@ func runSelfUpdate(logf func(format string, args ...any)) error {
 		Tag:     strings.TrimSpace(os.Getenv("IL2API_UPDATE_TAG")),
 		Logf:    logf,
 		Current: version,
-		// The exec'd image must not be in update mode again, or it would fetch
-		// its own release forever instead of serving.
-		ARGV: []string{"-serve"},
+		// The exec'd image must not be in update mode again (even from a stale
+		// IL2API_UPDATE), or it would fetch its own release forever.
+		ARGV: serveArgv(),
 	}
 	res, err := selfupdate.Update(context.Background(), opts)
 	if err != nil {
