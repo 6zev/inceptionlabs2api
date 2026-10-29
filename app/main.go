@@ -147,8 +147,12 @@ func run() error {
 	defer stop()
 
 	go func() {
-		logf("inceptionlabs2api %s (commit %s, built %s) listening on %s (upstream=%s proxy=%q models=%v session_per_request=%v)",
-			version, commit, date, cfg.Addr, cfg.UpstreamBase, config.RedactProxy(cfg.Proxy), cfg.Models, cfg.SessionPerRequest)
+		proxyDesc := "none"
+		if cfg.Proxy != "" {
+			proxyDesc = fmt.Sprintf("%q via %s", config.RedactProxy(cfg.Proxy), cfg.ProxySource)
+		}
+		logf("inceptionlabs2api %s (commit %s, built %s) listening on %s (upstream=%s proxy=%s models=%v session_per_request=%v)",
+			version, commit, date, cfg.Addr, cfg.UpstreamBase, proxyDesc, cfg.Models, cfg.SessionPerRequest)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server: %v", err)
 		}

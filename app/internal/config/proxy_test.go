@@ -78,3 +78,36 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// The conventional variables are a silent fallback: when IL2API_PROXY is unset
+// but the shell still carries ALL_PROXY, the gateway uses it. Record where it
+// came from so the boot log explains a proxy the operator believes they
+// removed.
+func TestProxySourceIsRecorded(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string // ProxySource
+		up   string // resulting Proxy
+	}{
+		{"explicit", map[string]string{"IL2API_PROXY": "socks5://127.0.0.1:1080"}, "IL2API_PROXY", "socks5://127.0.0.1:1080"},
+		{"inherit all_proxy", map[string]string{"ALL_PROXY": "socks5://127.0.0.1:1080"}, "ALL_PROXY", "socks5://127.0.0.1:1080"},
+		{"explicit wins over inherited", map[string]string{"IL2API_PROXY": "http://a:1", "ALL_PROXY": "socks5://b:2"}, "IL2API_PROXY", "http://a:1"},
+		{"https_proxy lower", map[string]string{"https_proxy": "http://c:3"}, "https_proxy", "http://c:3"},
+		{"none", nil, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := FromEnv(func(k string) string { return tc.env[k] })
+			if err != nil {
+				t.Fatalf("FromEnv: %v", err)
+			}
+			if c.ProxySource != tc.want {
+				t.Fatalf("ProxySource = %q, want %q", c.ProxySource, tc.want)
+			}
+			if c.Proxy != tc.up {
+				t.Fatalf("Proxy = %q, want %q", c.Proxy, tc.up)
+			}
+		})
+	}
+}

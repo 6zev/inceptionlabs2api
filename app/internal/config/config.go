@@ -26,6 +26,13 @@ type Config struct {
 	// only makes the gateway accept more names for the same backend.
 	Model   string
 	Proxy   string
+	// ProxySource names the variable the proxy came from ("IL2API_PROXY",
+	// "ALL_PROXY", ...), empty when no proxy is in effect. It exists so the
+	// boot log can say WHY a proxy is active when IL2API_PROXY looks unset
+	// (an inherited ALL_PROXY in the shell is the usual cause), which the
+	// proxy address alone cannot explain. The address is logged separately,
+	// with credentials redacted.
+	ProxySource string
 	PoolMin int
 	PoolMax int
 	PoolTTL time.Duration
@@ -155,14 +162,24 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if len(c.Models) == 0 {
 		c.Models = []string{c.Model}
 	}
+	// IL2API_PROXY unset falls back to the conventional proxy variables, so a
+	// host-level HTTPS_PROXY still works. That fallback is silent in the boot
+	// log, which is how an "I removed the proxy" report becomes a socks5 dial
+	// error with no visible cause: the operator cleared IL2API_PROXY but the
+	// shell (or a stale export) still carries ALL_PROXY. Record the source so
+	// the log can name it.
 	proxy := strings.TrimSpace(getenv("IL2API_PROXY"))
+	c.ProxySource = ""
 	if proxy == "" {
 		for _, key := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
 			if v := strings.TrimSpace(getenv(key)); v != "" {
 				proxy = v
+				c.ProxySource = key
 				break
 			}
 		}
+	} else {
+		c.ProxySource = "IL2API_PROXY"
 	}
 	proxy, err := normalizeProxy(proxy)
 	if err != nil {

@@ -443,8 +443,11 @@ IL2API_PROXY=http://127.0.0.1:2203       # HTTP CONNECT 隧道
 
 - `socks5` / `socks5h` 装在 **DialContext 层**（TLS 建在隧道之上），所以 Vercel
   clearance cookie 绑定的 HTTP/2 连接仍然成立；`http`/`https` 走 stdlib 的 CONNECT。
-- 未设置时仍会读取 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（大小写均可），
-  `ALL_PROXY=socks5://…` 可直接用。
+- 未设置 `IL2API_PROXY` 时仍会读取 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`
+  （大小写均可）。**这是最常见的坑**：`IL2API_PROXY` 删掉后，shell 里继承的
+  `ALL_PROXY` 依然生效。启动日志会写明来源，例如
+  `proxy="socks5://127.0.0.1:1080" via ALL_PROXY`；彻底关闭用
+  `env -u ALL_PROXY -u HTTPS_PROXY -u HTTP_PROXY ./inceptionlabs2api`。
 - 代理不可达时启动不失败：日志出现
   `clear: fetch challenge: … socks5: dial proxy 127.0.0.1:1080: connection refused`，
   `/v1/chat/completions` 返回 503，后台过盾循环持续重试。
