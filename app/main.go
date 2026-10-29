@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"inceptionlabs2api/internal/config"
 	"inceptionlabs2api/internal/pool"
+	"inceptionlabs2api/internal/selfupdate"
 	"inceptionlabs2api/internal/server"
 	"inceptionlabs2api/internal/upstream"
 )
@@ -40,6 +43,24 @@ func run() error {
 		return fmt.Errorf("config: %w", err)
 	}
 	logf := log.Printf
+
+	// Self-update runs INSTEAD of serving: `inceptionlabs2api -update` fetches
+	// the newest release, verifies its checksum, replaces this executable and
+	// execs it. It happens before the heap limit, the pool or any socket so a
+	// failed update leaves nothing half-wired. The environment (IL2API_* and
+	// the .env this process already loaded) carries over to the new image.
+	if updateMode() {
+		return runSelfUpdate(logf)
+	}
+
+	// Install the soft heap ceiling before anything allocates. Without one,
+	// Go lets the heap grow to 2x the live set with no upper bound, so a
+	// long-running gateway that saw a burst (or one oversized response) keeps
+	// the pages it grew; the limit makes it collect instead. soft: an
+	// over-limit allocation slows down, it does not fail.
+	if limit := config.ApplyMemoryLimit(cfg.MemoryLimit); limit > 0 {
+		logf("config: soft heap limit %d MiB (IL2API_MEMORY_LIMIT=0 removes it)", limit>>20)
+	}
 
 	up, fetch := upstream.NewClient(upstream.Config{
 		BaseURL:           cfg.UpstreamBase,
@@ -133,5 +154,42 @@ func run() error {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
+	return nil
+}
+
+// updateMode reports whether the process was started to self-update.
+//
+// The flag is read from os.Args and IL2API_UPDATE, not from config: the config
+// package is the capture's configuration contract and an update is an action,
+// not a setting. `-update` / `--update` / `update` all mean the same thing, so
+// a typo in a cron line fails loudly instead of silently serving.
+func updateMode() bool {
+	for _, a := range os.Args[1:] {
+		switch a {
+		case "-update", "--update", "update":
+			return true
+		}
+	}
+	if v := strings.TrimSpace(strings.ToLower(os.Getenv("IL2API_UPDATE"))); v == "1" || v == "true" || v == "on" {
+		return true
+	}
+	return false
+}
+
+// runSelfUpdate performs the update and, on success, execs the new binary so
+// the gateway comes back up in the same PID. A no-op exit happens when the
+// running version is already the newest release.
+func runSelfUpdate(logf func(format string, args ...any)) error {
+	opts := selfupdate.Options{
+		Repo:    strings.TrimSpace(os.Getenv("IL2API_UPDATE_REPO")),
+		Tag:     strings.TrimSpace(os.Getenv("IL2API_UPDATE_TAG")),
+		Logf:    logf,
+		Current: version,
+	}
+	res, err := selfupdate.Update(context.Background(), opts)
+	if err != nil {
+		return fmt.Errorf("self-update: %w", err)
+	}
+	logf("self-update: already on %s (%s); nothing to do", res.Version, res.Path)
 	return nil
 }

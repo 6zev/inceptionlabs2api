@@ -30,4 +30,8 @@ services:
       - IL2API_SESSION_PER_REQUEST=${IL2API_SESSION_PER_REQUEST:-off}
       # Gateway-served web_search tool. On by default; set off to disable.
       - IL2API_NATIVE_WEB_SEARCH=${IL2API_NATIVE_WEB_SEARCH:-on}
+      # Soft heap ceiling. The container image has no swap and no other
+      # consumer, so a ceiling is what keeps an idle instance from sitting on
+      # pages it grew during a burst. 0 removes it.
+      - IL2API_MEMORY_LIMIT=${IL2API_MEMORY_LIMIT:-256M}
     restart: unless-stopped

@@ -385,6 +385,7 @@ Mercury Decide：给一段场景文本 + 若干结构化问题，返回带概率
 | `IL2API_MAX_MESSAGES` | 96 | 单次请求消息条数上限；超限先折叠再裁掉最旧轮次。0 = 关闭 |
 | `IL2API_EMPTY_RETRIES` | 1 | 上游返回空补全（无任何文本）时的额外重试次数，用尽后返回 502 |
 | `IL2API_SESSION_PER_REQUEST` | off | 每次上游调用新取一个匿名 session，不复用池中 token |
+| `IL2API_MEMORY_LIMIT` | `256M` | Go 软内存上限（字节或 `K`/`M`/`G`）；超限只会让 GC 更频繁，不会拒绝请求。0 取消上限 |
 
 完整变量清单见 [`app/.env.example`](./app/.env.example)。
 
@@ -410,6 +411,49 @@ config: loaded environment from .env
   `IL2API_ADDR=:4000 ./inceptionlabs2api` 会覆盖文件中的值。
 - 支持 `KEY=value`、`export KEY=value`、`KEY="带 空格 和 \n 转义"`、
   `KEY='原样保留'` 以及行尾 `# 注释`。格式错误的行会让启动失败而不是被静默忽略。
+
+## 排障（502 / 503 / 504）
+
+日志里每条上游失败都带一个稳定的 `code`，先按它分类再看：
+
+| `code` | 含义 | 首要检查 |
+|---|---|---|
+| `upstream_clearance_failed` (503) | 无法完成 Vercel checkpoint 过盾 | `/healthz` 的 `clearance.has_cookie`；出口 IP 是否被挑战 |
+| `upstream_unavailable` (503) | 会话池为空 | `/healthz` 的 `pool.below_min` / `pool.last_error` |
+| `upstream_empty_response` (502) | 上游返回 0 文本 | 提示词是否过长 |
+| `upstream_idle_timeout` (504) | 空闲看门狗超时 | 上游是否异常缓慢 |
+| `upstream_stream_error` (502) | 流被截断 | 网络抖动、代理断开 |
+| 其它 `upstream_error` | 上游原样错误 | `message` 里就是上游原话（例如 `conversation is too long`） |
+
+清理 cookie 环时可能出现几轮 `retired slot N after a challenge`，这是正常恢复：
+每个被挑战的槽位会被踢出并重新过盾。若持续数分钟不恢复，用
+`curl 'localhost:3000/healthz?probe=1'` 立即补一次过盾，不必重启进程。
+
+## 自更新（OTA）
+
+二进制自带一条更新路径，不需要重新下载或改启动方式：
+
+```bash
+./inceptionlabs2api -update          # 也接受 --update / update / IL2API_UPDATE=1
+```
+
+它会：
+
+1. 从 GitHub Releases 取**当前系统/架构**对应的最新资产
+   （`inceptionlabs2api_<version>_<goos>_<goarch>`）；
+2. 下载并**逐字节校验 `sha256`**（校验文件缺失或不匹配则拒绝安装）；
+3. 把旧二进制改名为 `<exe>.old`，新二进制原子替换到原路径；
+4. **exec 新二进制**——同一个 PID，监听地址和 `.env` 都沿用，后台过盾/会话池重新初始化。
+
+| 变量 / 参数 | 作用 |
+|---|---|
+| `IL2API_UPDATE_TAG=v1.2.0` | 固定装某个版本（默认最新） |
+| `IL2API_UPDATE_REPO=owner/repo` | 换一个 release 来源（默认内置仓库） |
+
+- 当前版本已经是最新时直接退出，不下载、不重启。
+- exec 失败时二进制**已经替换**，错误信息会提示重启进程；旧文件保留在 `<exe>.old`，可手工回滚。
+- Windows 不支持原子替换运行中的 exe，会直接报错退出。
+- 放在 cron 里即可定时更新，例如 `0 4 * * * /opt/inceptionlabs2api -update >> /var/log/il2api-update.log 2>&1`。
 
 ## 许可
 

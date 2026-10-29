@@ -72,6 +72,10 @@ type Config struct {
 	ClearanceCooldown time.Duration
 	// ClearancePool is the size of the clearance ring (SPEC §2.1.2).
 	ClearancePool int
+	// MemoryLimit is the Go soft heap ceiling in bytes (IL2API_MEMORY_LIMIT),
+	// applied with debug.SetMemoryLimit at boot. Zero keeps Go's default of
+	// no ceiling; see memory.go for why the gateway ships one.
+	MemoryLimit int64
 }
 
 // Defaults returns the configuration used when no environment variable is set.
@@ -103,6 +107,7 @@ func Defaults() Config {
 		ClearanceRefresh:  45 * time.Minute,
 		ClearanceCooldown: 15 * time.Second,
 		ClearancePool:     20,
+		MemoryLimit:       defaultMemoryLimit,
 	}
 }
 
@@ -218,6 +223,16 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if c.ClearancePool, err = envInt(getenv, "IL2API_CLEARANCE_POOL", c.ClearancePool); err != nil {
 		return Config{}, err
 	}
+	// IL2API_MEMORY_LIMIT is presence-aware, so it needs the presence-aware
+	// form of getenv: unset (or empty, which this function everywhere treats
+	// as unset) keeps the default ceiling, while an explicit "0" turns the
+	// ceiling off.
+	if c.MemoryLimit, err = memoryLimitFromEnv(func(k string) (string, bool) {
+		v := getenv(k)
+		return v, strings.TrimSpace(v) != ""
+	}); err != nil {
+		return Config{}, fmt.Errorf("config: %w", err)
+	}
 	if v := strings.TrimSpace(strings.ToLower(getenv("IL2API_SEARCH_CONFIG_CHECK"))); v != "" {
 		switch v {
 		case "on", "1", "true", "yes":
@@ -311,6 +326,11 @@ func (c Config) validate() error {
 	}
 	if c.ClearancePool < 1 {
 		return fmt.Errorf("config: IL2API_CLEARANCE_POOL must be >= 1, got %d", c.ClearancePool)
+	}
+	// A ceiling below the live heap would make every cycle a GC cycle. Refuse
+	// the obviously hopeless values instead of shipping a gateway that stalls.
+	if c.MemoryLimit != 0 && c.MemoryLimit < 32<<20 {
+		return fmt.Errorf("config: IL2API_MEMORY_LIMIT must be 0 or at least 32M, got %d bytes", c.MemoryLimit)
 	}
 	u, err := url.Parse(c.UpstreamBase)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
