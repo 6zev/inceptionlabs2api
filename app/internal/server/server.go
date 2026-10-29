@@ -47,6 +47,10 @@ type PoolStats interface {
 // source means the gateway does not track clearance (e.g. unit tests).
 type ClearanceStats interface {
 	State() clear.State
+	// ProbeNow performs one clearance acquisition (or a no-op when the egress
+	// is not challenged). /healthz?probe=1 calls it: an operator who sees a
+	// dead ring can re-solve it without restarting the gateway.
+	ProbeNow(ctx context.Context) error
 }
 
 // Config configures the HTTP surface.
@@ -114,7 +118,12 @@ type Server struct {
 	// searchAvailable is nil until the config probe succeeds; false is a
 	// definitive "the deployment disabled retrieval".
 	searchAvailable *bool
-	probeOnce       sync.Once
+	// searchProbeErr is the last config-probe failure ("" when it succeeded).
+	// Availability alone cannot say "the probe never got through", and on a
+	// long-running instance a probe that keeps failing is the first sign of a
+	// dead doorway rather than a dead search backend.
+	searchProbeErr string
+	probeOnce      sync.Once
 
 	requests      atomic.Uint64
 	streams       atomic.Uint64
@@ -181,6 +190,7 @@ func (s *Server) probeSearch(ctx context.Context) {
 	defer cancel()
 	cfg, err := s.se.SearchConfig(ctx)
 	if err != nil {
+		s.setSearchProbeError(err.Error())
 		s.logf("search: config probe failed (search stays enabled, availability unknown): %v", err)
 		return
 	}
@@ -191,8 +201,23 @@ func (s *Server) probeSearch(ctx context.Context) {
 	available := cfg.RetrievalAvailable
 	s.searchMu.Lock()
 	s.searchAvailable = &available
+	s.searchProbeErr = ""
 	s.searchMu.Unlock()
 	s.logf("search: retrievalAvailable=%v", available)
+}
+
+// setSearchProbeError records a failed probe for /healthz.
+func (s *Server) setSearchProbeError(msg string) {
+	s.searchMu.Lock()
+	s.searchProbeErr = msg
+	s.searchMu.Unlock()
+}
+
+// searchProbeError returns the last probe failure ("" when none).
+func (s *Server) searchProbeError() string {
+	s.searchMu.Lock()
+	defer s.searchMu.Unlock()
+	return s.searchProbeErr
 }
 
 // SearchAvailable returns the cached probe result, nil when unknown. The probe
@@ -428,6 +453,19 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, "GET, HEAD")
 		return
 	}
+	// ?probe=1 forces one clearance acquisition before reporting. It exists
+	// because the only other recovery from a dead ring was a restart: the
+	// background loop paces one solve every ~2 s and a failing slot waits out
+	// its cooldown, so an operator watching a 3-4 minute outage had no lever.
+	// Bounded, and never gated behind auth failure: /healthz is already open.
+	if r.URL.Query().Get("probe") == "1" && s.clr != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		err := s.clr.ProbeNow(ctx)
+		cancel()
+		if err != nil {
+			s.logf("clear: manual probe failed: %v", err)
+		}
+	}
 	body := map[string]any{
 		"ok": true,
 		"counters": Counters{
@@ -439,7 +477,7 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 			STT:       s.stt.Load(),
 			Decisions: s.decisionCalls.Load(),
 		},
-		"search": map[string]any{"available": s.SearchAvailable()},
+		"search": map[string]any{"available": s.SearchAvailable(), "probe": s.searchProbeError()},
 	}
 	if s.pool != nil {
 		body["pool"] = s.pool.Stats()

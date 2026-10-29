@@ -99,10 +99,13 @@ type State struct {
 
 // SlotView is the health view of one ring slot.
 type SlotView struct {
-	Cookie       bool      `json:"cookie"`
-	State        SlotState `json:"state"`
-	AgeSeconds   int64     `json:"age_seconds"`
-	RefreshCount int64     `json:"refresh_count"`
+	Cookie     bool      `json:"cookie"`
+	State      SlotState `json:"state"`
+	AgeSeconds int64     `json:"age_seconds"`
+	// RemainingSeconds counts down to the edge's own Max-Age (negative once
+	// past it). Omitted when the edge sent no deadline.
+	RemainingSeconds *int64 `json:"remaining_seconds,omitempty"`
+	RefreshCount     int64  `json:"refresh_count"`
 }
 
 // slot is one clearance cookie in the rotation ring, plus the per-slot
@@ -112,6 +115,12 @@ type slot struct {
 	acquired  time.Time
 	refreshes int64
 
+	// expiresAt is the cookie's real deadline from the edge's Max-Age (zero
+	// when the edge sent none). The Refresh age is a proactive rotation; this
+	// is the hard cut-off, and a cookie past it must never be served, because
+	// the edge answers it with 401 and burns it for every request in flight.
+	expiresAt time.Time
+
 	// lastAttempt and lastErr implement the per-slot failure cooldown: only a
 	// slot whose own attempt failed waits, so one broken attempt cannot freeze
 	// the fills or the serving of the others.
@@ -120,9 +129,21 @@ type slot struct {
 	lastErr     error
 }
 
+// expiredLocked reports whether the slot's cookie is past the edge's own
+// deadline. A zero expiresAt (no Max-Age) never counts as expired: the
+// Refresh margin is the only signal for such a cookie.
+func (s *slot) expiredLocked(now time.Time) bool {
+	return s.cookie != "" && !s.expiresAt.IsZero() && !now.Before(s.expiresAt)
+}
+
 // stateLocked reports the slot's lifecycle state.
 func (s *slot) stateLocked(now time.Time, cooldown time.Duration) SlotState {
 	if s.cookie != "" {
+		if s.expiredLocked(now) {
+			// Dead, but not yet refilled: the same "waiting for the loop"
+			// state a challenged slot is in, so /healthz reads it correctly.
+			return SlotPending
+		}
 		return SlotLive
 	}
 	if s.failed && cooldown > 0 && !s.lastAttempt.IsZero() && now.Sub(s.lastAttempt) < cooldown {
@@ -254,20 +275,28 @@ func (c *Clearance) Header() (ua, cookie string) {
 	now := c.now()
 	n := uint64(len(c.slots))
 
-	// Prefer the next live, fresh slot at or after the cursor.
+	// Prefer the next live, fresh slot at or after the cursor. "Fresh" is
+	// both: inside the Refresh margin AND before the edge's own deadline.
+	// Serving a cookie past its Max-Age is worse than serving none — the edge
+	// answers 401, and every request in flight that carried the same slot hits
+	// it at the same moment.
 	for i := uint64(0); i < n; i++ {
 		idx := (c.cursor + i) % n
-		if s := c.slots[idx]; s.cookie != "" && now.Sub(s.acquired) < c.cfg.Refresh {
+		s := c.slots[idx]
+		if s.cookie != "" && !s.expiredLocked(now) && now.Sub(s.acquired) < c.cfg.Refresh {
 			c.cursor = idx + 1
 			return UserAgent, CookieName + "=" + s.cookie
 		}
 	}
-	// No fresh slot: take the next live one, stale or not.
+	// No fresh slot: take the next still-valid live one, stale or not. An
+	// expired cookie is never returned; the caller sends no cookie and the
+	// challenge path (or the fill loop) recovers.
 	for i := uint64(0); i < n; i++ {
 		idx := (c.cursor + i) % n
-		if c.slots[idx].cookie != "" {
+		s := c.slots[idx]
+		if s.cookie != "" && !s.expiredLocked(now) {
 			c.cursor = idx + 1
-			return UserAgent, CookieName + "=" + c.slots[idx].cookie
+			return UserAgent, CookieName + "=" + s.cookie
 		}
 	}
 	return UserAgent, ""
@@ -305,17 +334,25 @@ func (c *Clearance) State() State {
 			RefreshCount: s.refreshes,
 		}
 		if s.cookie != "" {
-			st.Live++
 			age := now.Sub(s.acquired)
 			if age < 0 {
 				age = 0
 			}
 			ss.AgeSeconds = int64(age.Seconds())
-			if oldest < 0 || age > oldest {
-				oldest = age
-				st.AgeSeconds = ss.AgeSeconds
+			if !s.expiresAt.IsZero() {
+				// remaining_seconds is the edge's own deadline, so /healthz
+				// shows a dying ring before requests start failing on it.
+				remaining := int64(s.expiresAt.Sub(now).Seconds())
+				ss.RemainingSeconds = &remaining
 			}
-			st.HasCookie = true
+			if s.stateLocked(now, c.cfg.Cooldown) == SlotLive {
+				st.Live++
+				if oldest < 0 || age > oldest {
+					oldest = age
+					st.AgeSeconds = ss.AgeSeconds
+				}
+				st.HasCookie = true
+			}
 		}
 		st.Slots[i] = ss
 	}
@@ -327,7 +364,11 @@ func (c *Clearance) State() State {
 func (c *Clearance) staleLocked() bool {
 	if c.liveLocked() == 0 {
 		// An unchallenged egress holds no cookie but is still fresh for one
-		// refresh window, for the same reason a cookie is.
+		// refresh window, for the same reason a cookie is. A ring holding only
+		// expired cookies is not that case: it needs a solve now.
+		if c.expiredLocked() {
+			return true
+		}
 		if !c.probed {
 			return true
 		}
@@ -338,18 +379,33 @@ func (c *Clearance) staleLocked() bool {
 	// job, and Header still serves the stale slot rather than blocking.
 	fresh := 0
 	for _, s := range c.slots {
-		if s.cookie != "" && c.now().Sub(s.acquired) < c.cfg.Refresh {
+		if s.cookie != "" && !s.expiredLocked(c.now()) && c.now().Sub(s.acquired) < c.cfg.Refresh {
 			fresh++
 		}
 	}
 	return stale && fresh == 0
 }
 
-// liveLocked counts slots holding a cookie.
+// expiredLocked reports whether any slot holds a cookie past the edge's own
+// deadline.
+func (c *Clearance) expiredLocked() bool {
+	now := c.now()
+	for _, s := range c.slots {
+		if s.expiredLocked(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// liveLocked counts slots holding a cookie the edge will still accept. An
+// expired cookie is not live: counting it would tell the fill loop there is
+// nothing to do while Header is already serving nothing.
 func (c *Clearance) liveLocked() int {
 	n := 0
+	now := c.now()
 	for _, s := range c.slots {
-		if s.cookie != "" {
+		if s.cookie != "" && !s.expiredLocked(now) {
 			n++
 		}
 	}
@@ -369,6 +425,14 @@ func (c *Clearance) Ensure(ctx context.Context) error {
 		return nil
 	}
 	return c.acquireSlot(ctx, idx)
+}
+
+// ProbeNow performs one clearance acquisition for an operator (the
+// /healthz?probe=1 lever). It is Refresh under a clearer name: it bypasses the
+// "nothing is stale" shortcut, because an operator asking for a probe has
+// already seen the symptom and does not want the gateway's opinion.
+func (c *Clearance) ProbeNow(ctx context.Context) error {
+	return c.Refresh(ctx)
 }
 
 // Refresh replaces the cookie a challenge just rejected, or acquires one when
@@ -599,6 +663,7 @@ func (c *Clearance) Retire(cookie string) error {
 			// a possible in-flight acquisition and must survive.
 			c.slots[i].cookie = ""
 			c.slots[i].acquired = time.Time{}
+			c.slots[i].expiresAt = time.Time{}
 			c.mu.Unlock()
 			c.logf("clear: retired slot %d after a challenge", i)
 			return nil
@@ -758,7 +823,7 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 	if err != nil {
 		return fmt.Errorf("clear: solve: %w", err)
 	}
-	cookie, err := c.submitSolution(ctx, token, solution)
+	cookie, expiry, err := c.submitSolution(ctx, token, solution)
 	if err != nil {
 		return err
 	}
@@ -769,6 +834,12 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 	}
 	c.slots[idx].cookie = cookie
 	c.slots[idx].acquired = c.now()
+	// The edge's own Max-Age is the hard cut-off. Without it the Refresh
+	// margin is a blind guess at the TTL, and a cookie that dies early (the
+	// observed wave of 401s ~28 min after a boot fill) keeps being served to
+	// every request until the guess comes round. Zero means "no Max-Age", and
+	// then only the Refresh margin applies.
+	c.slots[idx].expiresAt = expiry
 	c.slots[idx].refreshes++
 	c.probed = false
 	c.probedAt = time.Time{}
@@ -814,10 +885,14 @@ func (c *Clearance) fetchChallenge(ctx context.Context) (string, error) {
 
 // submitSolution POSTs the solved token. A 403 means the proof itself was
 // rejected (ErrRefused); anything but 204/200 is a typed failure.
-func (c *Clearance) submitSolution(ctx context.Context, token, solution string) (string, error) {
+//
+// It returns the cookie value and the deadline the edge set on it (zero when
+// the response carried no Max-Age or Expires). The deadline is what stops an
+// already-dead cookie from being served between rotations.
+func (c *Clearance) submitSolution(ctx context.Context, token, solution string) (string, time.Time, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+challengePath, nil)
 	if err != nil {
-		return "", fmt.Errorf("clear: build submission: %w", err)
+		return "", time.Time{}, fmt.Errorf("clear: build submission: %w", err)
 	}
 	req.Header.Set("user-agent", UserAgent)
 	req.Header.Set("accept", "*/*")
@@ -833,23 +908,34 @@ func (c *Clearance) submitSolution(ctx context.Context, token, solution string) 
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("clear: submit solution: %w", err)
+		return "", time.Time{}, fmt.Errorf("clear: submit solution: %w", err)
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
 
 	if resp.StatusCode == http.StatusForbidden {
-		return "", fmt.Errorf("%w: the checkpoint rejected the proof of work (version drift?)", ErrRefused)
+		return "", time.Time{}, fmt.Errorf("%w: the checkpoint rejected the proof of work (version drift?)", ErrRefused)
 	}
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("clear: solution rejected: HTTP %d", resp.StatusCode)
+		return "", time.Time{}, fmt.Errorf("clear: solution rejected: HTTP %d", resp.StatusCode)
 	}
 	for _, ck := range resp.Cookies() {
 		if strings.HasPrefix(ck.Name, "_vcrc") {
-			return ck.Value, nil
+			expiry := c.now()
+			switch {
+			case ck.MaxAge > 0:
+				expiry = expiry.Add(time.Duration(ck.MaxAge) * time.Second)
+			case ck.MaxAge < 0:
+				expiry = time.Time{} // already dead; never serve it
+			case !ck.Expires.IsZero():
+				expiry = ck.Expires
+			default:
+				expiry = time.Time{}
+			}
+			return ck.Value, expiry, nil
 		}
 	}
-	return "", errors.New("clear: no _vcrc* cookie in Set-Cookie")
+	return "", time.Time{}, errors.New("clear: no _vcrc* cookie in Set-Cookie")
 }
 
 // apiProbeHeaders applies the API request header set, matching the shape of

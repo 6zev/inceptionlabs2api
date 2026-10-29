@@ -37,14 +37,14 @@ func newProbeServer(t *testing.T, status int, token string) (*httptest.Server, *
 
 func newTestClearance(srv *httptest.Server) *Clearance {
 	return New(Config{
-		BaseURL:   srv.URL,
-		Client:    srv.Client(),
-		Timeout:   10 * time.Second,
-		Cooldown:  -1,
-		FillPace:  -1,
-		Jitter:    -1,
-		Pool:      2,
-		Logf:      func(string, ...any) {},
+		BaseURL:  srv.URL,
+		Client:   srv.Client(),
+		Timeout:  10 * time.Second,
+		Cooldown: -1,
+		FillPace: -1,
+		Jitter:   -1,
+		Pool:     2,
+		Logf:     func(string, ...any) {},
 	})
 }
 

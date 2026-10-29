@@ -71,6 +71,9 @@ type Pool struct {
 
 	mu     sync.Mutex
 	tokens []Token
+	// lastErr is the most recent failed fetch, kept for /healthz so a pool
+	// that cannot refill is visible instead of only logged.
+	lastErr string
 
 	// fetchMu serialises synchronous and background fetches so a burst of
 	// requests cannot start a handshake storm.
@@ -131,6 +134,14 @@ type Stats struct {
 	Min     int `json:"min"`
 	Max     int `json:"max"`
 	Expired int `json:"expired"`
+	// BelowMin is true when the pool has fewer live tokens than Min. It is
+	// what tells "the ring is healthy" from "the upstream is refusing every
+	// new session", which used to look identical on /healthz.
+	BelowMin bool `json:"below_min"`
+	// LastError is the most recent failed fetch (background refill or a
+	// request-path top-up), cleared by the next success. Empty when the pool
+	// has been filling fine.
+	LastError string `json:"last_error,omitempty"`
 }
 
 // Stats returns the current pool size and configured bounds.
@@ -146,7 +157,14 @@ func (p *Pool) Stats() Stats {
 		}
 		live++
 	}
-	return Stats{Size: live, Min: p.cfg.Min, Max: p.cfg.Max, Expired: expired}
+	return Stats{
+		Size:      live,
+		Min:       p.cfg.Min,
+		Max:       p.cfg.Max,
+		Expired:   expired,
+		BelowMin:  live < p.cfg.Min,
+		LastError: p.lastErr,
+	}
 }
 
 // Get returns a live token, round-robin. If none is available it fetches one
@@ -225,10 +243,12 @@ func (p *Pool) ensure(ctx context.Context) error {
 		}
 		tok, err := p.fetch(ctx)
 		if err != nil {
+			p.recordFetchError(err)
 			return err
 		}
 		created := p.cfg.Now()
 		p.mu.Lock()
+		p.lastErr = ""
 		if len(p.tokens) < p.cfg.Max {
 			p.tokens = append(p.tokens, Token{Value: tok, Created: created})
 		}
@@ -251,10 +271,12 @@ func (p *Pool) grow(ctx context.Context) error {
 		}
 		tok, err := p.fetch(ctx)
 		if err != nil {
+			p.recordFetchError(err)
 			return err
 		}
 		created := p.cfg.Now()
 		p.mu.Lock()
+		p.lastErr = ""
 		if len(p.tokens) < p.cfg.Max {
 			p.tokens = append(p.tokens, Token{Value: tok, Created: created})
 		}
@@ -290,6 +312,13 @@ func (p *Pool) maintain() {
 			}
 		}
 	}
+}
+
+// recordFetchError remembers the failure for /healthz.
+func (p *Pool) recordFetchError(err error) {
+	p.mu.Lock()
+	p.lastErr = err.Error()
+	p.mu.Unlock()
 }
 
 func (p *Pool) reportFetchError(err error) {
