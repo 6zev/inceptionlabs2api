@@ -20,6 +20,10 @@ import (
 // success (search: docs already collected) or truncation (chat: no [DONE]).
 // The scanner goroutine is released through done; the caller's deferred body
 // Close unblocks a pending network read.
+//
+// Memory: the scanner's buffer grows to the longest line seen and is released
+// by compaction when this call returns (see the seed comment below); the
+// reader's read buffer is fixed by streamReadBuffer, not per line.
 func lines(ctx context.Context, body io.Reader, idle, hardCap time.Duration, onLine func(line string) error) error {
 	if idle <= 0 {
 		idle = 60 * time.Second
@@ -34,7 +38,27 @@ func lines(ctx context.Context, body io.Reader, idle, hardCap time.Duration, onL
 
 	go func() {
 		scanner := bufio.NewScanner(body)
-		scanner.Buffer(make([]byte, 64*1024), maxLineBytes)
+		// Two things used to make this hold far more memory than it reads.
+		//
+		// 1. bufio.Scanner GROWS its buffer to fit the longest line and hands
+		//    that grown array back to the pool only when the read ends. The
+		//    upstream sends whole answers and whole source lists as single
+		//    events, so one large event pinned a MB-scale array for the rest of
+		//    the response. The seed is kept small (compactLineBytes) so that a
+		//    response of ordinary short lines pays 64 KiB, and the hard cap
+		//    stays maxLineBytes.
+		// 2. Scanner asks the reader for 4096 bytes per Read, but over TLS a
+		//    single read holds ~3 records of 16 KiB (crypto/tls BufferSize).
+		//    That is ~48 KiB carrying only 4 KiB of payload, so every read
+		//    overran a 64 KiB seed and grew the buffer for NO reason. A larger
+		//    read makes the payload pay for the records.
+		//
+		// If you raise the seed, raise it into the tens of KiB at most: it is
+		// per concurrent response.
+		scanner.Buffer(make([]byte, compactLineBytes), maxLineBytes)
+		if tb, ok := body.(interface{ SetReadBuffer(int) }); ok {
+			tb.SetReadBuffer(streamReadBuffer)
+		}
 		for scanner.Scan() {
 			select {
 			case lines <- lineResult{line: scanner.Text()}:

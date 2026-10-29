@@ -20,8 +20,22 @@ var ErrIdleTimeout = errors.New("upstream: stream idle timeout")
 
 // maxLineBytes caps one upstream line (SSE or NDJSON). The upstream sends
 // whole answers in single events on this diffusion model and whole source
-// lists in one docs event, so the buffer is generous.
+// lists in one docs event, so the buffer is generous. It is the scanner's
+// HARD cap; the seed it grows from is compactLineBytes (lines.go).
 const maxLineBytes = 16 << 20
+
+// compactLineBytes is the seed a scan buffer starts from in the shared line
+// pump. A bufio.Scanner grows to the longest line it sees and returns that
+// grown array to the pool when the read ends, so the seed decides what an
+// ordinary, short-line response pays per read.
+const compactLineBytes = 64 << 10
+
+// streamReadBuffer is the read size the line pump asks of an upstream
+// response body that exposes SetReadBuffer. bufio.Scanner otherwise reads
+// 4096 bytes at a time, each of which becomes its own 16 KiB TLS record;
+// ~3 live records per read is what made even a small-line response grow past
+// a 64 KiB seed. 32 KiB reads keep the record overhead off the hot path.
+const streamReadBuffer = 32 << 10
 
 // Reader parses an upstream SSE body and emits one callback per event.
 type Reader struct {
