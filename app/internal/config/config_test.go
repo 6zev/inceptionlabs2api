@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNativeWebSearchDefaultsOn(t *testing.T) {
 	// Arrange: no IL2API_NATIVE_WEB_SEARCH in the environment.
@@ -123,11 +126,11 @@ func TestSessionPerRequestInvalidRejected(t *testing.T) {
 	}
 }
 
-// The default model surface is one real name plus its "-thinking" alias.
-// Widening IL2API_MODELS does not unlock a different backend (the upstream
-// ignores the model field), so the real surface must stay narrow: the alias is
-// a label for a reasoning-aware client, never a second backend. See
-// ThinkingSuffix for the measured client (Cherry Studio) this serves.
+// The default model surface is exactly one name. Widening IL2API_MODELS does
+// not unlock a different backend (the upstream ignores the model field), so
+// the real surface must stay narrow — and there is no derived alias any more:
+// a "<name>-thinking" id is a label no backend differentiates, and /v1/models
+// already publishes the reasoning capability a client needs.
 func TestDefaultModelsIsSingleMercury3(t *testing.T) {
 	c, err := FromEnv(func(string) string { return "" })
 	if err != nil {
@@ -136,7 +139,7 @@ func TestDefaultModelsIsSingleMercury3(t *testing.T) {
 	if c.Model != "mercury-3" {
 		t.Errorf("Model default = %q, want mercury-3", c.Model)
 	}
-	want := []string{"mercury-3", "mercury-3" + ThinkingSuffix}
+	want := []string{"mercury-3"}
 	if len(c.Models) != len(want) {
 		t.Fatalf("Models default = %v, want %v", c.Models, want)
 	}
@@ -147,50 +150,34 @@ func TestDefaultModelsIsSingleMercury3(t *testing.T) {
 	}
 }
 
-// TestThinkingAliasIsDerivedFromNames pins the alias rule: each non-reasoning
-// name gains one suffix, a name that already advertises reasoning gains none,
-// and an explicitly listed alias is not duplicated.
-func TestThinkingAliasIsDerivedFromNames(t *testing.T) {
+// TestNoThinkingAliasIsDerived pins the removal: no name gains a "-thinking"
+// suffix, and a client that asks for one gets a 404 rather than a second id
+// for the same backend.
+func TestNoThinkingAliasIsDerived(t *testing.T) {
 	c, err := FromEnv(func(k string) string {
 		switch k {
-		case "IL2API_MODELS":
-			return "mercury-3, mercury-thinking, mercury-3-thinking"
-		}
-		return ""
-	})
-	if err != nil {
-		t.Fatalf("FromEnv: %v", err)
-	}
-	want := []string{"mercury-3", "mercury-thinking", "mercury-3-thinking"}
-	if len(c.Models) != len(want) {
-		t.Fatalf("Models = %v, want %v (explicit alias must not duplicate)", c.Models, want)
-	}
-	for i := range want {
-		if c.Models[i] != want[i] {
-			t.Errorf("Models[%d] = %q, want %q", i, c.Models[i], want[i])
-		}
-	}
-}
-
-// TestThinkingAliasFollowsRenamedModel covers IL2API_MODEL=foo: the alias must
-// follow the configured name rather than being hard-coded to mercury-3.
-func TestThinkingAliasFollowsRenamedModel(t *testing.T) {
-	c, err := FromEnv(func(k string) string {
-		if k == "IL2API_MODEL" {
+		case "IL2API_MODEL":
 			return "custom-model"
+		case "IL2API_MODELS":
+			return "mercury-3, mercury-4"
 		}
 		return ""
 	})
 	if err != nil {
 		t.Fatalf("FromEnv: %v", err)
 	}
-	want := []string{"custom-model", "custom-model" + ThinkingSuffix}
+	want := []string{"mercury-3", "mercury-4"}
 	if len(c.Models) != len(want) {
-		t.Fatalf("Models = %v, want %v", c.Models, want)
+		t.Fatalf("Models = %v, want %v (no derived alias)", c.Models, want)
 	}
 	for i := range want {
 		if c.Models[i] != want[i] {
 			t.Errorf("Models[%d] = %q, want %q", i, c.Models[i], want[i])
+		}
+	}
+	for _, m := range c.Models {
+		if strings.HasSuffix(m, "-thinking") {
+			t.Errorf("Models contains a derived alias: %q", m)
 		}
 	}
 }
@@ -205,9 +192,8 @@ func TestModelsAllowlistFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FromEnv: %v", err)
 	}
-	// Operator names keep their order at the front; each gains a thinking
-	// alias afterwards. Both listed names must still be accepted.
-	want := []string{"mercury-3", "mercury-4", "mercury-3-thinking", "mercury-4-thinking"}
+	// Operator names keep their order and are the whole surface.
+	want := []string{"mercury-3", "mercury-4"}
 	if len(c.Models) != len(want) {
 		t.Fatalf("Models = %v, want %v", c.Models, want)
 	}

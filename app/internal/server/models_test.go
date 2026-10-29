@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"inceptionlabs2api/internal/openai"
@@ -31,12 +32,23 @@ func getModels(t *testing.T, s *Server) openai.ModelList {
 // payload: a client cannot offer a reasoning-level selector unless these
 // fields are present, which is the whole reason reasoning_content was never
 // surfaced.
+//
+// The listing is exactly the configured surface: no derived "<name>-thinking"
+// alias is added, because the reasoning capability is advertised here instead
+// of being smuggled through the id.
 func TestModelsAdvertisingIsStable(t *testing.T) {
 	s := newTestServer(t, &mockChatter{})
 	list := getModels(t, s)
 
+	// newTestServer configures two names; both must appear and neither may
+	// gain a derived "<name>-thinking" alias.
 	if len(list.Data) != 2 {
 		t.Fatalf("got %d models, want 2", len(list.Data))
+	}
+	for _, m := range list.Data {
+		if strings.HasSuffix(m.ID, "-thinking") {
+			t.Errorf("models listing contains a derived alias: %q", m.ID)
+		}
 	}
 	for _, m := range list.Data {
 		if !m.SupportsReasoning || !m.Capabilities.Reasoning {

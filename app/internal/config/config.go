@@ -155,11 +155,6 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	if len(c.Models) == 0 {
 		c.Models = []string{c.Model}
 	}
-	// Add the "<model>-thinking" alias after the explicit list so an operator's
-	// names keep their order. See ThinkingSuffix for why this one alias exists
-	// at all, despite the narrow-surface rule above.
-	c.Models = withThinkingAliases(c.Models)
-
 	proxy := strings.TrimSpace(getenv("IL2API_PROXY"))
 	if proxy == "" {
 		for _, key := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
@@ -383,62 +378,6 @@ func redactURLError(err error, raw string) error {
 		return ue.Err
 	}
 	return errors.New("malformed URL")
-}
-
-// ThinkingSuffix is appended to a model name to form the alias that tells a
-// client the model can think.
-//
-// This is the one deliberate exception to the "keep the model surface narrow"
-// rule in this package and in the README. That rule is about not implying
-// multiple backends, and it still holds: the alias is a LABEL for the same
-// backend, and the upstream ignores the model field either way.
-//
-// The alias exists for clients that decide whether to offer a reasoning-effort
-// selector from the model ID alone, rather than from the /v1/models
-// capabilities object (which this gateway does publish). Cherry Studio is the
-// measured case: its REASONING_REGEX matches ids containing reasoning /
-// reasoner / thinking / think, so a bare "mercury-3" shows no thinking
-// control, no reasoning_effort is ever sent, and the reasoning_content the
-// gateway forwards is never requested. Naming one alias "mercury-3-thinking"
-// makes such a client expose the selector without any client-side change.
-const ThinkingSuffix = "-thinking"
-
-// thinkingMarker reports whether name already carries a token a
-// reasoning-aware client recognises, so appending the suffix would produce a
-// redundant id ("mercury-thinking-thinking") and a confusing selector.
-func thinkingMarker(name string) bool {
-	l := strings.ToLower(name)
-	for _, marker := range []string{"reasoning", "reasoner", "thinking", "think"} {
-		if strings.Contains(l, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// withThinkingAliases returns names followed by a "<name>-thinking" alias for
-// each entry that does not already look like a reasoning model. Duplicates are
-// dropped so an operator who lists the alias explicitly does not see it twice.
-func withThinkingAliases(names []string) []string {
-	out := make([]string, 0, len(names)*2)
-	seen := make(map[string]struct{}, len(names)*2)
-	add := func(n string) {
-		if _, dup := seen[n]; dup {
-			return
-		}
-		seen[n] = struct{}{}
-		out = append(out, n)
-	}
-	for _, n := range names {
-		add(n)
-	}
-	for _, n := range names {
-		if thinkingMarker(n) {
-			continue
-		}
-		add(n + ThinkingSuffix)
-	}
-	return out
 }
 
 func envInt(getenv func(string) string, key string, def int) (int, error) {

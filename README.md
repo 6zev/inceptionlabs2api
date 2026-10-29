@@ -101,14 +101,17 @@ curl http://localhost:3000/v1/chat/completions \
   反而让客户端误以为存在多个模型可选。
 - 判断"是否能用某个模型"的正确依据是上游，而不是这个名单。
 
-**自动别名 `mercury-3-thinking`**：唯一的例外。网关会自动为每个名字追加
-一个 `<名字>-thinking` 别名（同一个后端，只是标签）。原因是部分客户端
-**只根据模型 ID 判断是否显示"思考强度"选项**，不读 `/v1/models` 的
-capabilities——Cherry Studio 即实测案例（其 `REASONING_REGEX` 匹配包含
-`reasoning` / `reasoner` / `thinking` / `think` 的 ID）。在 Cherry Studio
-里选 `mercury-3-thinking`，思考选项就会出现，客户端才会发送
-`reasoning_effort`，进而收到 `reasoning_content`。名字本身已含这些词的
-不再追加别名。
+**没有 `-thinking` 别名**：网关不再自动派生 `<名字>-thinking`。那个别名只是
+同一后端的第二个标签，`/v1/models` 已经用 `capabilities.reasoning` /
+`supports_reasoning` / `reasoning_levels` 明确告知"这个模型会思考"，
+客户端应当读 capability 而不是猜 ID。请求 `mercury-3-thinking` 会得到
+`model_not_found`，与任何其它未列出的名字一致。
+
+> Cherry Studio 等**只按 ID 猜**的客户端（`REASONING_REGEX` 匹配
+> `reasoning` / `reasoner` / `thinking` / `think`）因此不会显示思考强度
+> 选项、也不会发送 `reasoning_effort` —— 网关仍会正常返回回答，只是拿不到
+> `reasoning_content`。需要时把 `IL2API_MODEL` 设成含该词的名字
+> （如 `mercury-3-thinking`）即可，那是你自己的显式命名，不是网关派生。
 
 ### `reasoning_effort` 实测：实际只有三档
 
