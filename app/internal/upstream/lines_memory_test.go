@@ -53,24 +53,47 @@ func TestLinesLargeLineFitsHardCap(t *testing.T) {
 	}
 }
 
-// TestLinesSmallLinesStayCompact guards against a seed that would make every
-// short response pay for a large buffer: the parser must not retain more than
-// a small multiple of the input for ordinary traffic.
+// TestLinesSmallLinesStayCompact guards the limit, not the buffer: a response
+// of ordinary short lines must parse regardless of how small the seed is, and
+// must not retain anything per response.
+//
+// Retention is checked through PrivateBytes (live heap) rather than a delta of
+// two HeapInuse samples: HeapInuse is a uint64, so a GC between reads makes
+// `after - before` underflow and the check can never fail for the right reason
+// (it did exactly that on CI, reporting 2^44 MiB). PrivateBytes here is read
+// after two forced GCs, so only what survived collection counts.
 func TestLinesSmallLinesStayCompact(t *testing.T) {
 	src := []byte("data: {\"t\":\"text-delta\",\"s\":\"hi\"}\n")
+	ctx := context.Background()
+
 	runtime.GC()
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
+	runtime.GC()
+	base := privateHeap(t)
+
 	for i := 0; i < 500; i++ {
-		if err := lines(context.Background(), bytes.NewReader(src), 0, 0, func(string) error { return nil }); err != nil && err != io.EOF {
+		if err := lines(ctx, bytes.NewReader(src), 0, 0, func(string) error { return nil }); err != nil && err != io.EOF {
 			t.Fatalf("lines: %v", err)
 		}
 	}
+
 	runtime.GC()
-	runtime.ReadMemStats(&after)
-	// 500 short responses must not leave tens of megabytes resident. The
-	// threshold is loose on purpose; it only catches per-response retention.
-	if grew := after.HeapInuse - before.HeapInuse; grew > 32<<20 {
-		t.Fatalf("500 short responses retained %.1f MiB of heap", float64(grew)/float64(1<<20))
+	runtime.GC()
+	after := privateHeap(t)
+
+	// 500 responses of ~40 bytes cannot legitimately retain megabytes. The
+	// limit is loose on purpose: it catches per-response retention (a grown
+	// scan buffer kept alive), not allocator noise.
+	const limit uint64 = 32 << 20
+	if after > base && after-base > limit {
+		t.Fatalf("500 short responses retained %.1f MiB of live heap",
+			float64(after-base)/float64(1<<20))
 	}
+}
+
+// privateHeap returns live heap bytes, saturating instead of wrapping.
+func privateHeap(t *testing.T) uint64 {
+	t.Helper()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
 }
