@@ -291,7 +291,12 @@ func (c *Client) Send(ctx context.Context, method, path string, body []byte, hea
 		// capability probe); say what happened instead.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
 		resp.Body.Close()
-		return nil, fmt.Errorf("%w: the checkpoint challenged %s even after a fresh clearance", ErrClearance, path)
+		// Name what is actually true: the request WAS retried on a fresh
+		// clearance and the edge still challenged it. What the client gets is
+		// the gateway's own failure to prove itself, not a fresh-challenge
+		// loop — the operator fix is the egress (a rotating proxy exit) or the
+		// checkpoint version, not more retries.
+		return nil, fmt.Errorf("%w: the checkpoint still challenged %s after a replay with a freshly cleared slot; the egress is being refused", ErrClearance, path)
 	}
 	return resp, nil
 }

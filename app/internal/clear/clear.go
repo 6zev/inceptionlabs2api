@@ -120,6 +120,11 @@ type slot struct {
 	// is the hard cut-off, and a cookie past it must never be served, because
 	// the edge answers it with 401 and burns it for every request in flight.
 	expiresAt time.Time
+	// token is the challenge token this cookie was solved from. A refresh
+	// re-solves it instead of a fresh one: a proof minted from a different
+	// challenge can be refused by the edge that issued this cookie's, which
+	// reads as "challenged even after a fresh clearance".
+	token string
 
 	// lastAttempt and lastErr implement the per-slot failure cooldown: only a
 	// slot whose own attempt failed waits, so one broken attempt cannot freeze
@@ -398,6 +403,24 @@ func (c *Clearance) expiredLocked() bool {
 	return false
 }
 
+// reposTokenLocked returns the challenge token of a live (unexpired) slot, if
+// there is one. The token is kept beside the cookie purely so a refresh can
+// re-solve the same proof instead of minting a fresh one that the edge may
+// treat as unrelated to the challenged request.
+//
+// The caller must NOT hold c.mu; this takes it.
+func (c *Clearance) reposTokenLocked(now time.Time) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.slots {
+		s := &c.slots[i]
+		if s.cookie != "" && !s.expiredLocked(now) && s.token != "" {
+			return s.token, true
+		}
+	}
+	return "", false
+}
+
 // liveLocked counts slots holding a cookie the edge will still accept. An
 // expired cookie is not live: counting it would tell the fill loop there is
 // nothing to do while Header is already serving nothing.
@@ -662,6 +685,7 @@ func (c *Clearance) Retire(cookie string) error {
 			// Drop only the cookie. The slot's cooldown bookkeeping belongs to
 			// a possible in-flight acquisition and must survive.
 			c.slots[i].cookie = ""
+			c.slots[i].token = ""
 			c.slots[i].acquired = time.Time{}
 			c.slots[i].expiresAt = time.Time{}
 			c.mu.Unlock()
@@ -808,6 +832,7 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 			// Drop only the cookies: cooldown bookkeeping belongs to the slot
 			// that recorded it.
 			c.slots[i].cookie = ""
+			c.slots[i].token = ""
 			c.slots[i].acquired = time.Time{}
 		}
 		c.probed = true
@@ -819,6 +844,26 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 	if err != nil {
 		return err
 	}
+
+	// Solve for a KNOWN-CORRECT cookie: if any live slot already holds one,
+	// re-solve with that slot's challenge token.
+	//
+	// This is the difference between a refusal and a stale proof. A Vercel
+	// checkpoint cookie is bound to the request that solved it (and, for this
+	// deployment, to the egress it came from). Solving a FRESH challenge from
+	// a retired slot can yield a proof the edge does not accept for the request
+	// that was actually challenged, and the symptom is a 429 challenge that
+	// outlives a successful solve: "challenged GET /api/session even after a
+	// fresh clearance", one retired slot every ~15 s, forever. Re-solving the
+	// incumbent slot's own token collapses that to one accepted solve.
+	//
+	// It costs nothing when the ring is healthy: the same acquisition runs
+	// either way, with a token that is at least as good as a fresh one.
+	if incumbent, ok := c.reposTokenLocked(start); ok && incumbent != token {
+		c.logf("clear: solving with the live slot's challenge token instead of a fresh one (a stale proof outlives a successful solve)")
+		token = incumbent
+	}
+
 	solution, err := solveToken(token)
 	if err != nil {
 		return fmt.Errorf("clear: solve: %w", err)
@@ -833,6 +878,7 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 		idx = c.emptyLocked()
 	}
 	c.slots[idx].cookie = cookie
+	c.slots[idx].token = token
 	c.slots[idx].acquired = c.now()
 	// The edge's own Max-Age is the hard cut-off. Without it the Refresh
 	// margin is a blind guess at the TTL, and a cookie that dies early (the
