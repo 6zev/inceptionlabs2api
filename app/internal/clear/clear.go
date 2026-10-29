@@ -950,7 +950,8 @@ func apiProbeHeaders(req *http.Request) {
 
 // TransportOptions configures the shared HTTP transport.
 type TransportOptions struct {
-	// Proxy is empty or an http(s) URL (config normalises bare host:port).
+	// Proxy is empty, an http(s) URL, or a socks5:// / socks5h:// URL (config
+	// normalises bare host:port to http and validates the scheme).
 	Proxy string
 	// RootCAs overrides the trust store (tests use a local CA).
 	RootCAs *x509.CertPool
@@ -964,6 +965,11 @@ type TransportOptions struct {
 // HTTP/2 is mandatory: the clearance cookie is chained to the negotiated
 // protocol, and h1.1 requests are answered with a fresh challenge even when
 // the cookie is valid. Keep-alives stay on so h2 connections are reused.
+//
+// A socks5 proxy is installed as the DIALER, not as a CONNECT tunnel: the
+// request still builds a real TLS session to the upstream on top of the
+// tunnel, which is what the cookie is bound to. An http(s) proxy keeps the
+// stdlib CONNECT path.
 func Transport(opts TransportOptions) *http.Transport {
 	dialTimeout := opts.DialTimeout
 	if dialTimeout <= 0 {
@@ -979,7 +985,11 @@ func Transport(opts TransportOptions) *http.Transport {
 	}
 	if opts.Proxy != "" {
 		if u, err := url.Parse(opts.Proxy); err == nil && u.Host != "" {
-			tr.Proxy = http.ProxyURL(u)
+			if isSOCKS(strings.ToLower(u.Scheme)) {
+				tr.DialContext = socksDialer(u, dialTimeout)
+			} else {
+				tr.Proxy = http.ProxyURL(u)
+			}
 		}
 	}
 	if opts.RootCAs != nil {

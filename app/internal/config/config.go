@@ -337,8 +337,13 @@ func (c Config) validate() error {
 	return nil
 }
 
-// normalizeProxy accepts bare host:port, http://, and https:// proxy URLs and
-// returns a canonical http(s) URL string. Empty input stays empty.
+// normalizeProxy accepts bare host:port, http://, https://, socks5:// and
+// socks5h:// proxy URLs and returns a canonical URL string. Empty stays empty.
+//
+// The distinction that matters: http(s) proxies are CONNECT tunnels (the
+// transport speaks to them itself), socks5 resolves the host LOCALLY, and
+// socks5h lets the proxy resolve it. Keeping the scheme intact through config
+// is what lets clear.Transport build the right dialer.
 func normalizeProxy(raw string) (string, error) {
 	if raw == "" {
 		return "", nil
@@ -350,11 +355,18 @@ func normalizeProxy(raw string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("config: invalid proxy URL: %w", redactURLError(err, raw))
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("config: proxy scheme must be http or https, got %q", u.Scheme)
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	case "socks5", "socks5h":
+		u.Scheme = strings.ToLower(u.Scheme)
+	default:
+		return "", fmt.Errorf("config: proxy scheme must be http, https, socks5 or socks5h, got %q", u.Scheme)
 	}
 	if u.Host == "" {
 		return "", fmt.Errorf("config: proxy %q has no host", RedactProxy(raw))
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", fmt.Errorf("config: proxy %q must not carry a path", RedactProxy(raw))
 	}
 	return u.String(), nil
 }

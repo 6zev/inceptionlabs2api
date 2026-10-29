@@ -384,7 +384,7 @@ Mercury Decide：给一段场景文本 + 若干结构化问题，返回带概率
 | `IL2API_POOL_MIN` / `MAX` | 2 / 8 | 会话池上下限 |
 | `IL2API_IDLE_TIMEOUT` | 60s | 上游空闲看门狗 |
 | `IL2API_CONTEXT_CHARS` | 0 | 提示词字符上限（0 = 不限制，已废弃） |
-| `IL2API_PROXY` | — | 可选 HTTP 代理 |
+| `IL2API_PROXY` | — | 出站代理：`http://`/`https://`（CONNECT）或 `socks5://`/`socks5h://` |
 | `IL2API_MAX_MESSAGES` | 96 | 单次请求消息条数上限；超限先折叠再裁掉最旧轮次。0 = 关闭 |
 | `IL2API_EMPTY_RETRIES` | 1 | 上游返回空补全（无任何文本）时的额外重试次数，用尽后返回 502 |
 | `IL2API_SESSION_PER_REQUEST` | off | 每次上游调用新取一个匿名 session，不复用池中 token |
@@ -432,6 +432,23 @@ config: loaded environment from .env
 每个被挑战的槽位会被踢出并重新过盾。若持续数分钟不恢复，用
 `curl 'localhost:3000/healthz?probe=1'` 立即补一次过盾，不必重启进程。
 
+## 出站代理（HTTP / SOCKS5）
+
+```bash
+IL2API_PROXY=socks5://127.0.0.1:1080     # 本地解析域名，把 IP 交给代理
+IL2API_PROXY=socks5h://127.0.0.1:1080    # 把域名交给代理，由代理解析（推荐给机场/远端出口）
+IL2API_PROXY=socks5://user:pass@host:1080  # 支持用户名密码（RFC 1929）
+IL2API_PROXY=http://127.0.0.1:2203       # HTTP CONNECT 隧道
+```
+
+- `socks5` / `socks5h` 装在 **DialContext 层**（TLS 建在隧道之上），所以 Vercel
+  clearance cookie 绑定的 HTTP/2 连接仍然成立；`http`/`https` 走 stdlib 的 CONNECT。
+- 未设置时仍会读取 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`（大小写均可），
+  `ALL_PROXY=socks5://…` 可直接用。
+- 代理不可达时启动不失败：日志出现
+  `clear: fetch challenge: … socks5: dial proxy 127.0.0.1:1080: connection refused`，
+  `/v1/chat/completions` 返回 503，后台过盾循环持续重试。
+
 ## 自更新（OTA）
 
 二进制自带一条更新路径，不需要重新下载或改启动方式：
@@ -439,6 +456,10 @@ config: loaded environment from .env
 ```bash
 ./inceptionlabs2api -update          # 也接受 --update / update / IL2API_UPDATE=1
 ```
+
+`-update` 只做更新这一件事：**不解析 `.env`、不启动服务**，所以代理写错也不会挡住更新。
+更新成功后 exec 新二进制并带 `-serve` 参数，这时才按正常方式启动 API。
+当前版本已经是最新时直接退出。
 
 它会：
 

@@ -38,19 +38,26 @@ func main() {
 // run builds the gateway and serves until SIGINT/SIGTERM. It returns an error
 // instead of exiting so the wiring is testable.
 func run() error {
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("config: %w", err)
-	}
 	logf := log.Printf
 
 	// Self-update runs INSTEAD of serving: `inceptionlabs2api -update` fetches
 	// the newest release, verifies its checksum, replaces this executable and
-	// execs it. It happens before the heap limit, the pool or any socket so a
-	// failed update leaves nothing half-wired. The environment (IL2API_* and
-	// the .env this process already loaded) carries over to the new image.
+	// execs it. It happens before the app config is even parsed, so a broken
+	// gateway setting (an unreachable proxy, a bad IL2API_* value — none of
+	// which the updater uses) can never block an update, and a failed update
+	// leaves nothing half-wired. On success the exec'd child serves normally.
 	if updateMode() {
-		return runSelfUpdate(logf)
+		if err := runSelfUpdate(logf); err != nil {
+			return err
+		}
+		// Only reachable when this build is already the target release: the
+		// update is a no-op and the update process exits instead of serving.
+		return nil
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 
 	// Install the soft heap ceiling before anything allocates. Without one,
@@ -170,21 +177,33 @@ func updateMode() bool {
 			return true
 		}
 	}
+	// The exec'd child is started with "-serve", which wins: it must SERVE even
+	// when IL2API_UPDATE=1 is still in the environment from the cron line that
+	// started the update. Otherwise the new image would re-enter update mode
+	// and loop.
+	for _, a := range os.Args[1:] {
+		if a == "-serve" || a == "--serve" {
+			return false
+		}
+	}
 	if v := strings.TrimSpace(strings.ToLower(os.Getenv("IL2API_UPDATE"))); v == "1" || v == "true" || v == "on" {
 		return true
 	}
 	return false
 }
 
-// runSelfUpdate performs the update and, on success, execs the new binary so
-// the gateway comes back up in the same PID. A no-op exit happens when the
-// running version is already the newest release.
+// runSelfUpdate performs the update. On success it execs the new binary, so the
+// gateway comes back up in the same PID and serves normally; the function only
+// returns when this build is already the newest release (a deliberate no-op).
 func runSelfUpdate(logf func(format string, args ...any)) error {
 	opts := selfupdate.Options{
 		Repo:    strings.TrimSpace(os.Getenv("IL2API_UPDATE_REPO")),
 		Tag:     strings.TrimSpace(os.Getenv("IL2API_UPDATE_TAG")),
 		Logf:    logf,
 		Current: version,
+		// The exec'd image must not be in update mode again, or it would fetch
+		// its own release forever instead of serving.
+		ARGV: []string{"-serve"},
 	}
 	res, err := selfupdate.Update(context.Background(), opts)
 	if err != nil {
