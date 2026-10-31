@@ -88,13 +88,20 @@ type Message struct {
 // available at all, and therefore never sends reasoning_effort nor shows the
 // reasoning_content the gateway already forwards.
 //
-// Every value here is measured, not inferred. Two deliberate omissions:
+// Two shapes are published side by side, because no single schema is standard:
 //
-//   - No context_length / context_window token budget. The upstream has no
-//     token window to report; it caps at 100 messages and ~4 MB of body
-//     (README, measured 2026-10-22). Advertising a token count would make a
-//     client size prompts it cannot actually send and meet a 502 instead.
-//   - No pricing. The gateway does not bill.
+//   - capabilities / supports_reasoning / reasoning_levels / limits, the
+//     gateway's own vocabulary, and
+//   - the OpenRouter shape (context_length, architecture, supported_parameters,
+//     pricing, top_provider). Real clients parse only this one: Chatbox reads
+//     context_length and derives the reasoning capability from architecture +
+//     supported_parameters (src/shared/models/openai-compatible.ts), and a
+//     second vocabulary would have to be invented to say the same thing.
+//
+// Context is reported in tokens here because the model card publishes a token
+// window. The transport caps that this deployment really enforces — 100
+// messages, ~4 MB body — are reported separately in limits, as what they are.
+// No pricing is advertised beyond zeros: the gateway does not bill.
 type Model struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
@@ -111,6 +118,47 @@ type Model struct {
 	// Limits reports the real upstream boundaries, named for what they are
 	// rather than pretending to be a token window.
 	Limits ModelLimits `json:"limits"`
+
+	// OpenRouter-shaped metadata. See the type comment.
+	ContextLength       int               `json:"context_length"`
+	Architecture        ModelArchitecture `json:"architecture"`
+	SupportedParameters []string          `json:"supported_parameters"`
+	Pricing             ModelPricing      `json:"pricing"`
+	TopProvider         ModelTopProvider  `json:"top_provider"`
+}
+
+// ModelArchitecture is OpenRouter's modality block. Chatbox only builds its
+// capabilities list when this object is present, so it is not optional even
+// though the backend is text-in/text-out.
+type ModelArchitecture struct {
+	Modality         string   `json:"modality"`
+	InputModalities  []string `json:"input_modalities"`
+	OutputModalities []string `json:"output_modalities"`
+	Tokenizer        string   `json:"tokenizer"`
+	// InstructType is null for models without a published instruction format,
+	// matching OpenRouter.
+	InstructType *string `json:"instruct_type"`
+}
+
+// ModelPricing mirrors OpenRouter's string-typed price fields. Every value is
+// "0": the gateway is free and bills nothing, and a client that multiplies
+// these gets zero rather than a guess.
+type ModelPricing struct {
+	Prompt            string `json:"prompt"`
+	Completion        string `json:"completion"`
+	Request           string `json:"request"`
+	Image             string `json:"image"`
+	WebSearch         string `json:"web_search"`
+	InternalReasoning string `json:"internal_reasoning"`
+}
+
+// ModelTopProvider is the serving provider's own limits, in the same shape
+// OpenRouter uses, so a client that reads only that block still sees the
+// window and the output cap.
+type ModelTopProvider struct {
+	ContextLength       int  `json:"context_length"`
+	MaxCompletionTokens int  `json:"max_completion_tokens"`
+	IsModerated         bool `json:"is_moderated"`
 }
 
 // ModelCapabilities are what the backend can do.

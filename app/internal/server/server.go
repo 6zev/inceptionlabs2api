@@ -413,9 +413,10 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 // never sends reasoning_effort, so the reasoning_content the chat handlers
 // already forward goes unread.
 //
-// The values are configuration and measurement, never fabrication. In
-// particular no token window is reported, because the upstream enforces
-// message and byte caps instead (see Model in the openai package).
+// The values are configuration and published model data, never fabrication.
+// Context and output limits come from the model card (see
+// upstream.MaxContextTokens); the message and byte caps this deployment really
+// enforces are reported in limits.
 func (s *Server) modelEntry(id string, created int64) openai.Model {
 	limits := openai.ModelLimits{
 		// MaxMessages already reserves headroom under the upstream's hard 100
@@ -443,6 +444,38 @@ func (s *Server) modelEntry(id string, created int64) openai.Model {
 		SupportsReasoning: true,
 		ReasoningLevels:   []string{"instant", "low", "medium", "high"},
 		Limits:            limits,
+
+		ContextLength: upstream.MaxContextTokens,
+		Architecture: openai.ModelArchitecture{
+			Modality:         "text->text",
+			InputModalities:  []string{"text"},
+			OutputModalities: []string{"text"},
+			Tokenizer:        "Other",
+		},
+		// Only what the gateway parses and forwards: unknown request fields are
+		// dropped (README), so listing temperature or max_tokens here would
+		// promise settings that never reach the backend.
+		SupportedParameters: []string{
+			"tools",
+			"tool_choice",
+			"parallel_tool_calls",
+			"reasoning",
+			"reasoning_effort",
+			"stream",
+		},
+		Pricing: openai.ModelPricing{
+			Prompt:            "0",
+			Completion:        "0",
+			Request:           "0",
+			Image:             "0",
+			WebSearch:         "0",
+			InternalReasoning: "0",
+		},
+		TopProvider: openai.ModelTopProvider{
+			ContextLength:       upstream.MaxContextTokens,
+			MaxCompletionTokens: upstream.MaxOutputTokens,
+			IsModerated:         false,
+		},
 	}
 }
 

@@ -431,6 +431,23 @@ const MaxUpstreamMessages = maxUpstreamMessages
 // because the upstream publishes no token accounting to convert with.
 const MaxInputBytes = 4 << 20
 
+// MaxContextTokens and MaxOutputTokens are Mercury 3's own window, not a
+// measurement of this chat endpoint: no request of that size was sent. They
+// come from the model's published card, which every catalogue that lists it
+// agrees on (models.dev "inception/mercury-3": context 1000000, output 131072;
+// the same numbers appear under openrouter, vercel, venice and nano-gpt).
+//
+// The two limits describe different things and both are true: the model reads
+// up to ~1M tokens, while this endpoint's transport refuses bodies past
+// MaxInputBytes (~4 MB, which is about 1M tokens of English, so the two
+// roughly coincide). A client that budgets by tokens uses these; the message
+// and byte caps in /v1/models limits still bound what will actually be
+// accepted.
+const (
+	MaxContextTokens = 1_000_000
+	MaxOutputTokens  = 131_072
+)
+
 // tooLongMarker is the upstream's own error phrase for the conversation
 // length rejection (case-insensitive match on the response body).
 const tooLongMarker = "conversation is too long"

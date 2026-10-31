@@ -113,6 +113,42 @@ curl http://localhost:3000/v1/chat/completions \
 > `reasoning_content`。需要时把 `IL2API_MODEL` 设成含该词的名字
 > （如 `mercury-3-thinking`）即可，那是你自己的显式命名，不是网关派生。
 
+### `/v1/models` 的元数据：两套形状，一个真值
+
+`/v1/models` 同时输出两套字段：
+
+- **网关自有**：`capabilities{streaming,tools,reasoning,web_search}`、
+  `supports_reasoning`、`reasoning_levels`、`limits{max_messages,max_input_bytes}`。
+- **OpenRouter 形状**：`context_length`、`architecture`、`supported_parameters`、
+  `pricing`、`top_provider`。
+
+两套都要有，是因为真正读 `/v1/models` 的客户端只认第二套。Chatbox 对自定义
+OpenAI 兼容服务走 `fetchRemoteModels`：**只有 `architecture` 存在时**才构造
+能力列表，从 `supported_parameters` 里的 `reasoning` / `include_reasoning` /
+`reasoning_effort` 推断"会思考"，从 `context_length` 取上下文窗口。缺
+`architecture`，整块能力为空；缺 `context_length`，UI 里就没有窗口。
+
+数值来源：`context_length` = 1,000,000、`top_provider.max_completion_tokens`
+= 131,072 取自模型卡（models.dev `inception/mercury-3`，openrouter / vercel /
+venice / nano-gpt 同值）。`limits` 里的 100 条消息与 ~4 MB 是**本服务实际执行的
+传输上限**，两者不是一回事：按 token 估预算看前一套，能发多大请求看后一套。
+约 1M 英文 token ≈ 4 MB，因此两个数字大致吻合。
+
+`supported_parameters` 只列网关真正解析并转发的参数（`tools` / `tool_choice` /
+`parallel_tool_calls` / `reasoning` / `reasoning_effort` / `stream`）。
+`temperature`、`max_tokens` 等字段会被静默丢弃，列出来就等于承诺传不过去的东西。
+
+两条诚实的边界：
+
+- **工具能力**：Chatbox 的 OpenAI 兼容路径不从 `/v1/models` 推断 `tool_use`
+  （源码注释写明无法判断），需要在客户端的模型设置里手动打开。网关本来支持
+  tools，这里只是标签没被读。
+- **只读本地模型库的客户端**：Kelivo 从 `/v1/models` **只取 `id`**，能力与窗口
+  来自 models.dev 目录、名字猜测和用户覆盖，服务端字段影响不到它。它按
+  `mercury-3` 能命中 models.dev 的 `inception/mercury-3`（1M 上下文、
+  `tool_call`、`reasoning` 齐全），所以要么把客户端目录更新到含该条目，要么在
+  应用内为该模型手动填窗口与能力。
+
 ### `reasoning_effort` 实测：实际只有三档
 
 **结论先说：日常用 `medium`（也就是不传）；`low` 适合要快又要对的场景；

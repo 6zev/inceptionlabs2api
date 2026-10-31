@@ -67,13 +67,13 @@ func TestModelsAdvertisingIsStable(t *testing.T) {
 	}
 }
 
-// TestModelsLimitsAreMeasurements pins the limits to what the upstream really
-// enforces. It deliberately asserts absence of a token window: inventing one
-// would make clients send requests the upstream rejects with 502.
+// TestModelsLimitsAreMeasurements pins the two limit families to their
+// sources. They answer different questions and both must be right:
 //
-// Note the MaxMessages value: server.New does not apply the config default
-// (config.Defaults owns that), so a Server built without MaxMessages reports
-// the upstream's own hard cap. That is the honest answer for that wiring.
+//   - limits.max_messages / max_input_bytes are what this deployment actually
+//     enforces (measured), and
+//   - context_length / top_provider are the model's published window, which is
+//     what a client budgets tokens against.
 func TestModelsLimitsAreMeasurements(t *testing.T) {
 	s := newTestServer(t, &mockChatter{})
 	m := getModels(t, s).Data[0]
@@ -85,6 +85,18 @@ func TestModelsLimitsAreMeasurements(t *testing.T) {
 	if m.Limits.MaxInputBytes != upstream.MaxInputBytes {
 		t.Errorf("max_input_bytes = %d, want %d", m.Limits.MaxInputBytes, upstream.MaxInputBytes)
 	}
+	if m.ContextLength != upstream.MaxContextTokens {
+		t.Errorf("context_length = %d, want the published window %d",
+			m.ContextLength, upstream.MaxContextTokens)
+	}
+	if m.TopProvider.ContextLength != upstream.MaxContextTokens {
+		t.Errorf("top_provider.context_length = %d, want %d",
+			m.TopProvider.ContextLength, upstream.MaxContextTokens)
+	}
+	if m.TopProvider.MaxCompletionTokens != upstream.MaxOutputTokens {
+		t.Errorf("top_provider.max_completion_tokens = %d, want %d",
+			m.TopProvider.MaxCompletionTokens, upstream.MaxOutputTokens)
+	}
 
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -94,10 +106,58 @@ func TestModelsLimitsAreMeasurements(t *testing.T) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, forbidden := range []string{"context_length", "context_window", "max_tokens"} {
-		if _, ok := fields[forbidden]; ok {
-			t.Errorf("%s must not be advertised: the upstream has no token window", forbidden)
+	// Every key Chatbox's listModels looks at. A missing architecture block is
+	// the one that silently drops the capability list entirely.
+	for _, required := range []string{
+		"context_length", "architecture", "supported_parameters", "pricing", "top_provider",
+	} {
+		if _, ok := fields[required]; !ok {
+			t.Errorf("%s is missing: clients that read the OpenRouter shape will not see the capability", required)
 		}
+	}
+}
+
+// TestModelsParseLikeChatbox walks the payload through the mapping Chatbox
+// applies to a custom OpenAI-compatible provider (fetchRemoteModels in
+// src/shared/models/openai-compatible.ts) and asserts what its UI then knows.
+//
+// Without architecture the client builds no capability list at all, and
+// without context_length it shows no window — which is exactly the report this
+// test exists to keep fixed.
+func TestModelsParseLikeChatbox(t *testing.T) {
+	s := newTestServer(t, &mockChatter{})
+	m := getModels(t, s).Data[0]
+
+	capabilities := map[string]bool{}
+	if m.Architecture.InputModalities != nil {
+		for _, mod := range m.Architecture.InputModalities {
+			if mod == "image" {
+				capabilities["vision"] = true
+			}
+		}
+		if m.Pricing.WebSearch != "" && m.Pricing.WebSearch != "0" {
+			capabilities["web_search"] = true
+		}
+		for _, p := range m.SupportedParameters {
+			switch p {
+			case "reasoning", "include_reasoning", "reasoning_effort":
+				capabilities["reasoning"] = true
+			}
+		}
+	}
+
+	if !capabilities["reasoning"] {
+		t.Errorf("Chatbox would not offer thinking: supported_parameters = %v", m.SupportedParameters)
+	}
+	if capabilities["vision"] {
+		t.Errorf("Chatbox would offer image input, but the backend is text-only")
+	}
+	if m.ContextLength <= 0 {
+		t.Fatalf("Chatbox would show no context window (context_length = %d)", m.ContextLength)
+	}
+	if m.TopProvider.MaxCompletionTokens <= 0 || m.TopProvider.MaxCompletionTokens > m.ContextLength {
+		t.Errorf("max_completion_tokens = %d is not a sane output cap for a %d-token window",
+			m.TopProvider.MaxCompletionTokens, m.ContextLength)
 	}
 }
 
