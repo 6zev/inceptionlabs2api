@@ -60,6 +60,18 @@ const (
 	// maxBodyBytes drops what we read from challenge responses; only headers
 	// and cookies matter.
 	maxBodyBytes = 1 << 20
+
+	// tokenReuseWindow is how much of the edge's challenge-token TTL a stored
+	// token may still be re-solved in. The TTL is 60 s and an expired token is
+	// rejected with HTTP 703, so this leaves a margin rather than racing the
+	// deadline: a slot's token is normally 45 minutes old and is never reused.
+	tokenReuseWindow = 45 * time.Second
+
+	// maxLoggedErrorBytes bounds how much of an error chain one log line
+	// carries. The retry/cooldown annotations are short by construction; this
+	// is the guard that keeps a surprising one from turning a single line into
+	// tens of megabytes.
+	maxLoggedErrorBytes = 1024
 )
 
 // SlotState is the state of one ring slot (SPEC §2.1.2).
@@ -83,6 +95,34 @@ var ErrRefused = errors.New("clear: challenge solution refused")
 // errNoChallenge means the edge answered the probe without a challenge, so
 // there is nothing to clear: this egress is already welcome.
 var errNoChallenge = errors.New("clear: no challenge issued")
+
+// errCooling reports that refresh declined to attempt because the slot's own
+// failure cooldown is still open. It is NOT a new failure: it carries the
+// recorded one so a caller can still say what is wrong, but nothing about the
+// slot changes. Rewriting lastAttempt here would keep extending the very
+// cooldown it just respected (so the slot could never leave it), and appending
+// the retry hint to the recorded error is how one 703 becomes a 28 MB log line.
+type errCooling struct {
+	last error
+	wait time.Duration
+}
+
+func (e *errCooling) Error() string {
+	return fmt.Sprintf("%v (retrying in %s)", e.last, e.wait.Round(time.Millisecond))
+}
+
+// Unwrap keeps errors.Is/As working for the recorded failure.
+func (e *errCooling) Unwrap() error { return e.last }
+
+// shortError is the log-safe text of an error: bounded, so one line can never
+// grow without limit no matter what a caller wraps into it.
+func shortError(err error) string {
+	s := err.Error()
+	if len(s) > maxLoggedErrorBytes {
+		s = s[:maxLoggedErrorBytes] + "...(truncated)"
+	}
+	return s
+}
 
 // State is the /healthz view of clearance. Live/Pool describe the ring as a
 // whole (HasCookie = any live slot, AgeSeconds = the oldest live slot);
@@ -125,6 +165,12 @@ type slot struct {
 	// challenge can be refused by the edge that issued this cookie's, which
 	// reads as "challenged even after a fresh clearance".
 	token string
+	// tokenAt is when that token was minted — that is, how much of the edge's
+	// own token TTL is left. The TTL is 60 s (the token's third dot-field), and
+	// a submission carrying an older token is answered with HTTP 703, so
+	// re-solving a stored one is a guaranteed failure rather than a cheaper
+	// solve. See tokenReuseWindow.
+	tokenAt time.Time
 
 	// lastAttempt and lastErr implement the per-slot failure cooldown: only a
 	// slot whose own attempt failed waits, so one broken attempt cannot freeze
@@ -141,6 +187,16 @@ func (s *slot) expiredLocked(now time.Time) bool {
 	return s.cookie != "" && !s.expiresAt.IsZero() && !now.Before(s.expiresAt)
 }
 
+// coolingLocked reports whether the slot's last acquisition failed and its
+// cooldown window is still open. It is the exact condition refresh
+// short-circuits on, so the fill loop must use this test rather than
+// stateLocked: a failed refresh keeps the slot's old cookie, and stateLocked
+// calls any slot with a cookie live. Without it the loop re-targets the same
+// stale slot every FillPace (~1.5 s) while the cooldown says 15 s.
+func (s *slot) coolingLocked(now time.Time, cooldown time.Duration) bool {
+	return s.failed && cooldown > 0 && !s.lastAttempt.IsZero() && now.Sub(s.lastAttempt) < cooldown
+}
+
 // stateLocked reports the slot's lifecycle state.
 func (s *slot) stateLocked(now time.Time, cooldown time.Duration) SlotState {
 	if s.cookie != "" {
@@ -151,7 +207,7 @@ func (s *slot) stateLocked(now time.Time, cooldown time.Duration) SlotState {
 		}
 		return SlotLive
 	}
-	if s.failed && cooldown > 0 && !s.lastAttempt.IsZero() && now.Sub(s.lastAttempt) < cooldown {
+	if s.coolingLocked(now, cooldown) {
 		return SlotCooldown
 	}
 	return SlotPending
@@ -404,9 +460,15 @@ func (c *Clearance) expiredLocked() bool {
 }
 
 // reposTokenLocked returns the challenge token of a live (unexpired) slot, if
-// there is one. The token is kept beside the cookie purely so a refresh can
-// re-solve the same proof instead of minting a fresh one that the edge may
-// treat as unrelated to the challenged request.
+// there is one and it is still inside its own TTL. The token is kept beside the
+// cookie so a refresh can re-solve the same proof instead of minting a fresh
+// one that the edge may treat as unrelated to the challenged request.
+//
+// It is only usable for tokenReuseWindow: an edge token carries a 60 s TTL
+// (its third dot-field) and a submission past it is rejected with HTTP 703, so
+// a slot's stored token — minted up to 45 minutes ago, at the previous refresh
+// — can never be re-solved. Sending a fresh challenge token instead is the only
+// acquisition that can succeed.
 //
 // The caller must NOT hold c.mu; this takes it.
 func (c *Clearance) reposTokenLocked(now time.Time) (string, bool) {
@@ -414,9 +476,13 @@ func (c *Clearance) reposTokenLocked(now time.Time) (string, bool) {
 	defer c.mu.Unlock()
 	for i := range c.slots {
 		s := &c.slots[i]
-		if s.cookie != "" && !s.expiredLocked(now) && s.token != "" {
-			return s.token, true
+		if s.cookie == "" || s.expiredLocked(now) || s.token == "" {
+			continue
 		}
+		if s.tokenAt.IsZero() || now.Sub(s.tokenAt) > tokenReuseWindow {
+			continue
+		}
+		return s.token, true
 	}
 	return "", false
 }
@@ -566,7 +632,7 @@ func (c *Clearance) fillOnce(ctx context.Context) bool {
 		return false
 	}
 	if err := c.acquireSlot(ctx, idx); err != nil {
-		c.logf("clear: background fill of slot %d failed: %v", idx, err)
+		c.logf("clear: background fill of slot %d failed: %s", idx, shortError(err))
 	}
 	return true
 }
@@ -579,12 +645,21 @@ func (c *Clearance) fillTargetLocked(now time.Time) int {
 		// A pending slot in its failure cooldown is not a target yet: the loop
 		// moves on and returns to it when the window closes. Without this a
 		// refusing checkpoint would make the loop spin on slot 0 forever.
+		if c.slots[i].coolingLocked(now, c.cfg.Cooldown) {
+			continue
+		}
 		if c.slots[i].stateLocked(now, c.cfg.Cooldown) == SlotPending {
 			return i
 		}
 	}
 	idx, oldest := -1, time.Duration(0)
 	for i := range c.slots {
+		// Same window here: a slot whose refresh just failed still holds its
+		// old cookie and stays "stale", so without this the loop would retry it
+		// on every FillPace instead of once per cooldown.
+		if c.slots[i].coolingLocked(now, c.cfg.Cooldown) {
+			continue
+		}
 		age := now.Sub(c.slots[i].acquired)
 		if age < c.cfg.Refresh {
 			continue
@@ -686,6 +761,7 @@ func (c *Clearance) Retire(cookie string) error {
 			// a possible in-flight acquisition and must survive.
 			c.slots[i].cookie = ""
 			c.slots[i].token = ""
+			c.slots[i].tokenAt = time.Time{}
 			c.slots[i].acquired = time.Time{}
 			c.slots[i].expiresAt = time.Time{}
 			c.mu.Unlock()
@@ -752,10 +828,17 @@ func (c *Clearance) acquireSlot(ctx context.Context, idx int) error {
 
 	err := c.refresh(ctx, idx)
 
+	// A cooldown short-circuit is not an attempt: leave the slot's bookkeeping
+	// alone so the window the call respected can actually close, and so the
+	// recorded error stays the one real failure instead of a chain that grows
+	// with every look at it.
+	var cooling *errCooling
+	attempted := !errors.As(err, &cooling)
+
 	c.mu.Lock()
 	c.inflight = false
 	c.inflightDone = nil
-	if idx >= 0 && idx < len(c.slots) {
+	if attempted && idx >= 0 && idx < len(c.slots) {
 		c.slots[idx].lastAttempt = c.now()
 		c.slots[idx].failed = err != nil
 		c.slots[idx].lastErr = err
@@ -806,7 +889,7 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 		// Inside this slot's window, a recorded failure means the checkpoint is
 		// down; neither a lazy request nor a fill may retry it yet.
 		if lastErr != nil && openedByFailure {
-			return fmt.Errorf("%w (retrying in %s)", lastErr, c.cfg.Cooldown-now.Sub(last))
+			return &errCooling{last: lastErr, wait: c.cfg.Cooldown - now.Sub(last)}
 		}
 	}
 
@@ -833,6 +916,7 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 			// that recorded it.
 			c.slots[i].cookie = ""
 			c.slots[i].token = ""
+			c.slots[i].tokenAt = time.Time{}
 			c.slots[i].acquired = time.Time{}
 		}
 		c.probed = true
@@ -879,6 +963,7 @@ func (c *Clearance) refresh(ctx context.Context, idx int) error {
 	}
 	c.slots[idx].cookie = cookie
 	c.slots[idx].token = token
+	c.slots[idx].tokenAt = c.now()
 	c.slots[idx].acquired = c.now()
 	// The edge's own Max-Age is the hard cut-off. Without it the Refresh
 	// margin is a blind guess at the TTL, and a cookie that dies early (the

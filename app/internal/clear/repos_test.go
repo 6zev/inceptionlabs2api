@@ -39,9 +39,12 @@ func TestRefreshReposTokenFromALiveSlot(t *testing.T) {
 		t.Fatalf("Ensure: %v", err)
 	}
 
-	// Pin the incumbent's token to something distinguishable, then refresh.
+	// Pin the incumbent's token to something distinguishable and still inside
+	// its own TTL (a live slot's token is only re-solved while it is younger
+	// than tokenReuseWindow; past that the edge answers 703), then refresh.
 	c.mu.Lock()
 	c.slots[0].token = incumbent
+	c.slots[0].tokenAt = time.Now()
 	c.mu.Unlock()
 	if err := c.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
